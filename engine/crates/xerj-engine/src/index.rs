@@ -13710,7 +13710,20 @@ impl Index {
                     ),
                 )));
             }
-            resolved
+            // #328's query half, and it rides the same guard for the same
+            // reason: a `dense_vector` has no term dictionary to consult, so a
+            // lexical clause naming one is lowered to `match_none` HERE,
+            // before `is_doc_scan_query` or `query_node_to_fts` ever see the
+            // tree. `unsearchable_query_field` cannot cover it — a vector
+            // field is `indexed`, so it is not "unsearchable" — and without
+            // the lowering the missing postings hand the clause to the
+            // stored-doc scan. See `lower_lexically_typeless_clauses`.
+            let typeless = crate::memtable::lexically_typeless_fields(&schema.schema);
+            if typeless.is_empty() {
+                resolved
+            } else {
+                lower_lexically_typeless_clauses(&resolved, &typeless)
+            }
         };
         let query = &resolved_query;
 
@@ -14091,6 +14104,22 @@ impl Index {
                 // `memtable::fts_excluded_fields` for why such a field keeps
                 // its postings rather than falling back to the scan.
                 if !f.options.indexed && !f.options.doc_values {
+                    continue;
+                }
+                // #328 — a `dense_vector` has no lexical representation at
+                // all, so it is not a field a `*` expansion may project onto.
+                // A vector field is declared with vector attributes and
+                // nothing else, so it never acquires index options and can
+                // never own terms (`lucene/core/src/java/org/apache/lucene/
+                // document/KnnFloatVectorField.java:70`, and `FieldInfo.java:565`
+                // for what `IndexOptions.NONE` means). Leaving it in would push
+                // a clause onto a field whose term dictionary this release
+                // stops building (`memtable::fts_excluded_fields`), and the
+                // per-segment `fts_has_field` gate would then hand the whole
+                // query to the stored-doc scan. A clause that NAMES the field
+                // rather than expanding onto it is handled separately, by
+                // `lower_lexically_typeless_clauses`.
+                if matches!(f.field_type, FieldType::Vector) {
                     continue;
                 }
                 if matches!(f.field_type, FieldType::Text) {
@@ -18662,7 +18691,9 @@ impl Index {
                     continue;
                 };
                 for (key, val) in obj {
-                    if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                    if key.starts_with(PASSAGE_METADATA_PREFIX)
+                        || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+                    {
                         continue;
                     }
                     match schema.schema.field(key) {
@@ -18791,7 +18822,9 @@ impl Index {
                 return;
             }
             obj.iter().any(|(key, val)| {
-                if key.starts_with(PASSAGE_METADATA_PREFIX) {
+                if key.starts_with(PASSAGE_METADATA_PREFIX)
+                    || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+                {
                     return false;
                 }
                 match schema.schema.field(key) {
@@ -18838,7 +18871,9 @@ impl Index {
         let mut schema_changed = false;
         let mut field_count = schema.schema.field_count() as u32;
         for (key, val) in obj {
-            if key.starts_with(PASSAGE_METADATA_PREFIX) {
+            if key.starts_with(PASSAGE_METADATA_PREFIX)
+                || is_undeclared_multi_vector_companion(&schema.schema, key, val)
+            {
                 continue;
             }
             if let Some(existing) = schema.schema.field_mut(key) {
@@ -19238,7 +19273,18 @@ fn extract_fts_fields_excluding(
             if excluded.contains(key) {
                 continue;
             }
-            let text = extract_field_text(val);
+            // This is the MERGE path, and a merge must not resurrect postings
+            // that flush correctly skipped (#328). A root key is caught above;
+            // an object-valued key is flattened whole by `extract_field_text`,
+            // so a `dense_vector` nested under it (`passages.vec`) would come
+            // back here even though flush dropped it. Prune it out of the
+            // flattened blob exactly the way `collect_text_fields` does.
+            let text = if val.is_object() && crate::memtable::has_excluded_descendant(key, excluded)
+            {
+                crate::memtable::extract_text_value_excluding(val, key, excluded)
+            } else {
+                extract_field_text(val)
+            };
             if !text.is_empty() {
                 fields.insert(key.clone(), text);
             }
@@ -29453,7 +29499,12 @@ fn extract_numeric_vector(source: &Value, field: &str) -> Option<Vec<f32>> {
 
 /// Collect every dense_vector-mapped field in schema order (dotted paths
 /// for fields nested under object mappings).
-fn collect_dense_vector_fields(schema: &Schema) -> Vec<String> {
+///
+/// Also the single source of truth for `memtable::lexically_typeless_fields`
+/// (#328) — the set of fields that get an HNSW graph and the set that get no
+/// term dictionary must be the same set, or a field ends up with both or
+/// neither.
+pub(crate) fn collect_dense_vector_fields(schema: &Schema) -> Vec<String> {
     fn walk(fields: &[FieldConfig], prefix: &str, out: &mut Vec<String>) {
         for fc in fields {
             let path = if prefix.is_empty() {
@@ -30148,6 +30199,1015 @@ fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
     }
 }
 
+/// Lower every LEXICAL clause that names a lexically typeless field to
+/// `QueryNode::MatchNone` — the query half of #328.
+///
+/// `typeless` is `memtable::lexically_typeless_fields`: the `dense_vector`
+/// fields and their `_chunks` / passage-metadata companions, i.e. exactly the
+/// fields this release stops giving a term dictionary. Dropping the postings
+/// alone is not enough, and this is the part the write-side change cannot do by
+/// itself. Every OTHER member of `fts_excluded_fields` is protected from the
+/// stored-doc scan by `unsearchable_query_field`, which 400s the query before
+/// execution; a `dense_vector` is not, because it IS indexed — kNN needs the
+/// HNSW graph. So without this pass a lexical clause on a vector field falls
+/// through the per-segment `fts_has_field` gate onto the stored-doc scan, whose
+/// `Term` arm matches ANY ELEMENT of a JSON array and whose `match` arm splits
+/// on non-alphanumerics. Measured post-`force_merge` on a 5,000-doc × 128-dim
+/// corpus with the postings removed but this pass absent, against `main`
+/// (first call for each shape, before the result cache sees it):
+/// `{"term":{"emb":"<component>"}}` 89.2 ms → 186.8 ms → **0.061 ms** with
+/// this pass, and `{"multi_match":{"fields":["emb"],"query":"0"}}`
+/// **0 hits → all 5,000 hits** → 0 hits, because every rendered float component
+/// contains a `0`. The `multi_match` row is a correctness regression, not a
+/// slow path, and it is the reason this pass exists.
+///
+/// Lucene's answer to "this field has no terms" is the same one, in two places:
+/// `Terms.getTerms` hands back `Terms.EMPTY` rather than null so the scorer is
+/// empty instead of absent (`lucene/core/src/java/org/apache/lucene/index/
+/// Terms.java:40`), and a query that cannot match is REWRITTEN to
+/// `MatchNoDocsQuery` (`lucene/core/src/java/org/apache/lucene/search/
+/// MatchNoDocsQuery.java:23`) — as `AbstractKnnVectorQuery` does on an empty
+/// index (`lucene/core/src/test/org/apache/lucene/search/
+/// BaseKnnVectorQueryTestCase.java:164`). Neither ever falls back to walking
+/// the corpus: `TestTermAutomatonQuery.testFieldMissing` asserts a plain 0 hits
+/// for a query on `bogusfield` (`lucene/sandbox/src/test/org/apache/lucene/
+/// sandbox/search/TestTermAutomatonQuery.java:1051`). The empty FIELD LIST case
+/// below is `BooleanQuery.rewrite`'s first line, verbatim in spirit —
+/// `if (clauses.size() == 0) return new MatchNoDocsQuery("empty BooleanQuery")`
+/// (`lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java:271`), and
+/// the per-occur rules in the `Bool` arm are the same method's, clause for
+/// clause (`:323` SHOULD/MUST_NOT ignored, `:327` MUST/FILTER returned).
+///
+/// This is deliberately NOT a rejection: XERJ keeps answering 200 where ES 400s
+/// `term`/`match`/`range` on a `dense_vector`. Adding the rejection is a
+/// separate, breaking change.
+///
+/// It is not answer-preserving, and the exception is a CLASS rather than a row.
+/// A `dense_vector` and its vector-shaped `_chunks` companion end up with no
+/// lexical surface at all, so every lexical leaf naming one OUTRIGHT answers 0
+/// where the stored-doc scan used to match the rendered decimal text of the
+/// float array. "Outright" is load-bearing twice over: a `fields: ["emb.*"]`
+/// PATTERN is not lowered (see `is_typeless_spec` below — measured 300 of 300
+/// on the fixture, on the merge base and here alike), and a `<field>_chunks`
+/// the user mapped as ANYTHING other than `dense_vector` — or that dynamic
+/// mapping registered from a value that is not a multi-vector — is not in
+/// `typeless` at all, so nothing naming it is lowered either
+/// (`memtable::lexically_typeless_fields`). On the 300-doc
+/// regression fixture that is `wildcard {emb:"0*"}` and `fuzzy {emb:"0"~2}`
+/// 300 hits (EVERY document) → 0, `prefix {emb:"0"}` 146 → 0,
+/// `match_phrase_prefix {emb:"0"}` 50 → 0, numeric `term`/`terms` 1 → 0, and the
+/// same for the `_chunks` companion. Note where the boundary is: `prefix`,
+/// `wildcard` and `fuzzy` lose their hits to the WRITE-side exclusion (no term
+/// dictionary left to enumerate), while `multi_match`/`simple_query_string` need
+/// THIS pass — with the postings gone and no lowering they answer every
+/// document. The full three-state table is on `memtable::fts_excluded_fields`.
+///
+/// The Bool fold below additionally moves `_score` for bools whose hit count
+/// does not change, because dropping a dead `should` makes the bool projectable
+/// onto the inverted index and BM25 replaces the stored-doc scorer. Measured and
+/// documented there and in the CHANGELOG; pinned in the (d2c) block of
+/// `user_mapped_dense_vector_builds_no_fts_term_dictionary`.
+///
+/// Three classes of clause are deliberately left alone, because none of them
+/// ever read the term dictionary and all of them are measured unchanged:
+///
+///  * `Exists` — answered from `_source` / doc values (5,000/5,000 docs on
+///    `main` and here), and ES agrees it is not an error on a field with no
+///    terms;
+///  * `Knn` / `SemanticSearch` on the field itself — the whole reason the field
+///    exists. Their `filter` sub-query IS walked;
+///  * the geo leaves — a `geo_distance` on a `dense_vector` is nonsense either
+///    way, but it resolves from `_source` and this change does not touch it.
+///
+/// `Nested` is not walked either, and that is a scope decision rather than an
+/// oversight: field names inside a `nested` query resolve against the ELEMENT,
+/// not the root (see `strip_nested_path_in_query`), so a root-level `emb` in
+/// the set is not the same `emb` the inner clause names. Rewriting through it
+/// could turn a legitimate inner clause into a silent zero. The inner clause
+/// keeps exactly today's behaviour.
+fn lower_lexically_typeless_clauses(
+    q: &QueryNode,
+    typeless: &std::collections::HashSet<String>,
+) -> QueryNode {
+    // One entry of a `fields: [...]` list. `"emb^3"` carries a boost.
+    //
+    // A PATTERN (`"*"`, `"body.*"`) is deliberately NOT lowered, and the honest
+    // reason is that this pass cannot decide it, not that it is already
+    // handled. Resolving a pattern needs the expansion universe — which
+    // includes DYNAMIC fields that are in no schema — and lowering a pattern
+    // that would have expanded onto a real lexical field is the same
+    // silent-zero failure the declared-sibling rule in
+    // `memtable::lexically_typeless_fields` exists to prevent. So the pattern
+    // stays and the gap stays with it, MEASURED rather than assumed. On the
+    // 300-doc × 128-dim fixture, identical on the `ca4d75a` merge base and
+    // here:
+    //
+    //   {"multi_match":{"query":"0","fields":["emb.*"]}}          300 of 300
+    //   {"multi_match":{"query":"liquidity","fields":["emb.*"]}}    0 of 300
+    //   {"multi_match":{"query":"0","fields":["emb_chunks.*"]}}   300 of 300
+    //   {"multi_match":{"query":"0","fields":["emb"]}}              0 of 300
+    //   {"multi_match":{"query":"0","fields":["emb*"]}}             0 of 300
+    //   {"multi_match":{"query":"0","fields":["*"]}}                0 of 300
+    //   {"simple_query_string":{"query":"0","fields":["emb.*"]}}    0 of 300
+    //
+    // `search_inner`'s expansion sets do drop vector fields, so the pattern
+    // never PROJECTS onto one — but an unprojectable `MultiMatch` falls to the
+    // stored-doc scan, and the scan resolves the pattern against the SOURCE's
+    // field names instead, where `emb` is present and renders as decimal text.
+    // That is why the first row is 300 and not 0: every rendered component
+    // contains a `0`, while `liquidity` never appears in the array. Not a
+    // regression (both columns agree) and not closed here; the CHANGELOG says
+    // "names one outright" rather than "names one" for exactly this reason.
+    let is_typeless_spec = |spec: &String| -> bool {
+        let (name, _boost) = parse_field_boost(spec);
+        !name.contains('*') && typeless.contains(name)
+    };
+    // A `fields: [...]` list with every vector entry removed. `None` means
+    // "leave this node alone": either nothing was dropped, or the list was
+    // already empty, which means "all fields" rather than "no fields".
+    let prune_specs = |fields: &Vec<String>| -> Option<Vec<String>> {
+        if fields.is_empty() || !fields.iter().any(is_typeless_spec) {
+            return None;
+        }
+        Some(
+            fields
+                .iter()
+                .filter(|spec| !is_typeless_spec(spec))
+                .cloned()
+                .collect(),
+        )
+    };
+    let recurse = |c: &QueryNode| lower_lexically_typeless_clauses(c, typeless);
+    match q {
+        // ── Leaves that name exactly one field ────────────────────────────
+        QueryNode::Term { field, .. }
+        | QueryNode::Terms { field, .. }
+        | QueryNode::Range { field, .. }
+        | QueryNode::Prefix { field, .. }
+        | QueryNode::Wildcard { field, .. }
+        | QueryNode::Match { field, .. }
+        | QueryNode::MatchPhrase { field, .. }
+        | QueryNode::MatchPhrasePrefix { field, .. }
+        | QueryNode::Fuzzy { field, .. }
+        | QueryNode::Regexp { field, .. }
+        | QueryNode::Intervals { field, .. }
+        | QueryNode::SpanTerm { field, .. } => {
+            if typeless.contains(field) {
+                QueryNode::MatchNone
+            } else {
+                q.clone()
+            }
+        }
+
+        // ── Multi-field forms: prune the list, empty list → MatchNone ─────
+        // The empty case is the specific hole. `query_node_to_fts` returns
+        // `None` for a field spec it cannot project, and `MultiMatch` is
+        // unconditionally in `is_doc_scan_query`, so a list that named ONLY
+        // vector fields would otherwise reach the stored-doc scan and match
+        // every document instead of none.
+        QueryNode::MultiMatch {
+            fields,
+            query,
+            match_type,
+            operator,
+            analyzer,
+            boost,
+            slop,
+            max_expansions,
+        } => match prune_specs(fields) {
+            None => q.clone(),
+            Some(kept) if kept.is_empty() => QueryNode::MatchNone,
+            Some(kept) => QueryNode::MultiMatch {
+                fields: kept,
+                query: query.clone(),
+                match_type: *match_type,
+                operator: *operator,
+                analyzer: analyzer.clone(),
+                boost: *boost,
+                slop: *slop,
+                max_expansions: *max_expansions,
+            },
+        },
+        QueryNode::SimpleQueryString { query, fields } => match prune_specs(fields) {
+            None => q.clone(),
+            Some(kept) if kept.is_empty() => QueryNode::MatchNone,
+            Some(kept) => QueryNode::SimpleQueryString {
+                query: query.clone(),
+                fields: kept,
+            },
+        },
+        QueryNode::QueryString {
+            default_field: Some(f),
+            ..
+        } if is_typeless_spec(f) => QueryNode::MatchNone,
+
+        // ── Composites: recurse, then fold the MatchNone we just created ──
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match,
+        } => {
+            let was_empty =
+                must.is_empty() && should.is_empty() && must_not.is_empty() && filter.is_empty();
+            let must: Vec<QueryNode> = must.iter().map(recurse).collect();
+            let mut should: Vec<QueryNode> = should.iter().map(recurse).collect();
+            let mut must_not: Vec<QueryNode> = must_not.iter().map(recurse).collect();
+            let filter: Vec<QueryNode> = filter.iter().map(recurse).collect();
+            // The fold is DELIBERATELY minimal — only the shapes this pass can
+            // itself produce, and only where the answer is unambiguous. It is
+            // not `xerj_query::rewriter::rewrite`, which is not on this path
+            // and whose "empty bool → MatchAll" rule fires AFTER it has
+            // stripped `MatchNone` out of `should`, i.e. turns an unsatisfiable
+            // bool into a match-everything one.
+            //
+            // Without a fold the lowering is CORRECT but not fast: a
+            // `simple_query_string {"fields":["emb"]}` lowers to
+            // `Bool{should:[Match{emb}]}` (`parser::make_simple_query_node`),
+            // which becomes `Bool{should:[MatchNone]}` — still a `Bool`, still
+            // in `is_doc_scan_query`, so still a full stored-doc scan that
+            // evaluates to nothing.
+            //
+            // The per-occur rule below is `BooleanQuery.rewrite`'s, clause for
+            // clause: a `MatchNoDocsQuery` in SHOULD or MUST_NOT "can be safely
+            // ignored" and one in MUST or FILTER is returned as the whole query
+            // (`lucene/core/src/java/org/apache/lucene/search/BooleanQuery.java:323`
+            // and `:327`). Lucene's neighbouring "pure negative BooleanQuery →
+            // MatchNoDocsQuery" rule (`:276`) is deliberately NOT adopted: that
+            // is Lucene's bool, not ES's. XERJ follows ES, where a bool with
+            // only `must_not` matches every non-excluded document — exactly what
+            // `doc_matches_query`'s Bool arm implements.
+
+            // ── MUST / FILTER: an unsatisfiable REQUIRED clause sinks the bool.
+            if must.iter().any(QueryNode::is_match_none)
+                || filter.iter().any(QueryNode::is_match_none)
+            {
+                return QueryNode::MatchNone;
+            }
+
+            // ── MUST_NOT: a clause that matches nothing EXCLUDES nothing, so
+            // dropping it is exact for every shape — `doc_matches_query` only
+            // ever asks `must_not.iter().any(...)`, and `MatchNone` is never
+            // `any`. Dropping it is also what closes the doc-scan fallback this
+            // pass would otherwise open: `query_node_to_fts`'s Bool arm `?`s on
+            // EVERY `must_not` child and its `MatchNone` arm is `None`, so one
+            // surviving `MatchNone` un-projects the whole bool and hands a
+            // query that used to run on the inverted index to the stored-doc
+            // scan. `{"bool":{"must_not":[{"term":{"emb":…}}]}}` is the shape.
+            must_not.retain(|c| !c.is_match_none());
+
+            // ── SHOULD. Both folds below turn on whether `should` is REQUIRED,
+            // and the rule has to be the one `doc_matches_query` actually
+            // implements, not the one ES documents in prose:
+            //
+            //  * `None`     → required iff `must` and `filter` are both empty.
+            //                 `must_not` does NOT relax it.
+            //  * `Fixed(0)` → optional.
+            //  * `Fixed(n)` → required.
+            //  * `Percentage(p)` → required for EVERY p including 0, because
+            //                 the count is `floor(len × p/100).max(1)`. The
+            //                 previous revision of this pass treated
+            //                 `Percentage(0)` as "optional"; that is only ever
+            //                 a missed fold, never a wrong answer, but it is
+            //                 still not what the evaluator does.
+            //  * `Field` / `Script` (terms_set) → the required count is read
+            //                 PER DOCUMENT and 0 is a legal value, so neither
+            //                 fold is sound. Leave the node exactly as recursed.
+            let should_required = match minimum_should_match {
+                None => must.is_empty() && filter.is_empty(),
+                Some(MinShouldMatch::Fixed(0)) => false,
+                Some(MinShouldMatch::Fixed(_)) | Some(MinShouldMatch::Percentage(_)) => true,
+                Some(MinShouldMatch::Field(_)) | Some(MinShouldMatch::Script { .. }) => {
+                    return QueryNode::Bool {
+                        must,
+                        should,
+                        must_not,
+                        filter,
+                        minimum_should_match: minimum_should_match.clone(),
+                    };
+                }
+            };
+            // Every optional clause unsatisfiable, and at least one required →
+            // the bool matches nothing, whatever `must_not` says. `must_not`
+            // is NOT part of this test: it can only remove further documents,
+            // never add one back. (The previous revision required
+            // `must_not.is_empty()` here and then fell through to the retain
+            // below, which turned `{"bool":{"should":[<vector clause>],
+            // "must_not":[X]}}` from "0 hits" into "every document except X".)
+            if should_required && !should.is_empty() && should.iter().all(QueryNode::is_match_none)
+            {
+                return QueryNode::MatchNone;
+            }
+            // Otherwise drop the dead optional clauses — but only when the
+            // required count does not move with the clause COUNT. It does not
+            // for `None` (1 or 0) and for `Fixed(n)` (n), which is why Lucene
+            // can drop unconditionally at `BooleanQuery.java:323`. It DOES for
+            // `Percentage(p)`, where shrinking `should` shrinks the threshold
+            // and can make an unsatisfiable bool satisfiable.
+            //
+            // THIS `retain` IS THE ONE WIRE-VISIBLE SCORE CHANGE in the pass.
+            // It does not move a hit COUNT — `doc_matches_query` never counts a
+            // `MatchNone` as a satisfied `should` — but the shrunken bool is
+            // projectable through `query_node_to_fts_with_keyword_fields` where
+            // the original was not, so BM25 scores it instead of
+            // `score_query_against_doc`. On the 300-doc fixture
+            // `bool{should:[term emb, term cat:"even"]}` keeps its 150 hits and
+            // goes `_score` 0.008402659 → 0.6931471 (exactly what
+            // `{"term":{"cat":"even"}}` scores on its own, which is what the
+            // bool now reduces to) and `max_score` 1.6931472 → 0.6931471. Both
+            // are in the CHANGELOG and pinned in the (d2c) block of
+            // `user_mapped_dense_vector_builds_no_fts_term_dictionary`.
+            let count_free_msm =
+                matches!(minimum_should_match, None | Some(MinShouldMatch::Fixed(_)));
+            if count_free_msm && should.iter().any(QueryNode::is_match_none) {
+                should.retain(|c| !c.is_match_none());
+            }
+            // Dropping the last `must_not` (or the last `should`) can empty a
+            // bool that arrived with clauses. An all-empty bool matches every
+            // document and scores 1.0 in `doc_matches_query` /
+            // `score_query_against_doc` — bit-identical to `MatchAll`, which
+            // takes the match-all fast path instead of `is_doc_scan_query`'s
+            // `Bool` arm. Lucene folds the same shape, to its own bool
+            // semantics, at `BooleanQuery.java:271`.
+            if !was_empty
+                && must.is_empty()
+                && should.is_empty()
+                && must_not.is_empty()
+                && filter.is_empty()
+            {
+                return QueryNode::MatchAll;
+            }
+            QueryNode::Bool {
+                must,
+                should,
+                must_not,
+                filter,
+                minimum_should_match: minimum_should_match.clone(),
+            }
+        }
+        // `constant_score` and a top-level `boost` wrapper both BUBBLE UP an
+        // unsatisfiable inner query rather than wrapping it — Lucene does the
+        // same, in the same words, at
+        // `lucene/core/src/java/org/apache/lucene/search/ConstantScoreQuery.java:56`
+        // ("bubble up MatchNoDocsQuery") and `BoostQuery.java:87`. It is exact
+        // — neither wrapper can make a non-matching inner query match — and it
+        // matters here because `Constant` is the ONLY wrapper with an arm in
+        // `query_node_to_fts_with_keyword_fields`: left as
+        // `Constant{MatchNone}` it projects to `None`, and `Constant` is in
+        // `is_doc_scan_query`, so `{"constant_score":{"filter":{"term":
+        // {"emb":…}}}}` would trade an inverted-index lookup for a full
+        // stored-doc scan.
+        QueryNode::Constant { score, query } => match recurse(query) {
+            QueryNode::MatchNone => QueryNode::MatchNone,
+            lowered => QueryNode::Constant {
+                score: *score,
+                query: Box::new(lowered),
+            },
+        },
+        QueryNode::Boosted { boost, query } => match recurse(query) {
+            QueryNode::MatchNone => QueryNode::MatchNone,
+            lowered => QueryNode::Boosted {
+                boost: *boost,
+                query: Box::new(lowered),
+            },
+        },
+        QueryNode::Named { name, query } => QueryNode::Named {
+            name: name.clone(),
+            query: Box::new(recurse(query)),
+        },
+        QueryNode::FunctionScore {
+            query,
+            functions,
+            score_mode,
+            boost_mode,
+            max_boost,
+        } => QueryNode::FunctionScore {
+            query: Box::new(recurse(query)),
+            functions: functions.clone(),
+            score_mode: *score_mode,
+            boost_mode: *boost_mode,
+            max_boost: *max_boost,
+        },
+        QueryNode::Pinned { ids, organic } => QueryNode::Pinned {
+            ids: ids.clone(),
+            organic: Box::new(recurse(organic)),
+        },
+        QueryNode::Boosting {
+            positive,
+            negative,
+            negative_boost,
+        } => QueryNode::Boosting {
+            positive: Box::new(recurse(positive)),
+            negative: Box::new(recurse(negative)),
+            negative_boost: *negative_boost,
+        },
+        QueryNode::DisMax {
+            queries,
+            tie_breaker,
+        } => QueryNode::DisMax {
+            queries: queries.iter().map(recurse).collect(),
+            tie_breaker: *tie_breaker,
+        },
+        QueryNode::Hybrid { queries, fusion } => QueryNode::Hybrid {
+            queries: queries
+                .iter()
+                .map(|wq| xerj_query::ast::WeightedQuery {
+                    query: recurse(&wq.query),
+                    weight: wq.weight,
+                })
+                .collect(),
+            fusion: fusion.clone(),
+        },
+        QueryNode::Knn {
+            field,
+            vector,
+            k,
+            num_candidates,
+            filter,
+            boost,
+            similarity,
+        } => QueryNode::Knn {
+            field: field.clone(),
+            vector: vector.clone(),
+            k: *k,
+            num_candidates: *num_candidates,
+            filter: filter.as_ref().map(|f| Box::new(recurse(f))),
+            boost: *boost,
+            similarity: *similarity,
+        },
+        QueryNode::SemanticSearch {
+            field,
+            text,
+            k,
+            filter,
+            boost,
+        } => QueryNode::SemanticSearch {
+            field: field.clone(),
+            text: text.clone(),
+            k: *k,
+            filter: filter.as_ref().map(|f| Box::new(recurse(f))),
+            boost: *boost,
+        },
+        QueryNode::SpanNear {
+            clauses,
+            slop,
+            in_order,
+        } => QueryNode::SpanNear {
+            clauses: clauses.iter().map(recurse).collect(),
+            slop: *slop,
+            in_order: *in_order,
+        },
+        QueryNode::SpanOr { clauses } => QueryNode::SpanOr {
+            clauses: clauses.iter().map(recurse).collect(),
+        },
+        QueryNode::SpanNot { include, exclude } => QueryNode::SpanNot {
+            include: Box::new(recurse(include)),
+            exclude: Box::new(recurse(exclude)),
+        },
+        QueryNode::SpanFirst { match_query, end } => QueryNode::SpanFirst {
+            match_query: Box::new(recurse(match_query)),
+            end: *end,
+        },
+        QueryNode::SpanContaining { little, big } => QueryNode::SpanContaining {
+            little: Box::new(recurse(little)),
+            big: Box::new(recurse(big)),
+        },
+        QueryNode::SpanWithin { little, big } => QueryNode::SpanWithin {
+            little: Box::new(recurse(little)),
+            big: Box::new(recurse(big)),
+        },
+
+        // Everything else names no lexical target on a vector field:
+        // MatchAll/MatchNone/Ids/Script, `Exists`, the geo leaves, a
+        // field-less `query_string`, `percolate` (the field holds stored
+        // queries, not data), `more_like_this` (with `fields` the parser
+        // lowers it to a `bool.should` of `match`, which the leaf arms above
+        // catch), and `Nested` (see the doc comment).
+        other => other.clone(),
+    }
+}
+
+/// Unit coverage for [`lower_lexically_typeless_clauses`] — #328.
+///
+/// The integration tests in `tests/integration.rs` pin the ANSWERS this
+/// rewriter has to produce end to end; these pin the SHAPE it produces, which
+/// is what decides whether the query then runs on the inverted index or on the
+/// stored-doc scan. The distinction is not cosmetic: `Bool{must_not:[MatchNone]}`
+/// and `Bool{}` give the same hits, but only the second projects through
+/// `query_node_to_fts_with_keyword_fields` — the first `?`s out on its
+/// `must_not` child and falls to a full corpus walk.
+#[cfg(test)]
+mod lexically_typeless_lowering_tests {
+    use super::*;
+
+    fn typeless(names: &[&str]) -> std::collections::HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn term(field: &str, value: &str) -> QueryNode {
+        QueryNode::Term {
+            field: field.into(),
+            value: Value::String(value.into()),
+            boost: None,
+        }
+    }
+
+    fn bool_of(
+        must: Vec<QueryNode>,
+        should: Vec<QueryNode>,
+        must_not: Vec<QueryNode>,
+        filter: Vec<QueryNode>,
+        msm: Option<MinShouldMatch>,
+    ) -> QueryNode {
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match: msm,
+        }
+    }
+
+    fn lower(q: &QueryNode) -> QueryNode {
+        lower_lexically_typeless_clauses(q, &typeless(&["emb", "emb_chunks"]))
+    }
+
+    // ── Leaves ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn single_field_leaf_on_a_vector_field_lowers_to_match_none() {
+        for leaf in [
+            term("emb", "0.5"),
+            QueryNode::Terms {
+                field: "emb".into(),
+                values: vec![Value::String("0.5".into())],
+                boost: None,
+            },
+            QueryNode::Range {
+                field: "emb".into(),
+                gte: Some(Value::from(-2.0)),
+                gt: None,
+                lte: Some(Value::from(2.0)),
+                lt: None,
+                boost: None,
+            },
+            QueryNode::Prefix {
+                field: "emb".into(),
+                value: "0".into(),
+                boost: None,
+                constant_score: true,
+            },
+            QueryNode::Wildcard {
+                field: "emb".into(),
+                value: "0*".into(),
+                boost: None,
+                constant_score: true,
+            },
+            QueryNode::Match {
+                field: "emb".into(),
+                query: "0".into(),
+                operator: xerj_query::ast::BoolOperator::Or,
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            },
+            term("emb_chunks", "0.5"),
+        ] {
+            assert!(
+                lower(&leaf).is_match_none(),
+                "leaf naming a lexically typeless field must lower: {leaf:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn leaf_on_a_lexical_field_is_untouched() {
+        let q = term("cat", "even");
+        assert_eq!(lower(&q), q, "a normal field keeps its clause");
+    }
+
+    /// `Exists` is answered from `_source` / doc values, never from the term
+    /// dictionary, so it must survive — this is the clause that keeps
+    /// `{"exists":{"field":"emb"}}` answering 5,000/5,000 after the postings
+    /// are gone.
+    #[test]
+    fn exists_and_knn_on_a_vector_field_survive() {
+        let exists = QueryNode::Exists {
+            field: "emb".into(),
+        };
+        assert_eq!(lower(&exists), exists);
+
+        let knn = QueryNode::Knn {
+            field: "emb".into(),
+            vector: vec![0.0, 1.0],
+            k: 3,
+            num_candidates: None,
+            filter: Some(Box::new(term("cat", "even"))),
+            boost: None,
+            similarity: None,
+        };
+        match lower(&knn) {
+            QueryNode::Knn { field, filter, .. } => {
+                assert_eq!(field, "emb", "the kNN target is the whole point");
+                assert_eq!(
+                    *filter.expect("filter kept"),
+                    term("cat", "even"),
+                    "a lexical filter under kNN is walked but not lowered"
+                );
+            }
+            other => panic!("kNN must not be lowered: {other:?}"),
+        }
+    }
+
+    /// A kNN filter that names the vector field itself IS lowered — the filter
+    /// is an ordinary lexical sub-query, unlike the `field` it hangs off.
+    #[test]
+    fn knn_filter_naming_the_vector_field_is_lowered() {
+        let knn = QueryNode::Knn {
+            field: "emb".into(),
+            vector: vec![0.0, 1.0],
+            k: 3,
+            num_candidates: None,
+            filter: Some(Box::new(term("emb", "0.5"))),
+            boost: None,
+            similarity: None,
+        };
+        match lower(&knn) {
+            QueryNode::Knn { filter, .. } => {
+                assert!(filter.expect("filter kept").is_match_none());
+            }
+            other => panic!("expected knn, got {other:?}"),
+        }
+    }
+
+    // ── Multi-field forms ────────────────────────────────────────────────
+
+    #[test]
+    fn multi_match_keeps_its_lexical_fields_and_drops_the_vector_ones() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["emb".into(), "body^3".into(), "emb_chunks".into()],
+            query: "0".into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: Some(xerj_query::ast::BoolOperator::Or),
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        match lower(&q) {
+            QueryNode::MultiMatch { fields, .. } => {
+                assert_eq!(fields, vec!["body^3".to_string()], "boost suffix preserved");
+            }
+            other => panic!("expected a pruned multi_match, got {other:?}"),
+        }
+    }
+
+    /// The regression the PR body originally mis-reported as "byte-identical":
+    /// a `fields` list naming ONLY vector fields must become `MatchNone`, not
+    /// an empty-`fields` multi_match (which means "all fields" downstream) and
+    /// not a stored-doc scan (which answers every document, because the scan
+    /// renders the float array to text and every component contains a `0`).
+    #[test]
+    fn multi_match_over_only_vector_fields_becomes_match_none() {
+        let q = QueryNode::MultiMatch {
+            fields: vec!["emb".into(), "emb_chunks^2".into()],
+            query: "0".into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: Some(xerj_query::ast::BoolOperator::Or),
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert!(lower(&q).is_match_none());
+    }
+
+    /// An EMPTY `fields` list means "every field", not "no field" — pruning
+    /// cannot empty it, so the node must be left exactly as it arrived.
+    #[test]
+    fn multi_match_with_no_fields_is_left_alone() {
+        let q = QueryNode::MultiMatch {
+            fields: vec![],
+            query: "0".into(),
+            match_type: xerj_query::ast::MultiMatchType::BestFields,
+            operator: Some(xerj_query::ast::BoolOperator::Or),
+            analyzer: None,
+            boost: None,
+            slop: 0,
+            max_expansions: 50,
+        };
+        assert_eq!(lower(&q), q);
+    }
+
+    /// A pattern entry is an EXPANSION, and the expansion sets in
+    /// `search_inner` already drop vector fields, so it must not be pruned
+    /// here — pruning `"*"` would silently turn "search everything" into
+    /// "search nothing".
+    #[test]
+    fn a_wildcard_field_spec_is_not_pruned() {
+        let q = QueryNode::SimpleQueryString {
+            query: "0".into(),
+            fields: vec!["*".into(), "emb".into()],
+        };
+        match lower(&q) {
+            QueryNode::SimpleQueryString { fields, .. } => {
+                assert_eq!(fields, vec!["*".to_string()]);
+            }
+            other => panic!("expected simple_query_string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn query_string_with_a_vector_default_field_becomes_match_none() {
+        let q = QueryNode::QueryString {
+            query: "0".into(),
+            default_field: Some("emb".into()),
+            default_operator: None,
+            boost: None,
+        };
+        assert!(lower(&q).is_match_none());
+    }
+
+    // ── Bool folding ─────────────────────────────────────────────────────
+
+    #[test]
+    fn match_none_in_must_or_filter_sinks_the_whole_bool() {
+        assert!(lower(&bool_of(
+            vec![term("emb", "0.5"), term("cat", "even")],
+            vec![],
+            vec![],
+            vec![],
+            None
+        ))
+        .is_match_none());
+        assert!(lower(&bool_of(
+            vec![],
+            vec![],
+            vec![],
+            vec![term("emb", "0.5")],
+            None
+        ))
+        .is_match_none());
+    }
+
+    /// `must_not` is the arm the first cut of this pass left open. A clause
+    /// that matches nothing excludes nothing, so it must be DROPPED — leaving
+    /// a `MatchNone` there keeps the bool un-projectable and sends a query
+    /// that used to run on the inverted index to the stored-doc scan.
+    #[test]
+    fn match_none_in_must_not_is_dropped_not_kept() {
+        match lower(&bool_of(
+            vec![term("cat", "even")],
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![],
+            None,
+        )) {
+            QueryNode::Bool { must, must_not, .. } => {
+                assert_eq!(must, vec![term("cat", "even")]);
+                assert!(must_not.is_empty(), "a dead exclusion is not an exclusion");
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+    }
+
+    /// The bool empties out completely: `{"bool":{"must_not":[{"term":
+    /// {"emb":…}}]}}` excludes nothing and therefore matches everything.
+    /// `MatchAll` and an all-empty `Bool` agree on hits AND on `_score` (1.0),
+    /// but only `MatchAll` skips `is_doc_scan_query`.
+    #[test]
+    fn a_bool_emptied_by_the_fold_becomes_match_all() {
+        assert_eq!(
+            lower(&bool_of(
+                vec![],
+                vec![],
+                vec![term("emb", "0.5")],
+                vec![],
+                None
+            )),
+            QueryNode::MatchAll
+        );
+    }
+
+    /// …but a bool that arrived empty is NOT rewritten: this pass only ever
+    /// reacts to something it itself lowered.
+    #[test]
+    fn a_bool_that_arrived_empty_is_untouched() {
+        let q = bool_of(vec![], vec![], vec![], vec![], None);
+        assert_eq!(lower(&q), q);
+    }
+
+    /// THE CORRECTNESS CASE. `should` is required whenever `must` and `filter`
+    /// are empty — `must_not` does not relax it (`doc_matches_query`'s Bool arm
+    /// tests `must.is_empty() && filter.is_empty()`). The first cut of this
+    /// pass required `must_not.is_empty()` before folding and then fell through
+    /// to dropping the dead `should` clause, which turned this query from
+    /// "0 hits" into "every document except the excluded ones".
+    #[test]
+    fn all_should_unsatisfiable_sinks_the_bool_even_with_a_must_not() {
+        assert!(lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![term("cat", "even")],
+            vec![],
+            None,
+        ))
+        .is_match_none());
+    }
+
+    #[test]
+    fn all_should_unsatisfiable_sinks_a_should_only_bool() {
+        assert!(lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![],
+            vec![],
+            None
+        ))
+        .is_match_none());
+    }
+
+    /// With a `must` present, `should` is scoring-only (`min = 0`), so a dead
+    /// optional clause is dropped and the bool survives.
+    #[test]
+    fn a_dead_should_beside_a_must_is_dropped_and_the_bool_survives() {
+        match lower(&bool_of(
+            vec![term("cat", "even")],
+            vec![term("emb", "0.5"), term("body", "liquidity")],
+            vec![],
+            vec![],
+            None,
+        )) {
+            QueryNode::Bool { must, should, .. } => {
+                assert_eq!(must, vec![term("cat", "even")]);
+                assert_eq!(should, vec![term("body", "liquidity")]);
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+    }
+
+    /// An explicit numeric `minimum_should_match` does not move with the
+    /// clause count, so the dead clause is dropped — and the survivor count
+    /// can now be below the threshold, which is exactly the original meaning.
+    #[test]
+    fn fixed_minimum_should_match_still_drops_the_dead_clause() {
+        match lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5"), term("body", "liquidity")],
+            vec![],
+            vec![],
+            Some(MinShouldMatch::Fixed(2)),
+        )) {
+            QueryNode::Bool {
+                should,
+                minimum_should_match,
+                ..
+            } => {
+                assert_eq!(should, vec![term("body", "liquidity")]);
+                assert_eq!(minimum_should_match, Some(MinShouldMatch::Fixed(2)));
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+    }
+
+    /// `Fixed(0)` makes `should` optional, so an all-dead `should` list does
+    /// NOT sink the bool.
+    #[test]
+    fn fixed_zero_minimum_should_match_keeps_the_bool_alive() {
+        match lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![term("cat", "even")],
+            vec![],
+            Some(MinShouldMatch::Fixed(0)),
+        )) {
+            QueryNode::Bool {
+                should, must_not, ..
+            } => {
+                assert!(should.is_empty(), "dead optional clause dropped");
+                assert_eq!(must_not, vec![term("cat", "even")]);
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+    }
+
+    /// A PERCENTAGE threshold moves with `should.len()`
+    /// (`floor(len × pct/100).max(1)`), so the list must not be shrunk. It is
+    /// still required at every percentage — including 0, because of the
+    /// `.max(1)` — so an all-dead list sinks the bool.
+    #[test]
+    fn percentage_minimum_should_match_does_not_shrink_the_clause_list() {
+        match lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5"), term("body", "a"), term("body", "b")],
+            vec![],
+            vec![],
+            Some(MinShouldMatch::Percentage(67)),
+        )) {
+            QueryNode::Bool { should, .. } => {
+                assert_eq!(should.len(), 3, "threshold rides on the clause COUNT");
+                assert!(should[0].is_match_none());
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+        assert!(lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![],
+            vec![],
+            Some(MinShouldMatch::Percentage(0)),
+        ))
+        .is_match_none());
+    }
+
+    /// `terms_set`: the required count is read PER DOCUMENT and 0 is legal, so
+    /// neither fold is sound and the node is left exactly as recursed.
+    #[test]
+    fn per_document_minimum_should_match_blocks_both_folds() {
+        match lower(&bool_of(
+            vec![],
+            vec![term("emb", "0.5")],
+            vec![],
+            vec![],
+            Some(MinShouldMatch::Field("required".into())),
+        )) {
+            QueryNode::Bool {
+                should,
+                minimum_should_match,
+                ..
+            } => {
+                assert_eq!(should.len(), 1, "clause count preserved");
+                assert!(should[0].is_match_none(), "leaf still lowered");
+                assert_eq!(
+                    minimum_should_match,
+                    Some(MinShouldMatch::Field("required".into()))
+                );
+            }
+            other => panic!("expected a bool, got {other:?}"),
+        }
+    }
+
+    // ── Wrappers ─────────────────────────────────────────────────────────
+
+    /// `Constant` is the only wrapper with an arm in
+    /// `query_node_to_fts_with_keyword_fields`, so it is the only one where
+    /// failing to bubble up costs an inverted-index lookup.
+    #[test]
+    fn constant_score_and_boost_bubble_up_match_none() {
+        assert!(lower(&QueryNode::Constant {
+            score: 2.0,
+            query: Box::new(term("emb", "0.5")),
+        })
+        .is_match_none());
+        assert!(lower(&QueryNode::Boosted {
+            boost: 2.0,
+            query: Box::new(term("emb", "0.5")),
+        })
+        .is_match_none());
+    }
+
+    #[test]
+    fn constant_score_over_a_lexical_clause_is_untouched() {
+        let q = QueryNode::Constant {
+            score: 2.0,
+            query: Box::new(term("cat", "even")),
+        };
+        assert_eq!(lower(&q), q);
+    }
+
+    /// Field names inside a `nested` query resolve against the ELEMENT, not
+    /// the root, so a root-level `emb` in the set is not the inner `emb`.
+    /// Deliberately out of scope — pinned so the decision is a decision.
+    #[test]
+    fn nested_is_not_walked() {
+        let q = QueryNode::Nested {
+            path: "chunks".into(),
+            query: Box::new(term("emb", "0.5")),
+            score_mode: None,
+        };
+        assert_eq!(lower(&q), q);
+    }
+
+    /// The whole pass is a no-op on a schema with no vector fields — the
+    /// caller skips it entirely on an empty set, and this pins that the
+    /// function agrees.
+    #[test]
+    fn an_empty_typeless_set_changes_nothing() {
+        let q = bool_of(
+            vec![term("emb", "0.5")],
+            vec![term("body", "x")],
+            vec![term("cat", "even")],
+            vec![],
+            None,
+        );
+        assert_eq!(
+            lower_lexically_typeless_clauses(&q, &std::collections::HashSet::new()),
+            q
+        );
+    }
+}
+
 /// Rewrite a query by resolving any field aliases to their canonical field names.
 ///
 /// Traverses the query tree, replacing alias field names with their target paths.
@@ -30812,6 +31872,89 @@ fn dynamic_field_config(key: &str, val: &Value, date_detection: bool) -> FieldCo
     dynamic_field_config_at_depth(key, val, date_detection, 1)
 }
 
+/// Is `key` the per-document MULTI-VECTOR companion of a `dense_vector` that
+/// is already declared, carrying the value shape RFC #148 gives one?
+///
+/// Dynamic mapping must NOT register such a key. `<vector>_chunks` arrives in
+/// `_source` as an array of float arrays, and `infer_field_type` walks it to
+/// its first scalar and lands on `FieldType::Double` — a `FieldConfig` that is
+/// byte-identical to what a user mapping `"type": "double"` would have
+/// produced. Once that config exists nothing downstream can tell the two
+/// apart, and `memtable::declares_non_vector_shaped_field` is left choosing
+/// between honouring a declaration nobody made (giving the companion back its
+/// term dictionary: measured `<seg>.emb_chunks.fst` 0 B → 1,592,118 B on the
+/// 300-doc `#328` fixture) and overriding a declaration the user DID make
+/// (silently unmapping their own numeric field). Not inventing the config is
+/// what removes the choice.
+///
+/// It is the same refusal the `__xerj_passage_meta__` sidecar already gets in
+/// the same `||` at each of this predicate's call sites
+/// (`key.starts_with(PASSAGE_METADATA_PREFIX)`), and the same modelling Lucene
+/// uses: a per-document multi-vector is `LateInteractionField extends
+/// BinaryDocValuesField`
+/// (`lucene/core/src/java/org/apache/lucene/document/LateInteractionField.java:36`,
+/// `:44`, `:45`) — its own field type, never a numeric one arrived at by
+/// inference.
+///
+/// THREE conditions, all required, so the blast radius is exactly the
+/// companion:
+///
+///  * the name is `<base>_chunks`;
+///  * `<base>` is ALREADY declared `dense_vector` in the live schema — a
+///    `foo_chunks` with no `foo` vector beside it is an ordinary field and is
+///    mapped as one;
+///  * the value [`looks_like_multi_vector`] — a rectangular, non-empty array of
+///    non-empty all-numeric arrays. A scalar, a string, a flat array or a
+///    ragged one is somebody's own field and is mapped as one.
+///
+/// KNOWN LIMIT, and it fails SAFE: this only fires when the `dense_vector` is
+/// declared BEFORE the documents arrive. Index first and map afterwards and
+/// `<vector>_chunks` already holds a dynamic `double` config, which
+/// `declares_non_vector_shaped_field` then (correctly, on the information it
+/// has) yields to — so the companion keeps its term dictionary. That costs
+/// bytes, not answers. Pinned by
+/// `documents_before_the_mapping_leave_the_companion_mapped_and_lexical`.
+/// ALLOCATION: this runs for every key of every ingested document that dynamic
+/// mapping does not already know, on both the read-lock pre-screen and the
+/// write-lock loop, so it allocates nothing and orders its three tests
+/// cheapest-first: an `O(1)` suffix strip, then an allocation-free schema walk
+/// ([`declares_dense_vector`], which is why `collect_dense_vector_fields`'
+/// `Vec<String>` is not used here), then the value walk.
+fn is_undeclared_multi_vector_companion(schema: &Schema, key: &str, val: &Value) -> bool {
+    let Some(base) = key.strip_suffix(crate::memtable::MULTI_VECTOR_COMPANION_SUFFIX) else {
+        return false;
+    };
+    !base.is_empty()
+        && declares_dense_vector(schema, base)
+        && crate::memtable::looks_like_multi_vector(val)
+}
+
+/// Is `path` declared `dense_vector`? Allocation-free, and resolves BOTH
+/// spellings of a nested name for the same reason
+/// `memtable::declares_non_vector_shaped_field` does: `put_mapping` stores a
+/// dotted path as one top-level `FieldConfig` named `"passages.vec"`, while
+/// `es_properties_to_fields` stores it as a `vec` child under a `passages`
+/// object. The literal lookup runs first so the flat spelling cannot fall
+/// through the segmented walk and be reported as undeclared.
+fn declares_dense_vector(schema: &Schema, path: &str) -> bool {
+    let is_vector = |fc: &FieldConfig| matches!(fc.field_type, FieldType::Vector);
+    if let Some(field) = schema.fields.iter().find(|fc| fc.name == path) {
+        return is_vector(field);
+    }
+    let mut fields: &[FieldConfig] = &schema.fields;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let Some(field) = fields.iter().find(|fc| fc.name == segment) else {
+            return false;
+        };
+        if segments.peek().is_none() {
+            return is_vector(field);
+        }
+        fields = &field.fields;
+    }
+    false
+}
+
 fn dynamic_field_config_at_depth(
     key: &str,
     val: &Value,
@@ -30938,6 +32081,26 @@ fn merge_dynamic_children_into(
     };
     let mut changed = false;
     for (key, sub_val) in obj {
+        // The nested form of `is_undeclared_multi_vector_companion`. It needs
+        // no dotted path and no `Schema`, because a companion and its
+        // `dense_vector` are SIBLINGS in the very object being merged: for a
+        // `passages` mapping carrying a `vec` child of type `dense_vector`, the
+        // companion is the `vec_chunks` child right beside it. Checking
+        // `field.fields` locally keeps this function's signature (and its four
+        // call sites) untouched.
+        if key
+            .strip_suffix(crate::memtable::MULTI_VECTOR_COMPANION_SUFFIX)
+            .filter(|base| !base.is_empty())
+            .is_some_and(|base| {
+                field
+                    .fields
+                    .iter()
+                    .any(|f| f.name == base && matches!(f.field_type, FieldType::Vector))
+            })
+            && crate::memtable::looks_like_multi_vector(sub_val)
+        {
+            continue;
+        }
         match field.fields.iter_mut().find(|f| f.name == *key) {
             Some(existing) => {
                 if merge_dynamic_children_into(
@@ -39595,6 +40758,187 @@ mod date_detection_tests {
                 "{bad} must be rejected"
             );
         }
+    }
+}
+
+/// Unit coverage for the #328 dynamic-mapping refusal — the half of the
+/// companion rule that keeps `memtable::declares_non_vector_shaped_field` free
+/// to yield to any declaration it finds.
+#[cfg(test)]
+mod multi_vector_companion_mapping_tests {
+    use super::*;
+
+    fn vector(name: &str, dims: usize) -> FieldConfig {
+        let mut fc = FieldConfig::new(name, FieldType::Vector);
+        fc.options.dimensions = Some(dims);
+        fc
+    }
+
+    fn schema_with_vector() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("body", FieldType::Text))
+            .unwrap();
+        schema.add_field(vector("emb", 2)).unwrap();
+        schema
+    }
+
+    /// ALL THREE conditions are required. Drop any one and dynamic mapping goes
+    /// back to registering the key like any other.
+    #[test]
+    fn the_refusal_needs_the_name_the_declaration_and_the_shape() {
+        let schema = schema_with_vector();
+        let mv = serde_json::json!([[1.0, 2.0], [3.0, 4.0]]);
+
+        // All three present.
+        assert!(is_undeclared_multi_vector_companion(
+            &schema,
+            "emb_chunks",
+            &mv
+        ));
+
+        // Wrong NAME: same value, no `_chunks` suffix, and a suffix with no
+        // base in front of it.
+        assert!(!is_undeclared_multi_vector_companion(&schema, "emb", &mv));
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema, "matrix", &mv
+        ));
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema, "_chunks", &mv
+        ));
+
+        // No DECLARATION to be a companion of: `other_chunks` has no `other`
+        // vector beside it, so it is an ordinary field even though its value is
+        // rectangular numeric.
+        assert!(!is_undeclared_multi_vector_companion(
+            &schema,
+            "other_chunks",
+            &mv
+        ));
+        // …and a base declared as something that is not a vector does not
+        // create a companion either.
+        let mut lexical_base = Schema::empty();
+        lexical_base
+            .add_field(FieldConfig::new("emb", FieldType::Text))
+            .unwrap();
+        assert!(!is_undeclared_multi_vector_companion(
+            &lexical_base,
+            "emb_chunks",
+            &mv
+        ));
+
+        // Wrong SHAPE: a user's own scalar, string, flat array or ragged array
+        // under the companion's name is still mapped.
+        for own in [
+            serde_json::json!(7),
+            serde_json::json!(7.5),
+            serde_json::json!("tenant-a"),
+            serde_json::json!([1.0, 2.0]),
+            serde_json::json!([[1.0, 2.0], [3.0]]),
+        ] {
+            assert!(
+                !is_undeclared_multi_vector_companion(&schema, "emb_chunks", &own),
+                "{own} is somebody's own field and must be mapped"
+            );
+        }
+    }
+
+    /// Both spellings of a nested vector reach the schema, so both must be
+    /// recognised — the same two shapes
+    /// `nested_dense_vector_is_excluded_from_its_parent_objects_term_dictionary`
+    /// exercises. The flat lookup runs first so it cannot fall through the
+    /// segmented walk.
+    #[test]
+    fn declares_dense_vector_resolves_both_nested_spellings() {
+        let mut dotted = Schema::empty();
+        dotted.add_field(vector("passages.vec", 2)).unwrap();
+        assert!(declares_dense_vector(&dotted, "passages.vec"));
+        assert!(!declares_dense_vector(&dotted, "passages"));
+        assert!(!declares_dense_vector(&dotted, "passages.other"));
+
+        let mut sub = Schema::empty();
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 2));
+        parent
+            .fields
+            .push(FieldConfig::new("title", FieldType::Text));
+        sub.add_field(parent).unwrap();
+        assert!(declares_dense_vector(&sub, "passages.vec"));
+        assert!(!declares_dense_vector(&sub, "passages.title"));
+        assert!(!declares_dense_vector(&sub, "passages"));
+        // Does not walk past a leaf, and does not invent missing segments.
+        assert!(!declares_dense_vector(&sub, "passages.vec.deeper"));
+        assert!(!declares_dense_vector(&sub, "absent.vec"));
+    }
+
+    /// The nested form of the refusal, which lives in
+    /// `merge_dynamic_children_into` and reads the sibling list directly rather
+    /// than a dotted path. A `vec_chunks` beside a `dense_vector vec` is not
+    /// registered; a `vec_chunks` with a scalar value, or one whose sibling is
+    /// not a vector, is.
+    #[test]
+    fn a_nested_companion_is_not_merged_in_beside_its_vector() {
+        let mut parent = FieldConfig::new("passages", FieldType::Object);
+        parent.fields.push(vector("vec", 2));
+        let mut count = 1u32;
+        let changed = merge_dynamic_children_into(
+            &mut parent,
+            &serde_json::json!({"vec_chunks": [[1.0, 2.0], [3.0, 4.0]], "title": "q3"}),
+            true,
+            1,
+            &mut count,
+            100,
+        );
+        assert!(changed, "the ordinary sibling still lands");
+        assert!(
+            parent.fields.iter().any(|f| f.name == "title"),
+            "{parent:?}"
+        );
+        assert!(
+            !parent.fields.iter().any(|f| f.name == "vec_chunks"),
+            "the nested multi-vector companion must not be registered: {parent:?}"
+        );
+        assert_eq!(count, 2, "exactly one field was added");
+
+        // A scalar under the same name IS somebody's own field.
+        let mut own = FieldConfig::new("passages", FieldType::Object);
+        own.fields.push(vector("vec", 2));
+        let mut own_count = 1u32;
+        merge_dynamic_children_into(
+            &mut own,
+            &serde_json::json!({"vec_chunks": 7}),
+            true,
+            1,
+            &mut own_count,
+            100,
+        );
+        assert_eq!(
+            own.fields
+                .iter()
+                .find(|f| f.name == "vec_chunks")
+                .map(|f| f.field_type),
+            Some(FieldType::Long),
+            "{own:?}"
+        );
+
+        // …and so is a rectangular numeric array with no vector sibling.
+        let mut no_vector = FieldConfig::new("passages", FieldType::Object);
+        no_vector
+            .fields
+            .push(FieldConfig::new("vec", FieldType::Text));
+        let mut nv_count = 1u32;
+        merge_dynamic_children_into(
+            &mut no_vector,
+            &serde_json::json!({"vec_chunks": [[1.0, 2.0]]}),
+            true,
+            1,
+            &mut nv_count,
+            100,
+        );
+        assert!(
+            no_vector.fields.iter().any(|f| f.name == "vec_chunks"),
+            "no `dense_vector` sibling means no companion: {no_vector:?}"
+        );
     }
 }
 
