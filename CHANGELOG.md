@@ -22,47 +22,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiet when the same request already reaches the vector through `semantic`
   or `knn` (including the ES 8.x top-level `knn` block).
 - **A `quantization: "scalar8"` (`int8_hnsw`) vector field scored updated
-  documents from stale quantized codes, silently, forever**
+  documents from stale quantized data, silently, forever**
   ([#371](https://github.com/xerj-org/xerj/issues/371)).
-  The per-field SQ8 code store was populated write-once: the first kNN that
-  observed a document computed its codes and nothing ever recomputed them — not
-  an update, not a delete-and-reindex, not a merge. Overwrite a document's
-  vector and it kept the ranking it had at first sight.
+  There were **two** write-once caches on this path, and either one alone
+  reproduces the reported symptom.
 
-  Reproduced at the HTTP boundary before the fix, on an 8-dimension cosine
-  field, against a byte-identical full-precision control index: doc `0` starts
-  as the query vector itself and is rewritten with its exact negation (true
-  cosine -1). The control drops it as it must. The `scalar8` index returned it
-  at `_score` **0.99999774** — the same value, to the last bit, as before the
-  rewrite, with the entire 20-document score list unchanged — while
-  `GET /{index}/_doc/0` confirmed `_source` had taken the negation. Both
-  `PUT /{index}/_doc/{id}` and `_bulk` were affected; `_bulk` was untested in
-  the original report.
+  1. The per-field SQ8 **code store** was populated write-once: the first kNN
+     that observed a document computed its codes and nothing ever recomputed
+     them — not an update, not a delete-and-reindex, not a merge.
+  2. The per-field **codebook** (`Sq8Params`, the per-dimension min/scale pair)
+     was fitted from the first <=1000 candidate vectors the field was ever
+     scanned with and then kept for the life of the process. A vector written
+     afterwards that falls outside that fitted range is *clamped* into it, and
+     when the fitted range is narrow the clamped decode is indistinguishable
+     from the vector the document used to hold.
 
-  The fix removes the per-document cache rather than adding invalidation to it.
-  The brute-force scan already holds each candidate's live f32 vector — it just
-  read it out of `_source` to apply the filter — so it now quantizes and
-  dequantizes on the spot through a new `Sq8Params::encode_into`, into two
-  buffers reused across the scan (no per-document allocation). Only the fitted
-  per-dimension min/scale codebook is kept between queries, behind an `Arc` the
-  scan clones so it holds no lock while scoring. `scalar8` still scores from
-  1-byte-per-dimension codes, so its recall profile is unchanged; what changes
-  is that the code being scored is always the document's current vector.
+  Both were reproduced at the HTTP boundary before the fix, each against a
+  byte-identical full-precision control index that performs the identical
+  manipulation:
 
-  Three defects in the same object went with it: unbounded growth (the map had
-  no eviction and no upper bound — one entry per document ever queried, for the
-  life of the process), an exclusive write lock taken on the query path on
-  *every* kNN over the field, and a codebook that could be fitted from an empty
-  candidate set — a single query with a wrong-length vector installed an
-  all-zero-scale codec that every later score on that field collapsed onto.
+  * **codes** — 8-dimension cosine field, doc `0` starts as the query vector
+    and is rewritten with its exact negation. The control drops it as it must;
+    the `scalar8` index returned it at `_score` **0.99999774**, the same value
+    to the last bit as before the rewrite, with the entire 20-document score
+    list unchanged, while `GET /{index}/_doc/0` confirmed `_source` had taken
+    the negation. `PUT /{index}/_doc/{id}` and `_bulk` were both affected;
+    `_bulk` was untested in the original report.
+  * **codebook** — same shape, but over a corpus whose dimension 0 never leaves
+    `+1.0`, so it fits the degenerate range `[1,1]`. Doc `0` negated to `-1.0`
+    decodes straight back to `+1.0`: still first at `_score` **1.000000**, the
+    whole score list frozen. On the workload the issue names as what makes it a
+    blocker — re-embedding a corpus after a model change — a codebook fitted to
+    the old embedding space clamped 50 re-embedded documents into a 0.002-wide
+    score band, destroying ranking outright.
 
-  Not closed by this change: `scalar8` still reads the full-precision vector
-  from `_source` on every query, so it does not reduce resident memory today.
-  Making it do so means the ordinal-addressed, ingest-time code array described
-  in #371 — codes written next to the data they describe, as Lucene does it —
-  which is a separate change. The "~4× smaller vector working set" wording in
-  `ES_COMPATIBILITY.md` described the cache that has been removed and has been
-  corrected there rather than left standing.
+  The fix removes both caches rather than adding invalidation to them. The
+  brute-force scan already holds each candidate's live f32 vector — it just
+  read it out of `_source` to apply the filter — so it now fits the codebook
+  over exactly the candidates it is about to score and quantizes/dequantizes
+  each one on the spot, through a new `Sq8Params::encode_into` and
+  `Sq8Params::fit_borrowed`, into two buffers reused across the scan (no
+  per-document allocation). **No SQ8 state of any kind now outlives a query**,
+  so there is nothing left to go stale. Fitting over exactly the set being
+  encoded additionally makes clamping impossible on this path rather than
+  merely unlikely: every value passed to `encode_into` is inside `[min,max]` by
+  construction. `scalar8` still scores from 1-byte-per-dimension codes, so its
+  recall profile is unchanged — measured recall@10 **0.998** against the exact
+  float32 index on the `vector-quantization` recipe corpus, byte-identical
+  scores to before this change on that (unfiltered, <1000-doc, never-updated)
+  shape.
+
+  Three defects in the removed objects went with them: unbounded growth (the
+  code map had no eviction and no upper bound — one entry per document ever
+  queried, for the life of the process), an exclusive write lock taken on the
+  query path on *every* kNN over the field, and a codebook that could be fitted
+  from an empty candidate set — a single query with a wrong-length vector
+  installed an all-zero-scale codec that every later score on that field
+  collapsed onto. That last one is now structurally absent rather than guarded:
+  a codebook that does not outlive its query cannot be observed by another.
+
+  **Not closed by this change**, tracked in
+  [#392](https://github.com/xerj-org/xerj/issues/392):
+  * `scalar8` still reads the full-precision vector from `_source` on every
+    query, so it **does not reduce resident memory** — it buys the precision
+    profile of int8 and nothing else. Making it a memory win means the
+    ordinal-addressed, ingest-time code array described in #371, written next
+    to the data it describes as Lucene does it. The "~4x smaller vector working
+    set" wording has been corrected wherever it appeared rather than left
+    standing: `demo/playbooks/ES_COMPATIBILITY.md`,
+    `demo/playbooks/STUB_AUDIT.md`, `demo/playbooks/USER_FEEDBACK_SCORECARD_RC4.md`,
+    `docs/recipes/vector-quantization.md`, `docs/recipes/README.md`,
+    `docs/examples/vector-quantization/quant_demo.py`,
+    `recipes/vector_quantization.py`, `xerj-common/src/config.rs` and
+    `xerj-vector/src/quantizer.rs`.
+  * because the codebook is now fitted per query, a `scalar8` `_score` depends
+    on the candidate set: the same document can score marginally differently
+    under two different `filter`s. The difference is bounded by SQ8's own
+    quantization step (1/255 of the fitted per-dimension range), inside the
+    approximation error `scalar8` already carries, but it is a real difference
+    from Elasticsearch, which fixes its codebook per segment at index time.
+  * `scalar8` continues to disqualify a field from HNSW-served kNN, so opting
+    in still costs ANN.
+
+  Cost: measured, but **not resolved**. `ci-test` profile, 4000 docs x 384
+  dims, warm, min/p10/p50 of 60 requests, three builds per side. On the
+  scan-bound shape (`k=4000`) the two sides overlap and the ordering flips with
+  the statistic — best min-of-60 was 22.66 ms on main vs 24.88 ms here, but
+  best p10 was 29.26 ms on main vs 25.09 ms here — on a machine that produced
+  p50 outliers up to 159 ms from background load. No direction can be claimed
+  for that shape from these numbers. The small-`k` shape (`k=10`,
+  `num_candidates=100`) was consistently marginally faster here, 0.15-0.16 ms
+  against 0.17-0.18 ms on main, which is the per-query `RwLock` read on the
+  codec store going away. In principle this change adds one min/max pass over
+  the candidate vectors and removes a lock acquisition; both are small against
+  the encode/decode/similarity work the scan already does.
 
 ## [1.0.0-rc.17] - 2026-08-15
 

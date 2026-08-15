@@ -5116,34 +5116,6 @@ impl RequestCacheSeen {
 
 // ── SQ8 serving-path codec ────────────────────────────────────────────────────
 
-/// Per-field SQ8 (scalar8) codec used by the kNN serving path.
-///
-/// Holds the shared [`Sq8Params`] for one dense_vector field — the
-/// per-dimension min/scale pair, fitted once from the first ~1000 vectors the
-/// field is scanned with — and nothing else. In particular it does NOT cache
-/// per-document codes: [`Index::run_knn_brute_force`] already has each
-/// candidate's live f32 vector in hand (it just read it out of `_source` to
-/// apply the filter), so it quantizes and dequantizes on the spot.
-///
-/// That is deliberate, and it is issue #371. The map this replaced was a
-/// write-once `doc_id -> Vec<u8>`: a document's codes were computed by the
-/// first kNN that observed it and never recomputed, so overwriting its vector
-/// left it scored from the stale code forever — a document whose stored vector
-/// was the exact negation of the query still came back at cosine 1.000000. Any
-/// per-document code cache has to be invalidated on update, delete, reindex
-/// and merge; keeping none removes the class. Lucene does not cache either —
-/// it addresses quantized vectors by ordinal in a flat per-segment array
-/// written at index time, so there is nothing to go stale.
-struct Sq8FieldStore {
-    /// Shared per-dimension min/scale codec for this field.
-    ///
-    /// `Arc` so a scan can take a handle and drop the lock before scoring,
-    /// rather than holding a guard across the whole candidate loop.
-    params: Arc<Sq8Params>,
-    /// Vector dimensionality the params were fitted for.
-    dim: usize,
-}
-
 /// L2-normalise a vector in place (no-op for a zero vector). Used for cosine
 /// fields so SQ8 fits over bounded per-dimension ranges (better recall).
 fn l2_normalize_vec(v: &mut [f32]) {
@@ -5367,16 +5339,6 @@ pub struct Index {
     /// `abort_background_tasks` so an unfinished rebuild can't hold the
     /// runtime (or the index Arc) alive across shutdown.
     hnsw_rebuild_task: Arc<parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>>,
-    /// Per-field SQ8 (scalar8) codecs for the kNN serving path.
-    ///
-    /// Keyed by dense_vector field name. Populated only for fields whose
-    /// mapping opts into `scalar8` quantization (`index_options.type:
-    /// int8_hnsw`). Each entry holds one shared [`Sq8Params`], fitted lazily on
-    /// the first kNN over the field from the same candidate vectors the
-    /// brute-force scan already gathers. No per-document state lives here — see
-    /// [`Sq8FieldStore`] for why (#371). Default (none) fields never touch this
-    /// map, so their exact f32 brute-force path is byte-identical to before.
-    sq8_stores: Arc<RwLock<HashMap<String, Sq8FieldStore>>>,
     // ── Per-index concurrency control ─────────────────────────────────────────
     /// Semaphore that limits the number of queries executing concurrently
     /// against this index.  The default is 64 permits, matching the global
@@ -6062,7 +6024,6 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
-            sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
             metric_query_total_ms: Arc::new(AtomicU64::new(0)),
             metric_index_count: Arc::new(AtomicU64::new(0)),
@@ -6428,7 +6389,6 @@ impl Index {
             hnsw_stale: Arc::new(std::sync::atomic::AtomicBool::new(hnsw_stale_init)),
             hnsw_rebuilding: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             hnsw_rebuild_task: Arc::new(parking_lot::Mutex::new(None)),
-            sq8_stores: Arc::new(RwLock::new(HashMap::new())),
             metric_query_count: Arc::new(AtomicU64::new(0)),
             metric_query_total_ms: Arc::new(AtomicU64::new(0)),
             metric_index_count: Arc::new(AtomicU64::new(0)),
@@ -10430,7 +10390,7 @@ impl Index {
     ///   * the graph is field-pinned to exactly the queried field and not
     ///     flush-time stale (see `hnsw_field` / `hnsw_stale`);
     ///   * the field does not opt into SQ8 (`scalar8` keeps its dedicated
-    ///     code-store scoring path);
+    ///     quantize-then-score brute path, which the graph does not model);
     ///   * `vector_doc_count >= HNSW_MIN_DOCS` — small vector sets (every
     ///     ES-YAML vector test is ≤ a few hundred docs) keep today's
     ///     byte-identical exact path;
@@ -10893,9 +10853,11 @@ impl Index {
 
         // ── Determine whether this field opts into SQ8 (scalar8) ──────
         // Default fields keep the exact f32 brute-force scan below,
-        // byte-identical to before. A `scalar8` field instead scores against
-        // a per-field u8 code store — decoding each doc's SQ8 codes rather
-        // than reading its f32 vector from `_source` for scoring.
+        // byte-identical to before. A `scalar8` field takes the branch above
+        // instead: it reads the same live f32 vector out of `_source`, but
+        // rounds it through 1-byte-per-dimension SQ8 codes before scoring, so
+        // the score carries `scalar8`'s precision loss. Nothing is cached —
+        // neither the codes nor the codebook outlive the query (#371).
         let use_sq8 = {
             let schema = self.schema.read().await;
             lookup_vector_quantization(&schema.schema, field).as_deref() == Some("scalar8")
@@ -10948,61 +10910,50 @@ impl Index {
                 cand.push((id, src, doc_vec));
             }
 
-            // Take (or fit) this field's SQ8 codec. Only the per-dimension
-            // min/scale params are kept between queries — never per-document
-            // codes; see [`Sq8FieldStore`] for why (#371). The params are
-            // fitted from the first ≤1000 vectors the field is scanned with and
-            // then reused, so the codebook is stable across queries and a
-            // document's score does not depend on which query first saw it.
-            let params = {
-                let cached = {
-                    let stores = self.sq8_stores.read().await;
-                    stores
-                        .get(field)
-                        .filter(|store| store.dim == dim)
-                        .map(|store| Arc::clone(&store.params))
-                };
-                match cached {
-                    Some(params) => params,
-                    None => {
-                        let sample: Vec<Vec<f32>> =
-                            cand.iter().take(1000).map(|(_, _, v)| v.clone()).collect();
-                        let params = Arc::new(Sq8Params::fit(&sample, dim));
-                        // Only publish a codec fitted on real vectors. A query
-                        // whose candidate set came back empty (every doc
-                        // filtered out, or a query vector of the wrong length)
-                        // would otherwise install a degenerate all-zero-scale
-                        // codebook and every later score on the field would
-                        // collapse onto it.
-                        if !sample.is_empty() {
-                            debug!(
-                                field,
-                                dim,
-                                sample = sample.len(),
-                                normalize,
-                                "SQ8 codec fitted"
-                            );
-                            // A concurrent first query may have fitted the same
-                            // field meanwhile; either sample is equally valid,
-                            // so overwrite rather than re-read under the lock.
-                            self.sq8_stores.write().await.insert(
-                                field.to_string(),
-                                Sq8FieldStore {
-                                    params: Arc::clone(&params),
-                                    dim,
-                                },
-                            );
-                        }
-                        params
-                    }
-                }
-            };
+            // Fit this field's SQ8 codebook over the candidate vectors this
+            // query is about to score, and drop it when the query ends. No
+            // codec state survives a query (#371).
+            //
+            // The codebook used to be fitted from the first ≤1000 vectors the
+            // field was ever scanned with and then kept for the life of the
+            // process, which is the same write-once defect as the per-document
+            // code map one level up: a vector written afterwards outside the
+            // fitted per-dimension range is CLAMPED into it, and when that
+            // range is narrow the clamped decode is indistinguishable from the
+            // vector the document used to hold. A corpus whose dimension 0
+            // never left +1.0 fitted `[1,1]` there, so overwriting a document
+            // with its exact negation decoded straight back to +1.0 and it
+            // stayed top at cosine 1.000000 — verbatim the reported symptom,
+            // with the per-document map already gone.
+            //
+            // Fitting over exactly the set being encoded also makes clamping
+            // structurally impossible here rather than merely unlikely: every
+            // value passed to `encode_into` is inside `[min,max]` by
+            // construction. An empty candidate set fits degenerate params, but
+            // the scoring loop below is then empty too, so nothing observes
+            // them — the old code had to guard against publishing that codec
+            // because it outlived the query that produced it.
+            //
+            // ACCEPTED CONSEQUENCE: the codebook now depends on the candidate
+            // set, so the same document can score marginally differently under
+            // two different `filter`s. The difference is bounded by SQ8's own
+            // quantization step (1/255 of the fitted range per dimension) —
+            // inside the approximation error `scalar8` already advertises, and
+            // the same class of dependency Lucene has by fitting per segment.
+            let params = Sq8Params::fit_borrowed(cand.iter().map(|(_, _, v)| v.as_slice()), dim);
+            debug!(
+                field,
+                dim,
+                candidates = cand.len(),
+                normalize,
+                "SQ8 codec fitted for this query"
+            );
 
             // Score by quantizing each candidate's CURRENT vector and decoding
             // it straight back — 1 byte/dim, so `scalar8` keeps its recall
-            // profile, and the score always describes the vector the document
-            // holds right now rather than one a previous query cached. Both
-            // buffers are reused across the scan, so this allocates nothing per
+            // profile, and the score describes the vector the document holds
+            // right now rather than one a previous query cached. Both buffers
+            // are reused across the scan, so this allocates nothing per
             // document. `v.len() == dim` was established when `cand` was built.
             let mut codes = vec![0u8; dim];
             let mut decoded = vec![0.0f32; dim];

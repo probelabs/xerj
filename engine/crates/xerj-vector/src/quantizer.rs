@@ -315,13 +315,26 @@ impl Quantizer for Scalar8Quantizer {
 /// Serializable per-dimension scalar-quantization (SQ8) parameters.
 ///
 /// This is the serving-path counterpart to [`Scalar8Quantizer`]: instead of
-/// packing a whole batch into one blob, it exposes a fitted codec that the
-/// engine keeps *per dense_vector field*. The engine stores one shared
-/// `Sq8Params` per field (fitted from the first ~1000 vectors the field is
-/// scanned with) and nothing else — the brute-force kNN scan quantizes each
-/// candidate's current vector through it and dequantizes straight back, so
-/// scores come from **1 byte/dim** codes without any per-document code cache
-/// that could go stale after an update (issue #371).
+/// packing a whole batch into one blob, it exposes a fitted codec cheap enough
+/// to build per query. The brute-force kNN scan fits one of these over exactly
+/// the candidate vectors it is about to score ([`Sq8Params::fit_borrowed`]),
+/// quantizes each candidate's current vector through it, dequantizes straight
+/// back, and drops it — so scores come from **1 byte/dim** codes while **no
+/// SQ8 state outlives the query** (issue #371).
+///
+/// That is deliberate. Both a per-document `doc_id -> Vec<u8>` code map and a
+/// per-field cached codebook were tried, and both were write-once in practice:
+/// the map never recomputed a document's codes after an update, and the
+/// codebook, fitted from the first ~1000 vectors a field was ever scanned
+/// with, silently *clamped* every later vector into that range — so a document
+/// overwritten with its own negation decoded straight back to its old value
+/// and kept ranking first at cosine 1.000000. Fitting over the set being
+/// encoded also makes clamping impossible here rather than merely unlikely.
+///
+/// The cost is that `scalar8` does not reduce resident memory: the scan reads
+/// the full-precision vector from `_source` either way. Making codes live with
+/// the data, addressed by ordinal and written at ingest as Lucene does, is
+/// tracked in issue #392.
 ///
 /// `mins[d]`/`scales[d]` are the per-dimension minimum and range (`max-min`)
 /// observed in the fitting sample. `encode` maps `v[d]` linearly to a u8 in
@@ -343,6 +356,22 @@ impl Sq8Params {
     /// different length are skipped. If no usable vector is present the
     /// params degenerate to zero scale (every code becomes 0, decoding to 0).
     pub fn fit(sample: &[Vec<f32>], dim: usize) -> Sq8Params {
+        Sq8Params::fit_borrowed(sample.iter().map(|v| v.as_slice()), dim)
+    }
+
+    /// Fit per-dimension min/max over borrowed vectors.
+    ///
+    /// Identical math to [`Sq8Params::fit`], without requiring the caller to
+    /// own the fitting sample. The kNN serving path fits over exactly the
+    /// candidate vectors it is about to encode — which it already holds — so
+    /// this lets it do that without copying the candidate set to build a
+    /// sample. Fitting over the encoded set is also what makes clamping
+    /// impossible on that path: every value encoded is inside `[min,max]` by
+    /// construction (#371).
+    pub fn fit_borrowed<'a, I>(sample: I, dim: usize) -> Sq8Params
+    where
+        I: IntoIterator<Item = &'a [f32]>,
+    {
         let mut mins = vec![f32::MAX; dim];
         let mut maxs = vec![f32::MIN; dim];
         let mut seen = false;
