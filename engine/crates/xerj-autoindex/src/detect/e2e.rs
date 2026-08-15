@@ -35,7 +35,12 @@ impl MockEs {
         let (sd, ss) = (Arc::clone(&docs), Arc::clone(&stop));
         let join = thread::spawn(move || loop {
             match listener.accept() {
-                Ok((stream, _)) => handle(stream, &sd),
+                Ok((stream, _)) => {
+                    // BSD/macOS: accepted sockets inherit the listener's
+                    // O_NONBLOCK; the handler does blocking reads.
+                    stream.set_nonblocking(false).unwrap();
+                    handle(stream, &sd)
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     if *ss.lock().unwrap() {
                         break;
@@ -269,6 +274,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,
+        stub_globs: Vec::new(),
         ignore: crate::ignore_rules::IgnoreOptions::default(),
         max_file_gb: 1,
         sample: 50,

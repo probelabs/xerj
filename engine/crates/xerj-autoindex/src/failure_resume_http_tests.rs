@@ -133,7 +133,12 @@ impl MockEndpoint {
         let server_state = Arc::clone(&state);
         let join = thread::spawn(move || loop {
             match listener.accept() {
-                Ok((stream, _)) => handle(stream, &server_state),
+                Ok((stream, _)) => {
+                    // BSD/macOS: accepted sockets inherit the listener's
+                    // O_NONBLOCK; the handler does blocking reads.
+                    stream.set_nonblocking(false).unwrap();
+                    handle(stream, &server_state)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if server_state
                         .lock()
@@ -516,6 +521,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,
+        stub_globs: Vec::new(),
         ignore: crate::ignore_rules::IgnoreOptions::default(),
         max_file_gb: 1,
         sample: 50,
@@ -2901,6 +2907,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
         },
         100,
         1,
+        false,
     );
     assert!(scan.pdf_spool.is_none());
     assert_eq!(scan.pdf_spool_fallbacks.len(), 1);
@@ -2988,6 +2995,7 @@ printf '%s' '{"schema":1,"extractor":"xerj-autoindex/__XERJ_VERSION__","parser":
         },
         100,
         1,
+        false,
     );
 
     assert!(
@@ -3066,6 +3074,7 @@ fn verified_but_junk_pdf_spool_is_created_then_discarded_not_eligible() {
         },
         100,
         1,
+        false,
     );
     assert!(scan.junk.is_some());
     assert!(scan.pdf_spool.is_some());

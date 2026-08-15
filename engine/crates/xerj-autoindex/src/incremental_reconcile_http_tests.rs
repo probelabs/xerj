@@ -52,7 +52,12 @@ impl HttpEndpoint {
         let server_state = Arc::clone(&state);
         let join = thread::spawn(move || loop {
             match listener.accept() {
-                Ok((stream, _)) => handle_http(stream, &server_state),
+                Ok((stream, _)) => {
+                    // BSD/macOS: accepted sockets inherit the listener's
+                    // O_NONBLOCK; the handler does blocking reads.
+                    stream.set_nonblocking(false).unwrap();
+                    handle_http(stream, &server_state)
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if server_state.lock().unwrap().stop {
                         break;
@@ -386,6 +391,7 @@ fn search_http(path: &str, body: &[u8], state: &Arc<Mutex<HttpState>>) -> Value 
 fn cfg(root: &Path, state_dir: &Path, url: &str, semantic: bool) -> IndexCfg {
     IndexCfg {
         root: root.to_owned(),
+        stub_globs: Vec::new(),
         url: url.to_owned(),
         api_key: None,
         api_key_file: None,

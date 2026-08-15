@@ -24,6 +24,21 @@ pub enum Family {
     SqlDump,
     /// Source code — AST-parsed by the matching tree-sitter grammar.
     Code,
+    /// Unity text-serialized asset (scene/prefab/.asset/.mat/.anim/…):
+    /// a `%YAML` + `%TAG !u! tag:unity3d.com` multi-document stream.
+    UnityYaml,
+    /// Unity `.meta` sidecar: plain YAML opening with `fileFormatVersion:`
+    /// and carrying the asset `guid` — the join key for everything Unity.
+    UnityMeta,
+    /// Biovision motion capture: a skeleton HIERARCHY header followed by a
+    /// large numeric MOTION block. Indexed as ONE metadata record per file
+    /// (joints, frame count, duration) — the motion numbers are never read.
+    Bvh,
+    /// User-designated existence-only file (`--stub <glob>`): ONE name-card
+    /// record, contents never opened. For corpus-specific data blobs the
+    /// owner wants referenceable but not parsed — never assigned by
+    /// sniffing, only by the CLI flag.
+    Stub,
     Binary,
 }
 
@@ -44,6 +59,10 @@ impl Family {
             Family::Sqlite => "sqlite",
             Family::SqlDump => "sqldump",
             Family::Code => "code",
+            Family::UnityYaml => "unity",
+            Family::UnityMeta => "unity-meta",
+            Family::Bvh => "bvh",
+            Family::Stub => "stub",
             Family::Binary => "binary",
         }
     }
@@ -158,6 +177,11 @@ fn sniff_bytes(
         s.binary_kind = Some("zip".into());
         return Ok(s);
     }
+    // Compressed image/audio/model payloads routinely pass the NUL and
+    // control-char heuristics below (windows-1252 decodes almost every byte
+    // to something printable), and a multi-MB PSD misread as prose costs
+    // ~100x its size in RAM through sectioning. Magic bytes are the reliable
+    // signal.
     for (magic, kind) in [
         (&b"\x89PNG"[..], "png"),
         (&b"GIF8"[..], "gif"),
@@ -165,6 +189,15 @@ fn sniff_bytes(
         (&b"\x7fELF"[..], "elf"),
         (&b"BM"[..], "bmp"),
         (&b"\x00\x00\x01\x00"[..], "ico"),
+        (&b"8BPS"[..], "psd"),
+        (&b"II*\x00"[..], "tiff"),
+        (&b"MM\x00*"[..], "tiff"),
+        (&b"RIFF"[..], "riff"),
+        (&b"OggS"[..], "ogg"),
+        (&b"fLaC"[..], "flac"),
+        (&b"ID3"[..], "mp3"),
+        (&b"Kaydara FBX Binary"[..], "fbx"),
+        (&b"\x76\x2f\x31\x01"[..], "exr"),
     ] {
         if prefix.starts_with(magic) {
             let mut s = mk(Family::Binary);
@@ -191,8 +224,63 @@ fn sniff_bytes(
         s.binary_kind = Some("unknown".into());
         return Ok(s);
     }
+    // A prefix that only decoded via LOSSY windows-1252 and is majority
+    // high-byte is pixel/float soup, not prose in a legacy encoding: real
+    // windows-1252 text (accented European prose) runs well under 30%
+    // non-ASCII, while raw image channels run ~50%. Without this, a large
+    // TGA classified as txt-prose is amplified ~100x in RAM by sectioning.
+    //
+    // Gated on the windows-1252 fallback SPECIFICALLY, and skipped when the
+    // bytes are plausibly legacy CJK: Shift-JIS/GBK/Big5/EUC-KR prose is
+    // ~100% high-byte, so the unqualified test junked every legacy-encoded
+    // CJK document in the corpus.
+    let legacy_cjk = encoding == WINDOWS_1252_LOSSY && looks_like_legacy_cjk(prefix);
+    if encoding == WINDOWS_1252_LOSSY && !legacy_cjk {
+        let total = text.chars().count().max(1);
+        let non_ascii = text.chars().filter(|c| !c.is_ascii()).count();
+        if non_ascii * 10 > total * 3 {
+            let mut s = mk(Family::Binary);
+            s.binary_kind = Some("unknown".into());
+            return Ok(s);
+        }
+    }
 
-    // 2b. Source code: a known code extension whose content is text. We only
+    // 2b. Unity text serialization, detected by content (never extension):
+    // scenes/prefabs/assets open with `%YAML` and declare the Unity tag
+    // namespace; `.meta` sidecars open with `fileFormatVersion:` and carry a
+    // `guid:`. Binary-serialized Unity assets fail both checks and fall
+    // through to the binary/text heuristics as before.
+    {
+        let body = text.trim_start_matches('\u{feff}');
+        if body.starts_with("%YAML") && body.contains("%TAG !u! tag:unity3d.com") {
+            let mut s = mk(Family::UnityYaml);
+            s.encoding = encoding;
+            return Ok(s);
+        }
+        let first_line = body.lines().next().unwrap_or("");
+        if first_line.starts_with("fileFormatVersion:")
+            && body.lines().any(|l| l.starts_with("guid:"))
+        {
+            let mut s = mk(Family::UnityMeta);
+            s.encoding = encoding;
+            return Ok(s);
+        }
+        // BVH motion capture: `HIERARCHY` opener with a `ROOT <name>` next.
+        // Without this the numeric MOTION block classified as txt-lines and
+        // indexed millions of meaningless number rows.
+        if first_line.trim() == "HIERARCHY"
+            && body
+                .lines()
+                .nth(1)
+                .is_some_and(|l| l.trim_start().starts_with("ROOT "))
+        {
+            let mut s = mk(Family::Bvh);
+            s.encoding = encoding;
+            return Ok(s);
+        }
+    }
+
+    // 2c. Source code: a known code extension whose content is text. We only
     // reach here after the binary guards above, so a text `.py`/`.rs`/`.go`/…
     // routes to the tree-sitter AST extractor (crate::extract::code). Extension
     // is the right signal — code vs prose is not reliably content-sniffable.
@@ -226,6 +314,96 @@ fn sniff_bytes(
     Ok(out)
 }
 
+/// The label for the last-resort decode. Every byte maps to *something* in
+/// windows-1252, so this never fails and therefore carries no evidence that
+/// the bytes are text — the binary heuristics key off this exact string.
+pub const WINDOWS_1252_LOSSY: &str = "windows-1252 (lossy)";
+
+/// Scripts written without spaces between words ("scriptio continua").
+///
+/// Whitespace density cannot be used to tell prose from byte soup for these:
+/// Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose runs at
+/// essentially 0% intra-line whitespace, the same as random bytes. Their
+/// presence is instead POSITIVE evidence of text — neither pixel channels nor
+/// float dumps produce ideographs.
+///
+/// The script set is the one Lucene singles out for exactly this reason:
+/// `CJKBigramFilter` (`lucene/analysis/common/src/java/org/apache/lucene/
+/// analysis/cjk/CJKBigramFilter.java:52-118`, Apache-2.0) defines `HAN`,
+/// `HIRAGANA`, `KATAKANA` and `HANGUL` flags because a whitespace tokenizer
+/// cannot segment them, and its default constructor
+/// (`CJKBigramFilter.java:119-126`) enables all four together. Thai, Lao,
+/// Khmer and Myanmar are added here on the same principle — Lucene reaches
+/// for `ICUTokenizer`/dictionary breaking for those rather than a bigram
+/// filter, but the property this function tests (no inter-word spaces) is
+/// identical. Adapted, not copied: Lucene is deciding how to TOKENIZE known
+/// text; this only decides whether the bytes are text at all.
+fn is_scriptio_continua(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF   // Hangul Jamo
+        | 0x0E00..=0x0EFF // Thai, Lao
+        | 0x1000..=0x109F // Myanmar
+        | 0x1780..=0x17FF // Khmer
+        | 0x3000..=0x303F // CJK symbols and punctuation (、。「」)
+        | 0x3040..=0x30FF // Hiragana, Katakana
+        | 0x3400..=0x4DBF // CJK Unified Ideographs Extension A
+        | 0x4E00..=0x9FFF // CJK Unified Ideographs
+        | 0xAC00..=0xD7AF // Hangul Syllables
+        | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+        | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
+        | 0x20000..=0x2A6DF // CJK Unified Ideographs Extension B
+    )
+}
+
+/// Share of `text` that is scriptio-continua, in percent.
+fn continua_percent(text: &str) -> usize {
+    let mut total = 0usize;
+    let mut hits = 0usize;
+    for c in text.chars() {
+        total += 1;
+        if is_scriptio_continua(c) {
+            hits += 1;
+        }
+    }
+    if total == 0 {
+        return 0;
+    }
+    hits * 100 / total
+}
+
+/// Whether `bytes` are plausibly text in a legacy CJK encoding.
+///
+/// This is a TEXT-NESS test and nothing more. It deliberately does NOT return
+/// which encoding: Shift-JIS, GBK, Big5 and EUC-KR share most of the same
+/// valid double-byte space, so a GBK document also decodes losslessly as
+/// Shift-JIS (and vice versa) with a high ideograph share either way. Telling
+/// them apart needs a statistical language model — what `chardet`/ICU do —
+/// which this crate does not have, and guessing would silently replace a
+/// Chinese document with plausible-looking Japanese mojibake. Tracked as a
+/// follow-up; see CHANGELOG.
+///
+/// What it IS sound for is the only question asked here: are these bytes a
+/// pixel/float payload, or somebody's prose? The pixel-soup guards below key
+/// off high-byte density and whitespace density, and legacy CJK prose looks
+/// exactly like soup under both — ~100% high-byte and ~0% whitespace — so
+/// without this they junk the file outright. Requiring a LOSSLESS decode
+/// (one undecodable pair disqualifies it) plus a substantially ideographic
+/// result keeps European windows-1252 prose out: its high bytes sit isolated
+/// among ASCII, so most form no valid double-byte pair at all.
+fn looks_like_legacy_cjk(bytes: &[u8]) -> bool {
+    [
+        encoding_rs::SHIFT_JIS,
+        encoding_rs::GBK,
+        encoding_rs::BIG5,
+        encoding_rs::EUC_KR,
+    ]
+    .into_iter()
+    .any(|enc| {
+        let (s, _, had_errors) = enc.decode(bytes);
+        !had_errors && continua_percent(&s) >= 30
+    })
+}
+
 fn decode(bytes: &[u8]) -> (String, &'static str) {
     match std::str::from_utf8(bytes) {
         Ok(s) => (s.to_string(), "utf-8"),
@@ -238,7 +416,7 @@ fn decode(bytes: &[u8]) -> (String, &'static str) {
                 )
             } else {
                 let (s, _, _) = encoding_rs::WINDOWS_1252.decode(bytes);
-                (s.into_owned(), "windows-1252 (lossy)")
+                (s.into_owned(), WINDOWS_1252_LOSSY)
             }
         }
     }
@@ -366,6 +544,30 @@ fn txt_kind(nonblank: &[&str]) -> Family {
     if nonblank.is_empty() {
         return Family::TxtLines;
     }
+    // NOTE — a whitespace-density guard ("text over 4 KiB with under 5%
+    // whitespace is pixel soup, junk it") was proposed here to catch raw TGA
+    // and `.bytes` payloads that decode into printable characters. It is not
+    // present, deliberately, because low whitespace density does not mean
+    // "not text":
+    //
+    //   * Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose is
+    //     scriptio continua — `nonblank` comes from `text.lines()`, so the
+    //     newlines are already stripped and only INTRA-LINE whitespace counts,
+    //     which those scripts do not have. Every such document over ~4 KiB
+    //     would be junked, in every corpus, worldwide.
+    //   * base64 blobs, hex dumps, FASTA/genomic sequences, single-line
+    //     minified payloads and long-token files are all legitimate text with
+    //     near-zero whitespace.
+    //   * `failure_resume_http_tests::legacy_key_collision_fails_before_
+    //     visibility_with_scoped_guidance` builds a 65,537-byte fixture of one
+    //     repeated ASCII letter. With the guard in place that file sniffs as
+    //     binary and the run exits 3 instead of 0 — the false positive is
+    //     reachable from this repo's own suite.
+    //
+    // High-byte payloads (which is what a real TGA is) are still caught, by
+    // the windows-1252 non-ASCII test in `sniff_bytes`. Bounding sectioning
+    // memory is the right fix for the RAM concern; silently deleting files
+    // that look unusual is not. Tracked as a follow-up.
     let avg_len = nonblank.iter().map(|l| l.len()).sum::<usize>() as f64 / nonblank.len() as f64;
     if avg_len > 60.0 {
         return Family::TxtProse;
@@ -525,6 +727,276 @@ fn sniff_csv_dialect(nonblank: &[&str]) -> Option<CsvDialect> {
         has_header,
         decimal_comma,
     })
+}
+
+#[cfg(test)]
+mod unity_sniff_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn sniff_str(s: &str, name: &str) -> Family {
+        sniff_bytes(s.as_bytes(), Path::new(name), Path::new(name), false)
+            .unwrap()
+            .family
+    }
+
+    #[test]
+    fn unity_tagged_yaml_is_detected_by_header_not_extension() {
+        let scene =
+            "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &123\nGameObject:\n  m_Name: X\n";
+        assert_eq!(sniff_str(scene, "Main.unity"), Family::UnityYaml);
+        assert_eq!(
+            sniff_str(scene, "renamed.txt"),
+            Family::UnityYaml,
+            "content decides, never the extension"
+        );
+    }
+
+    #[test]
+    fn a_bom_before_the_yaml_directive_is_tolerated() {
+        let scene =
+            "\u{feff}%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: X\n";
+        assert_eq!(sniff_str(scene, "Main.unity"), Family::UnityYaml);
+    }
+
+    #[test]
+    fn meta_needs_the_first_line_rule_and_a_guid() {
+        let meta =
+            "fileFormatVersion: 2\nguid: 9f1c4d0ab2e34f6\nMonoImporter:\n  serializedVersion: 2\n";
+        assert_eq!(sniff_str(meta, "Player.cs.meta"), Family::UnityMeta);
+        let stray = "config: true\nfileFormatVersion: 2\nguid: abc\n";
+        assert_ne!(
+            sniff_str(stray, "some.yaml"),
+            Family::UnityMeta,
+            "guid keys inside ordinary YAML must not reclassify it"
+        );
+        let no_guid = "fileFormatVersion: 2\nsettings:\n  a: 1\n";
+        assert_ne!(sniff_str(no_guid, "x.meta"), Family::UnityMeta);
+    }
+
+    #[test]
+    fn bvh_is_detected_by_hierarchy_root_header() {
+        let bvh = "HIERARCHY\nROOT Hips\n{\n  OFFSET 0 90 0\n  CHANNELS 6 Xposition Yposition Zposition Zrotation Xrotation Yrotation\n}\nMOTION\nFrames: 2\nFrame Time: 0.033\n1 2 3\n4 5 6\n";
+        assert_eq!(sniff_str(bvh, "clip.bvh"), Family::Bvh);
+        assert_eq!(
+            sniff_str(bvh, "clip.txt"),
+            Family::Bvh,
+            "content decides, never the extension"
+        );
+        let not_bvh = "HIERARCHY\nof needs (Maslow):\n- physiological\n- safety\n";
+        assert_ne!(sniff_str(not_bvh, "notes.txt"), Family::Bvh);
+    }
+
+    #[test]
+    fn plain_yaml_without_the_unity_tag_stays_yaml() {
+        let plain = "%YAML 1.2\n---\nkey: value\nother: 1\nnested:\n  a: 2\n";
+        assert_ne!(sniff_str(plain, "doc.yaml"), Family::UnityYaml);
+    }
+
+    /// Regression: PSD image data decoded via lossy windows-1252 passed the
+    /// NUL/control-char heuristics and classified as txt-prose, turning a
+    /// multi-MB texture into ~100x its size of prose sections. Media magic
+    /// bytes must win before any text heuristic runs.
+    #[test]
+    fn media_containers_are_binary_by_magic_not_heuristics() {
+        for (name, head) in [
+            ("t.psd", &b"8BPS\x00\x01"[..]),
+            ("t.tif", &b"II*\x00\x08\x00"[..]),
+            ("t.tif2", &b"MM\x00*\x00\x08"[..]),
+            ("t.wav", &b"RIFF\x24\x08\x00\x00WAVE"[..]),
+            ("t.ogg", &b"OggS\x00\x02"[..]),
+            ("t.fbx", &b"Kaydara FBX Binary  \x00"[..]),
+        ] {
+            let mut bytes = head.to_vec();
+            // A printable tail that WOULD pass the prose heuristics.
+            bytes.extend(b"lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20));
+            let sn = sniff_bytes(&bytes, Path::new(name), Path::new(name), false).unwrap();
+            assert_eq!(sn.family, Family::Binary, "{name} must be binary");
+        }
+    }
+
+    /// Whitespace density must NOT be used to junk text. This pins the
+    /// counter-examples that make the rejected guard unsafe: a long run of one
+    /// ASCII letter (the shape of this repo's own 65,537-byte resume-key
+    /// fixture), and a base64 blob. Both are >4 KiB with zero whitespace, and
+    /// both are text.
+    #[test]
+    fn whitespace_free_ascii_text_is_not_junked_as_binary() {
+        let mut repeated = "x".repeat(65_536);
+        repeated.push('b');
+        let b64: String = std::iter::repeat_n("QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo", 300)
+            .collect::<Vec<_>>()
+            .join("");
+        for (label, text) in [("repeated-letter", &repeated), ("base64", &b64)] {
+            assert!(text.chars().filter(|c| c.is_whitespace()).count() == 0);
+            let sn = sniff_bytes(
+                text.as_bytes(),
+                Path::new("blob.txt"),
+                Path::new("blob.txt"),
+                false,
+            )
+            .unwrap();
+            assert_ne!(
+                sn.family,
+                Family::Binary,
+                "{label}: whitespace-free ASCII is still text"
+            );
+        }
+        // Real prose is unaffected either way.
+        let prose = "The quick brown fox jumps over the lazy dog. ".repeat(200);
+        let sn = sniff_bytes(
+            prose.as_bytes(),
+            Path::new("note.txt"),
+            Path::new("note.txt"),
+            false,
+        )
+        .unwrap();
+        assert_ne!(sn.family, Family::Binary, "real prose must stay text");
+    }
+
+    /// Regression: a whitespace-density guard judged every script by a rule
+    /// that only holds for space-delimited ones. `nonblank` is built from
+    /// `text.lines()`, so newlines are already gone and only INTRA-LINE
+    /// whitespace counts — which CJK/Thai/Lao/Khmer/Burmese prose does not
+    /// have. Every such document over ~4 KB became `Family::Binary` and was
+    /// junked as "binary content (unknown)", in a Unity PR, for users with no
+    /// Unity project. Both original tests used Latin prose and ASCII soup, so
+    /// neither could see it. The guard is gone; this pins the outcome so it
+    /// cannot come back in another form.
+    #[test]
+    fn scriptio_continua_prose_is_not_mistaken_for_binary_soup() {
+        // Each sample is >= 4096 chars (the old guard's gate) and has NO
+        // spaces, exactly like the real documents that were being junked.
+        for (label, unit) in [
+            ("chinese", "本文档描述了系统的架构设计与实现细节。"),
+            (
+                "japanese",
+                "この文書はシステムの設計と実装について説明します。",
+            ),
+            ("korean", "이문서는시스템설계와구현에대해설명합니다"),
+            ("thai", "เอกสารนี้อธิบายการออกแบบและการใช้งานของระบบ"),
+        ] {
+            let text = unit.repeat(4096 / unit.chars().count() + 2);
+            assert!(
+                text.chars().count() >= 4096,
+                "{label}: sample must clear the 4096-char gate"
+            );
+            let ws = text.chars().filter(|c| c.is_whitespace()).count();
+            assert!(
+                ws * 20 < text.chars().count(),
+                "{label}: sample must be below the 5% whitespace ratio, else \
+                 it would have passed the old guard for the wrong reason"
+            );
+            let sn = sniff_bytes(
+                text.as_bytes(),
+                Path::new("notes.txt"),
+                Path::new("notes.txt"),
+                false,
+            )
+            .unwrap();
+            assert_ne!(
+                sn.family,
+                Family::Binary,
+                "{label}: scriptio-continua prose must not be junked as binary"
+            );
+        }
+    }
+
+    /// Regression: the sibling guard keyed off `encoding != "utf-8"`, and a
+    /// legacy CJK encoding decodes as lossy windows-1252 into ~100%
+    /// high-byte mojibake — so every Shift-JIS/GBK/Big5/EUC-KR document was
+    /// junked before any family heuristic ran.
+    ///
+    /// The assertion is deliberately only "not binary". This crate cannot
+    /// tell these encodings apart (they share most of their valid
+    /// double-byte space) and does not pretend to: the file is still decoded
+    /// as windows-1252, exactly as it was before this branch, which is
+    /// mojibake — but mojibake that is INDEXED rather than deleted.
+    #[test]
+    fn legacy_encoded_cjk_prose_is_not_junked_as_binary() {
+        for (label, enc, unit) in [
+            (
+                "shift_jis",
+                encoding_rs::SHIFT_JIS,
+                "この文書はシステムの設計について説明します。",
+            ),
+            ("gbk", encoding_rs::GBK, "本文档描述了系统的架构设计。"),
+            ("big5", encoding_rs::BIG5, "本文件描述系統的架構設計。"),
+            (
+                "euc-kr",
+                encoding_rs::EUC_KR,
+                "이문서는시스템설계를설명합니다",
+            ),
+        ] {
+            let text = unit.repeat(4096 / unit.chars().count() + 2);
+            let (bytes, _, had_errors) = enc.encode(&text);
+            assert!(!had_errors, "{label}: fixture must encode cleanly");
+            assert!(
+                std::str::from_utf8(&bytes).is_err(),
+                "{label}: fixture must not be valid UTF-8, or it proves nothing"
+            );
+            assert!(
+                looks_like_legacy_cjk(&bytes),
+                "{label}: text-ness probe must recognise this as prose"
+            );
+            let sn =
+                sniff_bytes(&bytes, Path::new("doc.txt"), Path::new("doc.txt"), false).unwrap();
+            assert_ne!(sn.family, Family::Binary, "{label}: must not be junked");
+        }
+    }
+
+    /// The legacy-CJK probe must not capture European text — that would
+    /// replace real windows-1252 prose with plausible-looking ideographs.
+    #[test]
+    fn european_windows_1252_prose_is_not_claimed_as_cjk() {
+        let text = "Le système décrit ici gère les données réservées à \
+                    l'opérateur, prêtes à être exportées. ";
+        let long = text.repeat(80);
+        let (bytes, _, _) = encoding_rs::WINDOWS_1252.encode(&long);
+        assert!(std::str::from_utf8(&bytes).is_err());
+        let (_, enc) = decode(&bytes);
+        assert_eq!(enc, WINDOWS_1252_LOSSY, "must stay windows-1252");
+        assert!(
+            !looks_like_legacy_cjk(&bytes),
+            "accented Latin must not be claimed as CJK"
+        );
+        let sn = sniff_bytes(&bytes, Path::new("note.txt"), Path::new("note.txt"), false).unwrap();
+        assert_ne!(sn.family, Family::Binary, "accented prose is still prose");
+    }
+
+    /// The pixel-soup protection the guards exist for must survive the fix:
+    /// high-byte float/pixel payloads still have to be caught.
+    #[test]
+    fn high_byte_pixel_soup_is_still_binary() {
+        // Bytes that are not valid UTF-8, not valid in any legacy CJK
+        // encoding as a whole, and majority high-byte — a raw texture.
+        let soup: Vec<u8> = (0..8192u32)
+            .map(|i| (0x80 + (i * 37) % 0x7f) as u8)
+            .collect();
+        assert!(std::str::from_utf8(&soup).is_err());
+        let sn = sniff_bytes(
+            &soup,
+            Path::new("texture.tga"),
+            Path::new("texture.tga"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sn.family, Family::Binary, "pixel soup must stay binary");
+    }
+
+    #[test]
+    fn binary_serialized_unity_assets_stay_binary() {
+        let mut bytes = b"UnityFS\x00\x00\x00\x00\x08".to_vec();
+        bytes.extend(std::iter::repeat_n(0u8, 64));
+        let sn = sniff_bytes(
+            &bytes,
+            Path::new("scene.unity"),
+            Path::new("scene.unity"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sn.family, Family::Binary);
+    }
 }
 
 #[cfg(test)]

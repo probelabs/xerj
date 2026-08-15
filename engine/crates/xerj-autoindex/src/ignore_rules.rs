@@ -668,6 +668,14 @@ impl IgnoreStack {
         }
     }
 
+    /// The marker-gated generated-dir prune (`walk::MARKER_GENERATED_DIRS`)
+    /// is also decided by the walker — the verdict needs the SIBLING marker
+    /// file, which the per-directory matcher stack cannot see — and reported
+    /// through the same accounting.
+    pub fn record_marker_dir(&mut self, path: &Path, label: &str) {
+        self.record_dir(path, label);
+    }
+
     fn record_file(&mut self, label: &str) {
         self.report.files_skipped += 1;
         self.report

@@ -7,7 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **`xerj autoindex` understands Unity projects.** Text-serialized scenes,
+  prefabs, `.asset`/`.mat`/`.anim` files become **one record per
+  GameObject/Component** (`unity_class`, `unity_class_id`, `file_id`,
+  `ref_guids`, `script_guid`, plus the flattened body); `.meta` sidecars become
+  a guid↔asset-path table; MonoBehaviour records carry a denormalized
+  `script_class`/`script_path` so "which scenes use this script?" is one query.
+  Detection is by the `%YAML` + `%TAG !u! tag:unity3d.com` header and never by
+  extension, so binary-serialized assets stay junk (enable Force Text
+  serialization). Unity's generated directories (`Library/`, `Temp/`, `obj/`,
+  `Logs/`, `UserSettings/`) are pruned and recorded only when a sibling
+  `ProjectSettings/ProjectVersion.txt` proves the tree really is a Unity
+  project.
+
+  Reland of community PR #274 by **@gonchar**, brought up to current `main` and
+  corrected — see Fixed below for what changed on the way in.
+
+- **BVH motion capture** — one metadata record per clip (`joints`,
+  `joint_count`, `frames`, `frame_time_s`, `duration_s`). The numeric MOTION
+  block, which is most of the file, is never read: extraction stops at the
+  `Frame Time:` line.
+
+- **`--stub <glob>`** designates files that should be *referenceable but not
+  parsed*: each match is indexed as one name-card record and its contents are
+  never opened.
+
+### Fixed
+
+- **Unity assets were sampled through a 4 MiB cap, silently junking whole
+  object classes.** Unity YAML is a grouped family — each `unity_class` is its
+  own dataset and a class's first document can sit anywhere in a scene that
+  `extract/unity.rs` itself says can exceed 200 MB. A class first appearing
+  past the cap was never sampled, got no entry in the plan, and phase B then
+  had nowhere to route its records: they became `file_junk` with nothing said.
+  The cap is now 512 MiB for this family, **and** any record whose group was
+  never sampled is now reported by name and count instead of silently counted
+  as junk.
+
+- **A `script_guid` that failed to resolve produced no counter, no warning and
+  no report line.** `build_unity_guid_map` discarded `extract_meta`'s `Result`,
+  so an unreadable `.meta` was indistinguishable from a script nothing
+  references — on the feature's own headline query. Unreadable sidecars,
+  sidecars carrying no usable guid, and unresolvable `script_guid`s are now
+  each reported.
+
+- **`script_path`/`script_class` were mapped only when the phase-A sample
+  happened to contain a `script_guid`**, while phase B stamps them whenever a
+  guid resolves. A cluster whose sampled window held no `m_Script` therefore
+  got them dynamic-mapped at index time, feeding the field-budget overshoot in
+  #312. They are now registered for every Unity cluster, and the enrichment
+  runs *before* `coerce_record` rather than after it, so the fields it stamps
+  are validated like every other field instead of bypassing coercion.
+
+- **`build_unity_guid_map` ran serially, unmetered, on the critical path of
+  every run** — including a resumed no-op incremental, which otherwise has no
+  work to do. A real Unity project has 10k-500k `.meta` sidecars. It now runs
+  on `crate::pool` under the progress meter (the unattributed-stretch pattern
+  of #241).
+
+- **A `--stub` file was named from the content path**, which under durable
+  preparation is a content-addressed blob — so every stub's one and only field
+  would have been titled after a blob ordinal (the #294 failure class).
+  It now uses `Sniffed::logical_name`.
+
+- **`order::band_from_family_str` disagreed with `order::band`.** The string
+  form's catch-all ranked `binary` as `Bulk` where the enum form ranks it
+  `Vendored`, so a resumed run could order work differently from the run that
+  planned it. Both now agree for every family, pinned by a test that iterates
+  the whole enum.
+
+- **The autoindex use-case README documented three flags and behaviours that
+  do not exist.** `--no-default-excludes` and `--no-gitignore` are spelled
+  `--no-default-ignores` and `--no-ignore`, and `cli::parse` hard-errors on an
+  unknown argument — so a reader who copied the documented invocation got an
+  error instead of an index. The marker-gated pruning of `node_modules/` and
+  `target/` was described but had been dropped from the branch. A test now
+  parses every `--flag` named in that README and fails if the CLI would reject
+  it.
+
+- **`stub_matcher_tests::an_invalid_pattern_fails_loudly_at_startup` did not
+  test its own name** — it asserted only that a *valid* pattern compiles.
+  `glob_to_regex` escapes every metacharacter, so no glob can produce a
+  syntactically invalid regex; the one reachable failure is the compiled-size
+  limit, which `?` and `**` reach at ~10^5 characters. Over-long patterns are
+  now rejected explicitly with a message naming the flag and the limit, and the
+  test exercises that path.
+
+### Changed
+
+- **A proposed whitespace-density binary heuristic was dropped before it
+  shipped.** PR #274 classified any text over 4 KiB with under 5% whitespace as
+  binary, to catch raw TGA payloads. `nonblank` is built from `text.lines()`,
+  so newlines are already stripped and only intra-line whitespace counts —
+  which means Chinese, Japanese, Korean, Thai, Lao, Khmer and Burmese prose,
+  base64 blobs, FASTA sequences and minified single-line files all scored 0%
+  and would have been junked as "binary content (unknown)", worldwide, in every
+  corpus. This repo's own
+  `failure_resume_http_tests::legacy_key_collision_fails_before_visibility_with_scoped_guidance`
+  builds a 65,537-byte fixture of one repeated ASCII letter; with the guard in
+  place that run exits 3 instead of 0. High-byte payloads (what a real TGA is)
+  are still caught by the windows-1252 non-ASCII test, which is additionally
+  now skipped for byte sequences that decode losslessly as Shift-JIS/GBK/Big5/
+  EUC-KR with a substantially ideographic result — legacy-encoded CJK prose is
+  ~100% high-byte and was being junked by it. That probe deliberately reports
+  only "this is text", not *which* encoding: those four share most of their
+  valid double-byte space, and picking one without a statistical language model
+  would replace a Chinese document with plausible-looking Japanese mojibake.
+
+  New magic-byte signatures (PSD, TIFF, RIFF, OGG, FLAC, MP3, FBX, EXR) are
+  kept — those are precise.
+
+### Known issues
+
+- `ref_guids` (Unity) and `joints` (BVH) are multi-valued keyword arrays, and
+  #332 means array elements are joined into one FTS token, so a post-flush
+  `term`/`match` on a single element does not hit. `script_guid`,
+  `script_path` and `script_class` are single-valued and unaffected, so the
+  documented "which scenes use this script?" query is not impacted. Fixing
+  #332 is an engine-side change to the FTS writer input type.
 
 ## [1.0.0-rc.16] - 2026-08-13
 
