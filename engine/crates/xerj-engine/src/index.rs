@@ -12683,6 +12683,61 @@ impl Index {
         )
     }
 
+    /// Resolve an ES meta-field named as a SORT key (#401).
+    ///
+    /// These fields are engine metadata: they are never literal keys in
+    /// `_source`, so `compute_sort_values`' generic `get_field_value` path
+    /// resolved every one of them to `Null` on every document — a sort that
+    /// silently ties the whole result set, and a `search_after` cursor that
+    /// can never advance past page one (`[null]` is never strictly greater
+    /// than `[null]`).  Lucene has no such failure mode because a sort key
+    /// is read from the field's DOC VALUES column rather than from the
+    /// stored document — `SortedNumericSortField` selects the document's
+    /// representative sort value out of `SortedNumericDocValues`
+    /// (`lucene/core/src/java/org/apache/lucene/search/SortedNumericSortField.java:49-59`)
+    /// and `NumericComparator` compares those column values directly
+    /// (`lucene/core/src/java/org/apache/lucene/search/comparators/NumericComparator.java:47-63`).
+    /// xerj has no column for these fields, so it resolves them through the
+    /// SAME accessors that populate the response meta-fields — a hit's
+    /// `sort` value and its `_seq_no` / `_version` therefore agree.
+    ///
+    /// Returns `None` for every other field name, so the caller falls
+    /// through to the ordinary `_source` lookup.
+    fn meta_sort_value(&self, field: &str, id: &str) -> Option<Value> {
+        // Hot path: this runs per candidate doc per sort field inside the
+        // bounded collectors, and an ordinary field name is the overwhelming
+        // case — settle it with one byte compare instead of four `str` eq.
+        if !field.starts_with('_') {
+            return None;
+        }
+        match field {
+            // `_seq_no`: the ES-sortable one (real ES gives it doc values
+            // and rejects the sort only under
+            // `index.disable_sequence_numbers`, which es_compat.rs already
+            // rejects at the API edge before the request reaches here).
+            // Unresolvable (unknown / tombstoned) stays `Null` so the
+            // request's `missing` policy still applies.
+            "_seq_no" => Some(
+                self.lookup_seq_no(id)
+                    .map_or(Value::Null, |s| Value::Number(s.into())),
+            ),
+            "_version" => Some(
+                self.lookup_version(id)
+                    .map_or(Value::Null, |v| Value::Number(v.into())),
+            ),
+            // xerj is single-shard with `primary_term` fixed at 1 — the same
+            // constant the hit meta-field emits (es_compat.rs:13250). Constant
+            // for every doc, so it ties like any other constant sort key;
+            // callers paginating on it still need a tie-breaker field.
+            "_primary_term" => Some(Value::Number(1.into())),
+            // Constant within one index; it discriminates only in the
+            // cross-index merge, which re-sorts on these same `sort` arrays
+            // (es_compat.rs:10855).
+            "_index" => Some(Value::String(self.name.as_str().to_string())),
+            _ => None,
+        }
+    }
+
     /// Retrieve a document by its string ID.
     ///
     /// Checks the memtable first, then searches on-disk segments.
@@ -14431,7 +14486,7 @@ impl Index {
                             }
                             seen_ids.insert(hit.id.clone());
                             let seq = self.lookup_seq_no(&hit.id).unwrap_or(u64::MAX);
-                            topk.offer(hit, seq);
+                            topk.offer(hit, seq, self);
                         }
                     } else if all_hits.len() < materialisation_limit && !seen_ids.contains(&hit.id)
                     {
@@ -14480,6 +14535,7 @@ impl Index {
                                         passage: None,
                                     },
                                     seq,
+                                    self,
                                 );
                             }
                         }
@@ -14686,6 +14742,16 @@ impl Index {
                         let sf = &request.sort[0];
                         if sf.is_score()
                             || sf.is_doc_order()
+                            || sf.field == "_id"
+                            // An ES meta-field has no memtable dv column, so
+                            // `sort_candidates_numeric` would classify EVERY
+                            // buffered doc as "missing this field" and hand
+                            // back an arbitrary `cap`-sized prefix as the
+                            // candidate set.  With #401's real `_seq_no`
+                            // values that prefix is no longer a superset of
+                            // the true top-cap — it would rank the wrong
+                            // documents correctly.  Take the full walk.
+                            || is_meta_sort_field(&sf.field)
                             || sf.mode != SortMode::default()
                             || sf.missing != SortMissing::default()
                         {
@@ -16302,7 +16368,7 @@ impl Index {
                                             if let Some(topk) = sort_topk.as_mut() {
                                                 let seq =
                                                     self.lookup_seq_no(&hit.id).unwrap_or(u64::MAX);
-                                                topk.offer(hit, seq);
+                                                topk.offer(hit, seq, self);
                                             } else {
                                                 all_hits.push(hit);
                                                 // #179 — hold the collector at
@@ -17096,7 +17162,7 @@ impl Index {
             // ordering agree on the exact total order (incl. date-string
             // normalisation).
             for hit in &mut final_hits {
-                hit.sort = compute_sort_values(&hit.source, hit.score, &hit.id, sort_fields);
+                hit.sort = compute_sort_values(&hit.source, hit.score, &hit.id, sort_fields, self);
             }
             // Sort by the populated sort keys.  Key ties break by seq_no
             // ASC (insertion order == ES internal doc-id order post-B1),
@@ -22996,6 +23062,16 @@ impl Index {
         field: &str,
         seg_doc_count: u64,
     ) -> Option<Resident<Option<Arc<Vec<(i64, u32)>>>>> {
+        // An ES meta-field (`_seq_no`, `_version`, …) is engine metadata, not
+        // a `_source` key, so no segment ever writes a dv column under that
+        // name.  Bail BEFORE the registry insert so the publish-time warm
+        // doesn't burn one of its 16 slots probing a column that cannot
+        // exist, and so a future column that happened to share the name
+        // could never silently drive the candidate cut for a key the
+        // engine resolves from the version map instead (#401).
+        if is_meta_sort_field(field) {
+            return None;
+        }
         // Register the field so the publish-time warm pre-builds this
         // shadow for every FUTURE segment (bounded registry).
         if self.sort_shadow_fields.len() < 16 && !self.sort_shadow_fields.contains_key(field) {
@@ -23496,7 +23572,7 @@ impl Index {
             } else {
                 scorer(source_ref, id_ref)
             };
-            let key = compute_sort_values(source_ref, score, id_ref, topk.fields.as_slice());
+            let key = compute_sort_values(source_ref, score, id_ref, topk.fields.as_slice(), self);
             if !topk.would_admit(&key) {
                 continue;
             }
@@ -24192,7 +24268,8 @@ impl Index {
                 } else {
                     scorer(source_ref, id_ref)
                 };
-                let key = compute_sort_values(source_ref, score, id_ref, topk.fields.as_slice());
+                let key =
+                    compute_sort_values(source_ref, score, id_ref, topk.fields.as_slice(), self);
                 if !topk.would_admit(&key) {
                     continue;
                 }
@@ -35908,9 +35985,10 @@ impl SortTopK {
     }
     /// Offer a fully-sourced hit.  Computes its sort key from `_source`,
     /// then delegates to `offer_keyed`.  `seq` is the hit's insertion-order
-    /// tie-break (see `SortHeapEntry::seq`).
-    fn offer(&mut self, mut hit: Hit, seq: u64) {
-        hit.sort = compute_sort_values(&hit.source, hit.score, &hit.id, &self.fields);
+    /// tie-break (see `SortHeapEntry::seq`).  `idx` resolves the ES
+    /// meta-fields that live outside `_source` (see `meta_sort_value`).
+    fn offer(&mut self, mut hit: Hit, seq: u64, idx: &Index) {
+        hit.sort = compute_sort_values(&hit.source, hit.score, &hit.id, &self.fields, idx);
         self.offer_keyed(hit, seq);
     }
     /// Offer a hit whose `sort` key is already computed.  Applies the
@@ -36969,11 +37047,27 @@ fn sort_epoch_memo(s: &str) -> Option<f64> {
     v
 }
 
+/// ES meta-fields whose sort value comes from engine metadata rather than
+/// from `_source` or from the hit itself (#401).  `_score` / `_doc` / `_id`
+/// are deliberately NOT here: `compute_sort_values` resolves those from the
+/// hit it is already holding, with no index lookup.
+///
+/// Also the gate for the columnar sort-candidate prefilters: those narrow the
+/// candidate set with a doc-values column keyed by the sort field name, and
+/// no such column exists for a meta-field — a memtable/segment column probe
+/// would report "every doc is missing this field" and cut the candidate set
+/// to an arbitrary `cap` docs, which is the same silently-wrong page the
+/// null sort values produced.
+fn is_meta_sort_field(field: &str) -> bool {
+    matches!(field, "_seq_no" | "_version" | "_primary_term" | "_index")
+}
+
 fn compute_sort_values(
     source: &Value,
     score: f32,
     id: &str,
     sort_fields: &[xerj_query::sort::SortField],
+    idx: &Index,
 ) -> Vec<Value> {
     let mut sort_vals: Vec<Value> = Vec::with_capacity(sort_fields.len());
     for sf in sort_fields {
@@ -36991,6 +37085,12 @@ fn compute_sort_values(
             // ordering and `search_after: [last_id]` keyset paging (used by
             // reindex) compare correctly. Matches ES, which echoes the id.
             Value::String(id.to_string())
+        } else if let Some(meta) = idx.meta_sort_value(&sf.field, id) {
+            // The rest of the ES meta-fields (`_seq_no`, `_version`,
+            // `_primary_term`, `_index`) — engine metadata, resolved from
+            // the version map instead of from `_source` (#401).  Everything
+            // else falls through to the `_source` lookup below.
+            meta
         } else {
             // `.keyword` is ES's conventional multi-field sub-type on
             // dynamic/keyword fields: sorting on `foo.keyword` reads the
