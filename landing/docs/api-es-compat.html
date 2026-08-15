@@ -193,6 +193,8 @@
 
   <p>This is the common case, not the corner case: <code class="inline">helpers.scan()</code> in <code class="inline">elasticsearch-py</code>, reindex internals, and most export and backup tooling all scroll a whole index, and whole indices are usually bigger than the cap.</p>
 
+  <p>The ceiling above is the one <code class="inline">_search?scroll=</code> enforces, on the request's total across every index it resolves. One route is looser: the <code class="inline">POST /:index/_search_scroll</code> alias applies the ceiling <em>per index</em>, so a comma-separated multi-index scroll sent there can snapshot the full ceiling from each. That direction is permissive, not lossy — every matched document is still in the snapshot and still paged out — but it means the number is a per-index ceiling on that one route. Tracked in <a href="https://github.com/xerj-org/xerj/issues/405">#405</a>.</p>
+
 <pre class="code"># 11,450 documents in `logs` — over the cap, so the scroll never opens
 $ curl -sX POST 'http://localhost:9200/logs/_search?scroll=1m' \
     -H 'Content-Type: application/json' \
@@ -208,9 +210,19 @@ sort key instead, or narrow the query."}], ... },"status":400}
 $ curl -sX POST http://localhost:9200/logs/_search \
     -H 'Content-Type: application/json' \
     -d '{"size":1000,"sort":[{"_id":"asc"}],"query":{"match_all":{}}}'
+{"hits":{"hits":[ ...,
+  {"_index":"logs","_id":"10897","_score":null,"_source":{"n":10897},"sort":["10897"]}]}}
+
+# the cursor is that last hit's `sort` array, copied verbatim. Read it out of
+# the response; never guess it from the page number. `_id` is a keyword, so it
+# sorts LEXICOGRAPHICALLY — "1000" &lt; "999" — and page 1 of numeric-looking ids
+# ends at "10897", not "999". Pass ["999"] here and the walk ends after
+# 1,010 of the 11,450 documents, with no error — the silent truncation this
+# whole page exists to rule out. Sort on a numeric field, or on a keyword
+# whose text order is the order you actually want.
 $ curl -sX POST http://localhost:9200/logs/_search \
     -H 'Content-Type: application/json' \
-    -d '{"size":1000,"sort":[{"_id":"asc"}],"search_after":["999"],"query":{"match_all":{}}}'
+    -d '{"size":1000,"sort":[{"_id":"asc"}],"search_after":["10897"],"query":{"match_all":{}}}'
 # → 12 pages, all 11,450 documents, no ceiling</pre>
 
   <h2>Bulk indexing example</h2>

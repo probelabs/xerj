@@ -222,7 +222,12 @@ Runnable examples live in [`recipes/`](./recipes) and
 
 XERJ implements the Elasticsearch REST API: indices, documents, bulk, search,
 aggregations, mappings, kNN, scroll, reindex and the `_cat` endpoints. Kibana and
-the official client libraries connect to it directly.
+the official client libraries connect to it directly. One boundary worth knowing
+before you point export tooling at it: scroll is a bounded up-front snapshot, not
+a segment-walking cursor, so a query whose exact total exceeds the snapshot
+window is refused with a `400` rather than silently truncated — use
+`search_after` for result sets of any size
+([the cap](https://xerj.org/docs/api-es-compat.html#scroll-cap)).
 
 The conformance suite runs on every commit and currently passes **1366 of 1369**
 cases. It lives in [`engine/tests/es-compat-yaml`](./engine/tests/es-compat-yaml),

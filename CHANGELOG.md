@@ -39,12 +39,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published number is checked against the server's behaviour rather than
   against a second hand-written copy of it.
 
-  Verified against a node built from this branch (v1.0.0-rc.17, ES-compat
-  listener on :19370, 11,450 documents in `logs`): the scroll open returns
-  `400 illegal_argument_exception` naming `[11450]`, `[10000]` and
-  `[search_after]`; a 6,012-document subset scrolls normally and returns a
-  `_scroll_id`; and `search_after` on `_id` walks all 11,450 documents over 12
-  pages of 1,000.
+  **The published escape hatch is now executed, not just spell-checked.** A
+  pinned number is worth nothing if the recipe past it is wrong, and the first
+  draft of this page's `search_after` transcript was: it paged with
+  `search_after: ["999"]` against 11,450 numeric-looking `_id`s. `_id` is a
+  keyword and sorts lexicographically, so `"1000" < "999"` and page 1 of 1,000
+  actually ends at `_id` `"10897"`. Followed exactly as printed, including the
+  page's own stop rule ("until a page comes back empty"), that walk collected
+  1,010 of 11,450 documents — 10,440 missing, every response a 200 — which is
+  the silently-truncated export that #198 and this very page exist to rule out.
+  The transcript now publishes the cursor the response actually returns, shows
+  the hit it comes from, and states the lexicographic ordering that produced the
+  mistake. `published_search_after_recipe_walks_the_whole_corpus` parses the
+  transcript out of the page, seeds the corpus the transcript itself names,
+  replays the printed request bodies verbatim against the real router, and
+  asserts the walk collects every seeded `_id` over the page count the
+  transcript claims — so a wrong cursor, an early stop, a repeated page or a
+  drifted claim all fail the build.
+
+  Three further scroll claims elsewhere in the tree were corrected to match:
+  `landing/agent-search/index.html` said scroll *was* a deep-pagination cursor;
+  `landing/llms-full.txt` §6 and `README.md` carried the bare "scroll is
+  supported" form; and the ES→XERJ migration recipe in
+  `docs/recipes/production-deployment.md` told readers they could point a
+  whole-index scroll copy at a XERJ source with no mention of the ceiling.
+
+  One boundary is documented rather than fixed here: the cap is applied to the
+  request's summed total on `POST /{index}/_search?scroll=` (`es_compat.rs:14211`)
+  but *per index* on the `POST /{index}/_search_scroll` alias
+  (`es_compat.rs:19726`), so a multi-index scroll on that route can snapshot the
+  ceiling from each index. That direction is permissive, not lossy. The pages now
+  say so and point at
+  [#405](https://github.com/xerj-org/xerj/issues/405), where the engine
+  inconsistency is tracked.
+
+  Verified by `cargo test -p xerj-api --test
+  scroll_snapshot_cap_is_documented` — 3 passed in the `ci-test` profile
+  (8.67s, overflow-checks off) and 3 passed in `dev` (12.40s, overflow-checks
+  on). It drives `build_es_compat_router` over tempdir engines: an
+  11,450-document `logs` index
+  refuses the scroll open with `400 illegal_argument_exception` naming `[11450]`
+  and `[10000]`; a 128-document control scroll returns a `_scroll_id`; the
+  printed first page returns 1,000 hits ending at `_id` `"10897"` with
+  `sort: ["10897"]`; and the published walk from that cursor returns 11,450
+  distinct `_id`s over 12 pages with none missing and none repeated. Reverting
+  only the transcript hunk to the `["999"]` form fails the same test with
+  `left: Array [String("999")] / right: Array [String("10897")]`, and with the
+  cursor assertion inverted so the walk still runs, with "collected 1010 of
+  11450 documents over 2 pages, silently missing 10440". The `_search_scroll`
+  divergence above was measured on two 6,000-document indices in one engine:
+  `POST /sa,sb/_search?scroll=1m` → 400 naming `[12000]`/`[10000]`;
+  `POST /sa,sb/_search_scroll?scroll=1m` → 200 with a `_scroll_id` and
+  `hits.total {value: 12000, relation: "eq"}`.
 
 ### Fixed
 

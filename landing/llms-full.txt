@@ -153,6 +153,16 @@ Content types:
   and export scripts) reads whole indices, and whole indices are usually larger than the
   cap. So the accurate compatibility claim is "scroll is supported, with a bounded
   snapshot cap; use `search_after` beyond that", NOT "scroll is supported".
+  Two things to get right when you switch. (a) The cursor is the previous page's LAST hit's
+  `sort` array, copied verbatim out of the response — never a value you computed from the
+  page number. `_id` is a keyword and sorts LEXICOGRAPHICALLY ("1000" < "999"), so over
+  11,450 numeric-looking ids page 1 of 1,000 ends at "10897"; passing ["999"] instead walks
+  off the end of the corpus and returns an empty page after 1,010 documents, with no error.
+  Sort on a numeric field if you want numeric order. (b) The ceiling above is what
+  `_search?scroll=` enforces, against the request's total over every index it resolves. The
+  `POST /{index}/_search_scroll` alias applies it PER INDEX instead, so a multi-index scroll
+  sent there can snapshot the full ceiling from each — permissive, not lossy; nothing is
+  truncated. Tracked in https://github.com/xerj-org/xerj/issues/405.
 
 - Default `_search` source is compact. When `_source` is omitted, ordinary source fields
   are returned but engine-generated `<field>_vector` and `<field>_vector_chunks` companions
@@ -731,7 +741,8 @@ parent/child join, so running these would return silently wrong hits:
 Any other query type answers `unknown query type`.
 
 Search body options: from, size, sort, _source (include/exclude), highlight, aggs,
-track_total_hits, and (via dedicated endpoints) scroll and point-in-time.
+track_total_hits, and (via dedicated endpoints) scroll and point-in-time. Scroll is a
+bounded snapshot, not a cursor — see the cap in §2; `search_after` is the unbounded path.
 
 Aggregations (complete; no probabilistic sketch in the metric path — cardinality
 is a true distinct count, not an HLL estimate, and terms doc_count is precise).
