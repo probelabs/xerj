@@ -81,6 +81,11 @@ your PATH if needed): `xerj --insecure --data-dir ./data &`, wait until
 `http://localhost:9200` responds, then `xerj autoindex ~/my-project` — see
 [Index a folder](#index-a-folder).
 
+For a host with no runtime internet access, follow the
+[air-gapped deployment recipe](./docs/recipes/air-gapped-deployment.md). The
+default lexical embedder is offline; neural mode needs the three model files
+staged locally before the first semantic operation.
+
 ## Index a folder
 
 Start the server, then point `autoindex` at anything:

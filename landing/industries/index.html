@@ -82,13 +82,13 @@
       <span class="card-k">02 · PUBLIC SECTOR</span>
       <span class="card-t">GOVERNMENT ·<br>DEFENSE ·<br><span class="accent">INTELLIGENCE</span></span>
       <span class="card-b">
-        Air-gapped enclaves. Signed offline updates. ~36 MB binary
-        fits inside ATO envelopes that reject JVM stacks. FedRAMP +
-        IL5 on the roadmap · SBOM shipped per release today.
+        Air-gapped enclaves with an operator-staged standard binary in offline
+        lexical mode. Optional local model; adjacent SHA-256 integrity check.
+        FedRAMP + IL5 remain on the roadmap.
       </span>
       <span class="card-facts">
-        AIR-GAP MODE · NO TELEMETRY EGRESS<br>
-        SBOM + SLSA PROVENANCE (ROADMAP Q3)<br>
+        OFFLINE DEPLOYMENT · NO RUNTIME TELEMETRY/UPDATE/LICENSE CALLS<br>
+        OPTIONAL LOCAL MODEL · OPERATOR-STAGED RELEASE<br>
         NIST 800-53 / AI RMF CROSS-WALK
       </span>
       <span class="card-cta">EXPLORE PUBLIC SECTOR  →</span>
@@ -158,8 +158,8 @@
     <div class="v">Customer-managed keys via AWS KMS · GCP KMS · Azure Key Vault · HashiCorp Vault · Thales Luna HSM. No XERJ-side plaintext access.</div>
   </div>
   <div class="row">
-    <div class="k">AIR-GAP</div>
-    <div class="v"><span class="mono">XERJ_AIRGAP=1</span> disables all telemetry egress · offline bundle · signed release manifest. <strong>Deployable into a SCIF or a sealed rack.</strong></div>
+    <div class="k">OFFLINE DEPLOYMENT</div>
+    <div class="v">Standard binary · offline lexical mode · operator-staged archive + adjacent <span class="mono">.sha256</span> integrity only · optional local model · no runtime telemetry/update/license calls. <strong><a href="/docs/recipes/air-gapped-deployment.html">See the deployment recipe.</a></strong></div>
   </div>
 </section>
 

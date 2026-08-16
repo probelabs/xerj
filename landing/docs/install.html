@@ -150,6 +150,7 @@ $ sha256sum -c xerj-${ver}-x86_64-unknown-linux-musl.tar.gz.sha256
 $ tar xzf xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
 $ sudo install -m 0755 xerj-${ver}-x86_64-unknown-linux-musl/xerj /usr/local/bin/xerj
 $ xerj --version</pre>
+  <p>Deploying to a host with no runtime internet access? Follow the <a href="/docs/recipes/air-gapped-deployment.html">air-gapped deployment recipe</a> for release checksums, optional local neural model files, and the loopback/auth defaults.</p>
   <p><strong>macOS Gatekeeper:</strong> the release binaries are not code-signed or notarized. A tarball fetched with <code class="inline">curl</code> (both the one-liner and the commands above) is not quarantined and runs as-is. A tarball downloaded through a <em>browser</em> is: macOS attaches <code class="inline">com.apple.quarantine</code> and the first launch is blocked with <em>"cannot be opened because the developer cannot be verified"</em>. Clear it once, then run normally:</p>
 <pre class="code">$ xattr -d com.apple.quarantine ./xerj</pre>
 

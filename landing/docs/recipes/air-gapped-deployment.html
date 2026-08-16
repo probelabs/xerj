@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ · Docs · Recipe · Air-gapped deployment</title>
+<meta name="description" content="Stage a XERJ release and optional neural model on a connected machine, then run the node without runtime internet access.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="/style.css?v=90f643e">
+</head>
+<body>
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a><a href="/product.html">PRODUCT</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a><a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html" class="active">RECIPES</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="spacer"></span>
+  <span class="theme"><button type="button" data-theme="day">DAY</button><span class="dash">·</span><button type="button" data-theme="night" class="active">NIGHT</button></span>
+</nav>
+
+<div class="docs-search" id="docsSearch">
+  <input type="text" id="docsSearchInput" placeholder="Search docs · keys, flags, endpoints, playbooks…" aria-label="Search docs" autocomplete="off" spellcheck="false">
+  <span class="hint">⌘ K</span><div class="results" id="docsSearchResults" aria-live="polite"></div>
+</div>
+
+<div class="docs-shell">
+<nav class="docs-nav" aria-label="Docs">
+  <div class="group"><span class="label">START</span>
+    <a href="/docs/index.html"><span class="eyebrow">01</span>Overview</a>
+    <a href="/docs/install.html"><span class="eyebrow">02</span>Install</a>
+  </div>
+  <div class="group"><span class="label">OPERATIONS</span>
+    <a href="/docs/operations.html"><span class="eyebrow">01</span>Running in production</a>
+    <a href="/docs/config.html"><span class="eyebrow">02</span>Config TOML</a>
+  </div>
+  <div class="group"><span class="label">RECIPES</span>
+    <a href="/docs/recipes/index.html"><span class="eyebrow">00</span>All recipes</a>
+    <a href="/docs/recipes/air-gapped-deployment.html" class="active"><span class="eyebrow">13</span>Air-gapped deployment</a>
+  </div>
+</nav>
+
+<main class="docs-content">
+  <div class="breadcrumb"><a href="/docs/index.html">DOCS</a><span class="sep">·</span><a href="/docs/recipes/index.html">RECIPES</a><span class="sep">·</span>AIR-GAPPED DEPLOYMENT
+    <button class="pdf-btn" onclick="window.print()" title="Save this page as PDF"><svg viewBox="0 0 24 24"><path d="M12 3v12M12 15l-4-4M12 15l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>PDF</button>
+  </div>
+  <div class="kicker"><span>RECIPE · 13 · OPERATIONS</span></div>
+  <h1>Run XERJ fully offline — air-gapped deployment</h1>
+  <p><strong>Goal:</strong> follow this short Linux x86_64-musl procedure: stage one operator-approved release, install it as an unprivileged service, and keep the node on loopback. The base path is lexical and needs no model files; neural embedding is optional.</p>
+
+  <blockquote><p>This recipe is traced to the release workflow, installer, embedding loader, and configuration defaults. It is not a claim that an egress-disabled enclave run was live-tested. Execute the final firewall and operational checks in your own target environment.</p></blockquote>
+
+  <h2>Runtime boundary</h2>
+  <ul>
+    <li>The default embedding mode is <strong>lexical feature hashing</strong>: no model, embedding service, or network connection is required.</li>
+    <li>Neural mode is optional. Without <code class="inline">embedding.local_model_dir</code>, its first embedding operation downloads <code class="inline">config.json</code>, <code class="inline">tokenizer.json</code>, and <code class="inline">model.safetensors</code> for <code class="inline">sentence-transformers/all-MiniLM-L6-v2</code> from Hugging Face; with that directory set, XERJ reads them locally.</li>
+    <li><code class="inline">proxy</code> calls only the configured OpenAI-compatible <code class="inline">embedding.default_endpoint</code>. The experimental <code class="inline">onnx-experimental</code> backend needs an ONNX-enabled build and explicit local assets; neither is the base release path.</li>
+  </ul>
+
+  <h2>Defaults and boundaries</h2>
+  <table><thead><tr><th>Component</th><th>Default</th><th>Offline meaning</th></tr></thead><tbody>
+    <tr><td>Embedding</td><td><code class="inline">auto</code></td><td>Lexical unless an endpoint is configured; no model/network for lexical mode.</td></tr>
+    <tr><td>WAL tap</td><td>Disabled</td><td>A persisted runtime overlay can override TOML on a reused data directory.</td></tr>
+    <tr><td>Cluster</td><td>Disabled</td><td>Single-node startup does not initialize the Raft transport.</td></tr>
+    <tr><td>REST / ES-compatible listeners</td><td><code class="inline">127.0.0.1</code></td><td>Loopback-only by default; keep it there unless the production auth/TLS procedure is followed.</td></tr>
+    <tr><td>autoindex / MCP</td><td>Localhost defaults</td><td>Local clients; they do not create a public listener or silently upload corpus data.</td></tr>
+    <tr><td>Runtime telemetry, updates, license activation</td><td>None</td><td>The running binary makes no calls for these purposes.</td></tr>
+  </tbody></table>
+  <p>The bundled Console has three external Google Fonts link elements (two preconnects and one stylesheet; stylesheet may fetch additional font files). Blocked requests fall back to system fonts.</p>
+  <p>This procedure does not claim that egress was measured here. If policy requires that boundary, apply an egress-deny rule and inspect firewall/log counters during acceptance.</p>
+
+  <h2>1. Stage an approved release</h2>
+  <p>Run this on a connected staging machine. Set <code class="inline">TAG</code> to the operator-approved <code class="inline">vX.Y.Z</code> release tag before running; there is no moving release alias here. This procedure stages the Linux x86_64 musl archive only. The matching <code class="inline">.sha256</code> is a separate per-archive asset.</p>
+<pre class="code">set -eu
+
+: "${TAG:?set TAG to an operator-approved vX.Y.Z release tag}"
+if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+  echo "TAG must match vX.Y.Z with optional prerelease/build metadata: $TAG" &gt;&amp;2
+  exit 2
+fi
+VERSION="${TAG#v}"
+TARGET="x86_64-unknown-linux-musl"
+EXT="tar.gz"
+STAGE="xerj-${VERSION}-${TARGET}"
+ASSET="${STAGE}.${EXT}"
+BASE="https://github.com/xerj-org/xerj/releases/download/${TAG}"
+OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
+
+mkdir -p "$OUT/release"
+curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
+curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
+(
+  cd "$OUT/release"
+  sha256sum -c "$ASSET.sha256"
+  tar -xzf "$ASSET"
+  test -x "$STAGE/xerj"
+  "$STAGE/xerj" --version
+)</pre>
+  <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. After transfer, set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
+<pre class="code">: "${TAG:?set TAG to the same operator-approved release tag}"
+VERSION="${TAG#v}"
+ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+cd /opt/xerj-staging/release
+sha256sum -c "$ASSET.sha256"
+tar -xzf "$ASSET"
+test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"</pre>
+
+  <h2>2. Install the base lexical node</h2>
+  <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
+<pre class="code">if ! getent passwd xerj &gt;/dev/null; then
+  sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
+fi
+sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
+sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
+sudo install -m 0755 \
+  "/opt/xerj-staging/release/xerj-${VERSION}-x86_64-unknown-linux-musl/xerj" \
+  /opt/xerj/bin/xerj</pre>
+  <p>Create <code class="inline">/etc/xerj/xerj.toml</code> with the complete base configuration. Explicit lexical mode and an empty endpoint keep this path model-free:</p>
+<pre class="code">[server]
+bind_address = "127.0.0.1"
+data_dir = "/var/lib/xerj"
+es_compat_port = 9200
+
+[auth]
+enabled = true
+
+[embedding]
+mode = "lexical"
+default_endpoint = ""
+default_model = ""</pre>
+<pre class="code">sudo -u xerj /opt/xerj/bin/xerj --config /etc/xerj/xerj.toml</pre>
+  <p>Start it as <code class="inline">xerj</code>. On first start the authenticated admin key is written to <code class="inline">/var/lib/xerj/admin.key</code>. Keep the listener on loopback; a network-facing listener needs the production TLS/auth procedure.</p>
+
+  <h2>3. Optional neural model</h2>
+  <p>Only when neural semantics are needed, stage the three loader files on the connected machine:</p>
+<pre class="code">MODEL="$OUT/model/all-MiniLM-L6-v2"
+mkdir -p "$MODEL"
+for FILE in config.json tokenizer.json model.safetensors; do
+  curl -fL --retry 3 -o "$MODEL/$FILE" \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
+done
+( cd "$MODEL" &amp;&amp; sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256 )</pre>
+  <p>Transfer and verify <code class="inline">model.sha256</code>, then install the files:</p>
+<pre class="code">sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
+sudo install -o xerj -g xerj -m 0640 \
+  /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
+  /opt/xerj/models/all-MiniLM-L6-v2/</pre>
+  <p>Replace only the embedding block with:</p>
+<pre class="code">[embedding]
+mode = "neural"
+local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"</pre>
+  <p>XERJ does not independently verify model checksums; the transferred digest is an operator check, not a XERJ signature. Omit this section and all model assets for lexical search.</p>
+
+  <h2>4. Authenticate local clients and verify</h2>
+<pre class="code">XERJ=/opt/xerj/bin/xerj
+DATA=/var/lib/xerj
+KEY="$(sudo cat "$DATA/admin.key")"
+export XERJ_API_KEY="$KEY"
+"$XERJ" --version
+curl -fsS -H "Authorization: ApiKey $KEY" \
+  http://127.0.0.1:9200/_cluster/health</pre>
+  <p>With the lexical node running, this semantic query uses the local lexical embedder and needs zero model files. Assert that it returns <code class="inline">_id</code> <code class="inline">1</code>:</p>
+<pre class="code">curl -fsS -X PUT http://127.0.0.1:9200/offline-demo \
+  -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
+  -d '{"mappings":{"properties":{"body":{"type":"semantic_text"}}}}'
+curl -fsS -X POST 'http://127.0.0.1:9200/offline-demo/_doc/1?refresh=true' \
+  -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
+  -d '{"body":"A local lexical node can answer this without a network service."}'
+curl -fsS -X POST http://127.0.0.1:9200/offline-demo/_search \
+  -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
+  -d '{"query":{"semantic":{"field":"body","query":"local lexical"}}}'</pre>
+  <p>Repeat health and query after restarting the same data directory. For the stronger boundary check, run the sequence with host egress disabled and inspect firewall/log counters; this recipe does not claim that test was run here.</p>
+  <p>For MCP, <code class="inline">XERJ_AUTH</code> and <code class="inline">--auth</code> are complete Authorization-header values, including the scheme:</p>
+<pre class="code">XERJ_URL=http://127.0.0.1:9200 XERJ_AUTH="ApiKey $KEY" "$XERJ" mcp
+"$XERJ" mcp --url http://127.0.0.1:9200 --auth "ApiKey $KEY"</pre>
+  <p>For <code class="inline">xerj autoindex</code>, <code class="inline">XERJ_API_KEY</code> and <code class="inline">--api-key</code> take the raw key; the client adds the <code class="inline">ApiKey</code> scheme:</p>
+<pre class="code">XERJ_API_KEY="$KEY" "$XERJ" autoindex /path/to/folder --url http://127.0.0.1:9200
+"$XERJ" autoindex /path/to/folder --url http://127.0.0.1:9200 --api-key "$KEY"</pre>
+
+  <h2>Existing data directories and local clients</h2>
+  <p>WAL tap is disabled by default, but <code class="inline">PUT /_xerj/wal_tap</code> persists a runtime overlay and reapplies it over TOML on restart. Inspect and remove an old overlay before reusing a data directory:</p>
+<pre class="code">curl -fsS -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap
+curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap</pre>
+  <p>Cluster mode remains disabled unless explicitly enabled and supplied a shared <code class="inline">cluster.auth_secret</code>. <code class="inline">xerj mcp</code> is a local stdio client to <code class="inline">XERJ_URL</code>; <code class="inline">xerj autoindex</code> also defaults to the local ES-compatible endpoint. Neither creates an external listener or silently uploads corpus data.</p>
+
+  <h2>What this recipe does not promise</h2>
+  <ul>
+    <li>Release <code class="inline">.sha256</code> files provide integrity, not signing or attestation.</li>
+    <li>XERJ does not independently checksum the Hugging Face model files.</li>
+    <li>The Console falls back to system fonts, but its three external Google Fonts link elements remain browser egress attempts unless deployment removes or rewrites that HTML; stylesheet may fetch additional font files.</li>
+    <li>This is a traced procedure, not a live disconnected-firewall run or measured browser-egress claim.</li>
+  </ul>
+  <p>Related: <a href="/docs/operations.html">production operations</a>, <a href="/docs/config.html">configuration reference</a>, <a href="https://github.com/xerj-org/xerj/blob/main/docs/EXPERIMENTAL_ONNX.md">experimental ONNX backend</a>, and <a href="https://github.com/xerj-org/xerj/blob/main/metrics/README.md">metrics privacy posture</a>.</p>
+</main>
+</div>
+
+<footer class="footer"><span>XERJ.AI · DOCS</span><span>READ THE SOURCE</span><span><a href="/index.html">HOME</a> · <a href="/llms.txt">LLMS.TXT</a></span></footer>
+
+<script type="application/json" id="docs-index">[{"title":"Overview","slug":"/docs/index.html","kicker":"START","snip":""},{"title":"Quickstart","slug":"/docs/quickstart.html","kicker":"START","snip":""},{"title":"Install","slug":"/docs/install.html","kicker":"START","snip":""},{"title":"Migrate from ES","slug":"/docs/migration-from-es.html","kicker":"START","snip":""},{"title":"CLI","slug":"/docs/cli.html","kicker":"REFERENCE","snip":""},{"title":"Config TOML","slug":"/docs/config.html","kicker":"REFERENCE","snip":""},{"title":"Environment","slug":"/docs/env.html","kicker":"REFERENCE","snip":""},{"title":"Native REST API","slug":"/docs/api-native.html","kicker":"REFERENCE","snip":""},{"title":"ES-compat API","slug":"/docs/api-es-compat.html","kicker":"REFERENCE","snip":""},{"title":"Query types","slug":"/docs/queries.html","kicker":"DATA MODEL","snip":""},{"title":"Aggregations","slug":"/docs/aggregations.html","kicker":"DATA MODEL","snip":""},{"title":"Analyzers","slug":"/docs/analyzers.html","kicker":"DATA MODEL","snip":""},{"title":"Vectors & kNN","slug":"/docs/vectors.html","kicker":"DATA MODEL","snip":""},{"title":"Ingest pipelines","slug":"/docs/ingest.html","kicker":"ENGINE","snip":""},{"title":"Storage & WAL","slug":"/docs/storage.html","kicker":"ENGINE","snip":""},{"title":"Compression","slug":"/docs/compression.html","kicker":"ENGINE","snip":""},{"title":"Clustering","slug":"/docs/clustering.html","kicker":"ENGINE","snip":""},{"title":"Metrics","slug":"/docs/metrics.html","kicker":"ENGINE","snip":""},{"title":"Auth & TLS","slug":"/docs/security.html","kicker":"ENGINE","snip":""},{"title":"Running in production","slug":"/docs/operations.html","kicker":"OPERATIONS","snip":""},{"title":"Backup & restore","slug":"/docs/backup-restore.html","kicker":"OPERATIONS","snip":""},{"title":"Upgrades","slug":"/docs/upgrades.html","kicker":"OPERATIONS","snip":""},{"title":"Troubleshooting","slug":"/docs/troubleshooting.html","kicker":"OPERATIONS","snip":""},{"title":"SIEM","slug":"/docs/playbooks/siem.html","kicker":"PLAYBOOKS","snip":""},{"title":"Log analytics","slug":"/docs/playbooks/log-analytics.html","kicker":"PLAYBOOKS","snip":""},{"title":"Vector · RAG","slug":"/docs/playbooks/vector-search.html","kicker":"PLAYBOOKS","snip":""},{"title":"Full-text search","slug":"/docs/playbooks/full-text.html","kicker":"PLAYBOOKS","snip":""},{"title":"Observability","slug":"/docs/playbooks/observability.html","kicker":"PLAYBOOKS","snip":""},{"title":"CLI · --config","slug":"/docs/cli.html#config-flag","kicker":"CLI","snip":"-c, --config <PATH>  Path to the TOML config file."},{"title":"CLI · --data-dir","slug":"/docs/cli.html#data-dir-flag","kicker":"CLI","snip":"-d, --data-dir <PATH>  Override [server] data_dir at the command line."},{"title":"CLI · --insecure","slug":"/docs/cli.html#insecure-flag","kicker":"CLI","snip":"-k, --insecure  Disable TLS and API-key auth. Dev only."},{"title":"[server] rest_port","slug":"/docs/config.html#server","kicker":"CONFIG","snip":"u16 · default 8080 · Native REST API listener port."},{"title":"[server] es_compat_port","slug":"/docs/config.html#server","kicker":"CONFIG","snip":"u16 · default 9200 · Elasticsearch-wire-format port. 0 to disable."},{"title":"[storage] wal_sync","slug":"/docs/config.html#storage","kicker":"CONFIG","snip":"enum · default batched · sync · batched · async. Durability knob."},{"title":"[vector] hnsw_ef_search","slug":"/docs/config.html#vector","kicker":"CONFIG","snip":"u32 · default 100 · Accepted but not wired — the beam width comes from the request num_candidates."},{"title":"[vector] default_quantization","slug":"/docs/config.html#vector","kicker":"CONFIG","snip":"enum · none (default) · scalar8. binary is refused at startup; scalar4 is not accepted."},{"title":"GET /v1/health","slug":"/docs/api-native.html#health","kicker":"NATIVE API","snip":"Liveness + readiness. {status, uptime_s, version}."},{"title":"GET /v1/metrics","slug":"/docs/api-native.html#metrics","kicker":"NATIVE API","snip":"Prometheus text format. Scrape-friendly."},{"title":"POST /v1/indices/:name/turbo-ingest","slug":"/docs/api-native.html#turbo-ingest","kicker":"NATIVE API","snip":"NDJSON bulk path with parallel tokenization."},{"title":"POST /v1/indices/:name/search","slug":"/docs/api-native.html#search","kicker":"NATIVE API","snip":"Unified query endpoint — full-text, term, range, KNN, hybrid."},{"title":"POST /:index/_bulk","slug":"/docs/api-es-compat.html#bulk","kicker":"ES API","snip":"NDJSON bulk. Actions: index, create, update, delete."},{"title":"POST /:index/_search","slug":"/docs/api-es-compat.html#search","kicker":"ES API","snip":"ES query DSL. Drop-in migration path."},{"title":"match_all","slug":"/docs/queries.html#match-all","kicker":"QUERY","snip":"Everything in the index."},{"title":"bool","slug":"/docs/queries.html#bool","kicker":"QUERY","snip":"must / should / must_not / filter clauses."},{"title":"knn","slug":"/docs/queries.html#knn","kicker":"QUERY","snip":"Vector kNN — HNSW-served when unfiltered (exact-rescored); filtered runs the exact scan."},{"title":"semantic","slug":"/docs/queries.html#semantic","kicker":"QUERY","snip":"Embed the query text at query time and search the vector field."},{"title":"hybrid","slug":"/docs/queries.html#hybrid","kicker":"QUERY","snip":"RRF / linear fusion of sub-queries."},{"title":"terms aggregation","slug":"/docs/aggregations.html#terms","kicker":"AGG","snip":"Exact, pre-computed terms histograms over keyword fields."},{"title":"date_histogram","slug":"/docs/aggregations.html#date-histogram","kicker":"AGG","snip":"Time-bucketed counts."},{"title":"kNN serving","slug":"/docs/vectors.html#knn-query","kicker":"VECTORS","snip":"Unfiltered kNN via persisted HNSW + exact rescore; filtered kNN exact scan."},{"title":"SQ8 quantization","slug":"/docs/vectors.html#quantization","kicker":"VECTORS","snip":"8-bit scalar quantization. int8 scoring precision, not a memory saving (#392)."},{"title":"turbo-ingest","slug":"/docs/ingest.html#turbo","kicker":"INGEST","snip":"NDJSON bulk path. Parallel tokenization across cores."},{"title":"delta-of-delta","slug":"/docs/compression.html#delta-of-delta","kicker":"COMPRESSION","snip":"Timestamp encoding. Apache/Nginx/ISO auto-detect."},{"title":"dictionary encoding","slug":"/docs/compression.html#dictionary","kicker":"COMPRESSION","snip":"Up to 256 unique strings per column."},{"title":"api_key","slug":"/docs/security.html#api-key","kicker":"SECURITY","snip":"Static admin key. Auto-generated on first run."},{"title":"SIEM playbook","slug":"/docs/playbooks/siem.html","kicker":"PLAYBOOK","snip":"Terms agg over source IPs for SIEM, with detection rules."},{"title":"RAG playbook","slug":"/docs/playbooks/vector-search.html","kicker":"PLAYBOOK","snip":"Embeddings, kNN, hybrid search, BM25 + kNN fusion."},{"title":"[cluster] enabled","slug":"/docs/config.html#cluster","kicker":"CONFIG","snip":"bool · default false · Enable multi-node Raft cluster mode."},{"title":"[cluster] peers","slug":"/docs/config.html#cluster","kicker":"CONFIG","snip":"array · \"node_id=host:port\" · At least one peer per node."},{"title":"[cluster] port","slug":"/docs/config.html#cluster","kicker":"CONFIG","snip":"u16 · default 9300 · Intra-cluster Raft + search port."},{"title":"[embedding] default_endpoint","slug":"/docs/config.html#embedding","kicker":"CONFIG","snip":"string · OpenAI-compatible embeddings URL for auto-embedding on ingest."},{"title":"[embedding] default_model","slug":"/docs/config.html#embedding","kicker":"CONFIG","snip":"string · Model name (e.g. text-embedding-3-small, nomic-embed-text)."},{"title":"Raft","slug":"/docs/clustering.html","kicker":"CLUSTER","snip":"Embedded Raft — leader election, log replication, metadata only."},{"title":"Node draining","slug":"/docs/clustering.html","kicker":"CLUSTER","snip":"POST /v1/cluster/nodes/:id/drain before maintenance."},{"title":"Region split/merge","slug":"/docs/clustering.html","kicker":"CLUSTER","snip":"Range partitions auto-split at byte threshold, merge back when small."},{"title":"Systemd unit","slug":"/docs/operations.html","kicker":"OPS","snip":"Production unit file with hardening directives."},{"title":"Readiness probe","slug":"/docs/operations.html","kicker":"OPS","snip":"GET /v1/health/ready — only 200 once WAL replay is complete."},{"title":"Config reload","slug":"/docs/operations.html","kicker":"OPS","snip":"SIGHUP reloads most keys without restart."},{"title":"Hot backup","slug":"/docs/backup-restore.html","kicker":"OPS","snip":"rsync the data dir after POST /v1/admin/flush."},{"title":"S3 backup","slug":"/docs/backup-restore.html","kicker":"OPS","snip":"POST /v1/admin/backup → any S3-compatible endpoint."},{"title":"Rolling upgrade","slug":"/docs/upgrades.html","kicker":"OPS","snip":"Drain → stop → upgrade → start → activate, per node."},{"title":"Merge pressure","slug":"/docs/troubleshooting.html","kicker":"OPS","snip":"Segment count climbing → raise merge.max_concurrent + io_rate."},{"title":"Cluster flapping","slug":"/docs/troubleshooting.html","kicker":"OPS","snip":"Leader changes every few seconds → raise cluster.tick_ms."},{"title":"WAL replay failed","slug":"/docs/troubleshooting.html","kicker":"OPS","snip":"xerj verify --repair-wal truncates at last valid entry."},{"title":"Recipes","slug":"/docs/recipes/index.html","kicker":"RECIPES","snip":"Task-oriented AI & search recipes, each verified end-to-end against a live XERJ."},{"title":"Semantic search & RAG","slug":"/docs/recipes/semantic-search-rag.html","kicker":"RECIPE","snip":"Retrieval by meaning with semantic_text — auto-embed on ingest, no separate vector DB."},{"title":"Agent memory","slug":"/docs/recipes/agentic-memory.html","kicker":"RECIPE","snip":"Long-term memory for agents via /_memory — store, recall, forget, per-agent isolation."},{"title":"Passage retrieval","slug":"/docs/recipes/passage-retrieval.html","kicker":"RECIPE","snip":"Auto-chunk long docs; best-passage (max-sim) scoring — 98% top-3."},{"title":"Vector search · kNN","slug":"/docs/recipes/vector-search-knn.html","kicker":"RECIPE","snip":"Nearest-neighbor over dense_vector — HNSW-served unfiltered, exact with filters."},{"title":"Vector quantization","slug":"/docs/recipes/vector-quantization.html","kicker":"RECIPE","snip":"scalar8 (accepts ES int8_hnsw; exact code scan) — int8 scoring at recall@10 = 0.998. Precision, not memory."},{"title":"Hybrid search","slug":"/docs/recipes/hybrid-search.html","kicker":"RECIPE","snip":"Keyword + vector in one query — RRF fusion."},{"title":"Log analytics","slug":"/docs/recipes/log-analytics.html","kicker":"RECIPE","snip":"Raw logs to dashboards — error rates, p95 latency, top services."},{"title":"Anomaly detection","slug":"/docs/recipes/anomaly-detection.html","kicker":"RECIPE","snip":"Statistical _ml detectors that flag spikes in metrics/logs."},{"title":"Anomaly datafeeds","slug":"/docs/recipes/continuous-anomaly-datafeeds.html","kicker":"RECIPE","snip":"Live _ml datafeed re-scores an index on a timer, stores anomaly records."},{"title":"Migrate from ES","slug":"/docs/recipes/migrate-from-elasticsearch.html","kicker":"RECIPE","snip":"Point your existing ES client at XERJ — same wire, change the URL."},{"title":"Index a folder of mixed docs","slug":"/docs/recipes/document-folder-index.html","kicker":"RECIPE","snip":"Walk a folder of PDF/DOCX/HTML/MD/TXT, extract + chunk + embed, then lexical/semantic/hybrid search — grep can't read a PDF."},{"title":"Zero-config autoindex","slug":"/docs/recipes/zero-config-autoindex.html","kicker":"RECIPE","snip":"xerj autoindex <folder> — one command, content-sniffed formats, inferred mappings, a self-describing data map. 80/81 ground-truth checks on a 518 MB corpus."},{"title":"Air-gapped deployment","slug":"/docs/recipes/air-gapped-deployment.html","kicker":"RECIPE","snip":"Linux x86_64-musl release staging and model-free lexical deployment; neural optional."}]</script>
+<script>
+(function () {
+  const root = document.documentElement;
+  for (const btn of document.querySelectorAll('[data-theme]')) btn.addEventListener('click', () => {
+    const theme = btn.getAttribute('data-theme'); root.setAttribute('data-theme', theme);
+    for (const b of document.querySelectorAll('[data-theme]')) b.classList.toggle('active', b.getAttribute('data-theme') === theme);
+  });
+  const search = document.getElementById('docsSearch'), input = document.getElementById('docsSearchInput'), results = document.getElementById('docsSearchResults'), data = document.getElementById('docs-index');
+  if (!search || !input || !results || !data) return;
+  const index = JSON.parse(data.textContent || '[]');
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  input.addEventListener('input', () => {
+    const q = input.value.trim().toLowerCase();
+    if (!q) { search.classList.remove('active'); results.innerHTML = ''; return; }
+    const hits = index.filter((e) => (e.title + ' ' + e.kicker + ' ' + e.snip).toLowerCase().includes(q));
+    results.innerHTML = hits.length ? hits.map((e) => '<a href="' + e.slug + '"><span class="kicker">' + esc(e.kicker) + '</span><span class="title">' + esc(e.title) + '</span><span class="snip">' + esc(e.snip) + '</span></a>').join('') : '<div class="no-results">NO MATCHES</div>';
+    search.classList.add('active');
+  });
+  document.addEventListener('keydown', (e) => { if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); input.focus(); } });
+}());
+</script>
+</body>
+</html>
