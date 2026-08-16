@@ -545,15 +545,22 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
             // ',' at offset 13 followed by four little-endian u16s whose HIGH
             // bytes (15, 17, 19, 21) are spaces clears every bound above.
             // Decode one field further, to the LZW minimum code size that
-            // opens the image data: the spec confines it to 2..=12, which is
-            // entirely non-printable. Every counterexample carries 0x20 there.
+            // opens the image data. A GIF palette holds at most 256 entries, so
+            // this field is bits-per-pixel and cannot exceed 8 — codes grow to
+            // 12 bits during compression, but the MINIMUM code size is 2..=8.
+            // Round 2 wrote 2..=12, and that width is what let text back
+            // through: 9, 10, 11 and 12 are exactly TAB, LF, VT and FF, so an
+            // ordinary line break at the derived offset satisfied it. Measured,
+            // every real image-descriptor-first GIF on the build machine
+            // carries 8 here across palettes of 2 to 256 entries, while the
+            // CP1252 and ASCII counterexamples carry 9 or 10.
             let has_local_table = desc[8] & 0x80 != 0;
             // A frame needs a palette: its own Local Colour Table, or the
             // Global one. With neither there is nothing to decode pixels
             // against, so such a file is not a GIF at all. This is what
             // separates prose whose byte at the LZW position happens to be a
             // control character — the CSV counterexample carries `\n` (10),
-            // which is inside the valid 2..=12 range and clears the check
+            // which is inside the old 2..=12 range and cleared the check
             // below on its own.
             if !has_local_table && packed & 0x80 == 0 {
                 return false;
@@ -563,7 +570,7 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
             } else {
                 0
             };
-            matches!(prefix.get(block + 10 + local_table), Some(2..=12))
+            matches!(prefix.get(block + 10 + local_table), Some(2..=8))
         }
         _ => false,
     }
@@ -1703,7 +1710,7 @@ mod printable_magic_tests {
         gif87.extend_from_slice(&[16, 0, 16, 0, 0x80, 0, 0]);
         gif87.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]); // GCT
                                                                // Image Descriptor, then the LZW minimum code size that opens the
-                                                               // image data — the spec confines it to 2..=12, and it is the field
+                                                               // image data — the spec confines it to 2..=8, and it is the field
                                                                // all-ASCII input cannot supply (#379).
         gif87.extend_from_slice(&[0x2c, 0, 0, 0, 0, 16, 0, 16, 0, 0, 0x02]);
         gif87.extend(b"lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20));
@@ -1875,6 +1882,52 @@ mod printable_magic_tests {
              extension and no encoder writes it into the container"
         );
     }
+    /// The third must-fix from the round-2 verification: the palette check is a
+    /// single-bit test on a byte that in text is a character. Bit 7 is clear for
+    /// 7-bit ASCII — which is why the round-2 ASCII fixtures passed — but SET
+    /// for every CP1252 accented letter and every UTF-8 lead byte, so the gate
+    /// stood open for exactly the scripts this repository has junked before
+    /// (the #378 reland silently dropped CJK, Cyrillic, Greek, Hebrew and
+    /// Arabic documents over ~4 KB).
+    ///
+    /// The palette bit is not what separates text from images. The LZW minimum
+    /// code size is.
+    #[test]
+    fn accented_and_multibyte_text_is_not_junked_through_the_image_descriptor() {
+        let latin1 = |s: &str, n: usize| -> Vec<u8> {
+            s.repeat(n).chars().map(|c| c as u32 as u8).collect()
+        };
+        let cases: [(&str, Vec<u8>); 3] = [
+            (
+                "cp1252-spanish-csv",
+                latin1(
+                    "GIF89a está en desuso hoy,1 2 3 4 5\nformato,anio,notas\n",
+                    30,
+                ),
+            ),
+            (
+                "cp1252-french-csv",
+                latin1("GIF89a créé en 1987, puis,1 2 3 4 5\nligne,a,b,c\n", 40),
+            ),
+            (
+                "ascii-csv-newline-at-the-lzw-offset",
+                "GIF89a format,1 2 3 4 5\nrow,a,b,c,d\n"
+                    .repeat(60)
+                    .into_bytes(),
+            ),
+        ];
+        for (label, bytes) in &cases {
+            let p = Path::new("notes.txt");
+            let sn = sniff_bytes(bytes, p, p, false).unwrap();
+            assert_ne!(
+                sn.family,
+                Family::Binary,
+                "{label}: text junked as {:?} — the image-descriptor path is still open (#379)",
+                sn.binary_kind
+            );
+        }
+    }
+
     /// The Comment-extension arm, which round 2 of #379 added and which an
     /// independent verification then broke real images with. It is the only
     /// branch here carrying a loop, so it is the one that needed fixtures and
