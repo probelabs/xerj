@@ -188,28 +188,28 @@
       <text x="40" y="44" class="label mute">SEALED ENCLAVE · NO INTERNET · TARGET: GOV · DEFENSE · FIN</text>
 
       <g class="node accent"><rect x="60" y="80" width="500" height="140"/>
-        <text x="76" y="104" class="label">XERJ CLUSTER · 3-NODE HA · AIRGAP=1</text>
-        <text x="76" y="128" class="small">FTS · VECTOR · COLUMNS · AGENT MEMORY</text>
-        <text x="76" y="150" class="small">encrypted segments · AES-256-GCM · BYOK</text>
-        <text x="76" y="176" class="small mute">RTO &lt; 30 s · RPO 0 (sync) · 99.95 % availability</text>
-        <text x="76" y="204" class="small mute">no outbound · no telemetry · no license ping</text>
+        <text x="76" y="104" class="label">XERJ NODE · STANDARD BINARY · LEXICAL BASELINE</text>
+        <text x="76" y="128" class="small">loopback listener · authenticated API</text>
+        <text x="76" y="150" class="small">optional local model staged by operator</text>
+        <text x="76" y="176" class="small mute">archive + adjacent .sha256 integrity check</text>
+        <text x="76" y="204" class="small mute">no runtime telemetry · update · license calls</text>
       </g>
 
       <g class="node mute"><rect x="600" y="80" width="320" height="140" class="dashed"/>
-        <text x="616" y="104" class="label">OFFLINE UPDATE CHANNEL</text>
-        <text x="616" y="128" class="small">signed bundle via data-diode</text>
-        <text x="616" y="148" class="small">manifest verified before install</text>
-        <text x="616" y="168" class="small">SBOM + SLSA provenance</text>
+        <text x="616" y="104" class="label">OPERATOR-STAGED RELEASE</text>
+        <text x="616" y="128" class="small">archive + adjacent .sha256</text>
+        <text x="616" y="148" class="small">verify before transfer</text>
+        <text x="616" y="168" class="small">optional local model files</text>
         <text x="616" y="196" class="small mute">inbound only</text>
       </g>
 
       <line x1="598" y1="150" x2="566" y2="150" class="mute"/>
       <polygon class="mute" points="570,146 570,154 562,150"/>
     </svg>
-    <div class="row"><div class="k">NODES</div><div class="v">1–N · offline</div></div>
-    <div class="row"><div class="k">RTO / RPO</div><div class="v">Same as HA cluster</div></div>
-    <div class="row"><div class="k">EGRESS</div><div class="v">Zero telemetry · zero update probe · zero license ping</div></div>
-    <div class="row"><div class="k">UPDATES</div><div class="v">Signed offline bundle · SBOM verified before install · reproducible-build manifest</div></div>
+    <div class="row"><div class="k">NODES</div><div class="v">1 · loopback by default</div></div>
+    <div class="row"><div class="k">RTO / RPO</div><div class="v">Operator-defined</div></div>
+    <div class="row"><div class="k">EGRESS</div><div class="v">No runtime telemetry · update · license calls; Console may attempt external Google Fonts</div></div>
+    <div class="row"><div class="k">UPDATES</div><div class="v">Operator-staged archive · adjacent .sha256 integrity only</div></div>
     <div class="row"><div class="k">USE WHEN</div><div class="v">Classified enclaves · SCIFs · regulated on-prem with no internet · sovereign cloud</div></div>
   </div>
 

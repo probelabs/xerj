@@ -123,7 +123,7 @@
   <div class="matrix-row"><span class="mk">SCIM</span><span class="mv">SCIM 2.0 provisioning for tenant and user lifecycle</span><span class="mstatus road">ROAD Q3</span></div>
   <div class="matrix-row"><span class="mk">AUDIT TRAIL</span><span class="mv">Structured event log · queryable as index · replayable · exportable</span><span class="mstatus beta">BETA</span></div>
   <div class="matrix-row"><span class="mk">EXPLAIN-PLAN</span><span class="mv">First-class endpoint · per-node cost + rows · audit artifact for every retrieval</span><span class="mstatus ga">GA</span></div>
-  <div class="matrix-row"><span class="mk">AIR-GAP</span><span class="mv">Offline bundle · signed release manifest · <span class="mono">XERJ_AIRGAP=1</span> disables all telemetry</span><span class="mstatus ga">GA</span></div>
+  <div class="matrix-row"><span class="mk">AIR-GAP</span><span class="mv">Standard binary · offline lexical mode · operator-staged archive + adjacent <span class="mono">.sha256</span> integrity only · optional local model · no runtime telemetry/update/license calls · Console may attempt external Google Fonts</span><span class="mstatus">DOCS</span></div>
   <div class="matrix-row"><span class="mk">MULTI-TENANCY</span><span class="mv">Tenant-isolated indices + quotas + audit · physical isolation via separate clusters</span><span class="mstatus ga">GA</span></div>
   <div class="matrix-row"><span class="mk">CIRCUIT-BREAKERS</span><span class="mv">Per-request heap + time · per-tenant concurrency · per-index doc-scan ceiling</span><span class="mstatus ga">GA</span></div>
 </section>
@@ -143,26 +143,26 @@
   <div class="matrix-row"><span class="mk">PCI-DSS · CJIS · GDPR</span><span class="mv">Self-hosted deployments inherit customer controls</span><span class="mstatus yes">INHERITED</span></div>
 </section>
 
-<!-- SBOM · SUPPLY CHAIN -->
+<!-- RELEASE INTEGRITY · OPERATOR CONTROL -->
 <section class="scene-section">
-  <div class="kicker"><span>SUPPLY CHAIN</span><span class="dash">·</span><span>WHAT SHIPS WITH EACH RELEASE</span></div>
-  <h2 class="scene">SIGNED.<br><span class="accent">VERIFIABLE.</span></h2>
+  <div class="kicker"><span>RELEASE INTEGRITY</span><span class="dash">·</span><span>OPERATOR CONTROL</span></div>
+  <h2 class="scene">RELEASE.<br><span class="accent">INTEGRITY.</span></h2>
 
   <div class="row">
-    <div class="k">SBOM</div>
-    <div class="v">Every release ships a CycloneDX SBOM alongside the binary. Every Rust dependency, every transitive, every crate version. <strong>Auditors verify before deploy.</strong></div>
+    <div class="k">ARCHIVE CHECK</div>
+    <div class="v">Each release archive has an adjacent <span class="mono">.sha256</span> file. It verifies archive integrity against the published digest, not a signature or attestation.</div>
   </div>
   <div class="row">
-    <div class="k">SLSA PROVENANCE</div>
-    <div class="v">Build provenance attestations · reproducible builds · cryptographically-signed artifact manifests. SLSA Level 3 target. <strong>Roadmap Q3 2026.</strong></div>
+    <div class="k">OFFLINE BASELINE</div>
+    <div class="v">The standard binary runs in offline lexical mode without model files. An optional local model can be staged separately when neural embedding is required.</div>
   </div>
   <div class="row">
-    <div class="k">SIGNED ARTIFACTS</div>
-    <div class="v">Signed Git tags · signed release archives · cosign-compatible signatures. Offline verification works with <span class="mono">cosign verify-blob</span>.</div>
+    <div class="k">RUNTIME BOUNDARY</div>
+    <div class="v">The running binary makes no runtime telemetry, update, or license-activation calls. The Console may still attempt its external Google Fonts resources in a browser.</div>
   </div>
   <div class="row">
-    <div class="k">REPRODUCIBLE BUILDS</div>
-    <div class="v">Same source + same toolchain + same flags = byte-identical binary. <strong>Anyone can rebuild and verify.</strong></div>
+    <div class="k">PROCEDURE</div>
+    <div class="v">Stage the release and any model files on a connected machine, verify the adjacent digest, then transfer and verify again inside the enclave.</div>
   </div>
   <div class="row">
     <div class="k">MINIMAL DEPENDENCIES</div>

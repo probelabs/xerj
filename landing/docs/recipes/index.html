@@ -104,6 +104,7 @@
     <a href="/docs/recipes/migrate-from-elasticsearch.html" class=""><span class="eyebrow">10</span>Migrate from ES</a>
     <a href="/docs/recipes/document-folder-index.html" class=""><span class="eyebrow">11</span>Doc folder index</a>
     <a href="/docs/recipes/zero-config-autoindex.html" class=""><span class="eyebrow">12</span>Zero-config autoindex</a>
+    <a href="/docs/recipes/air-gapped-deployment.html" class=""><span class="eyebrow">13</span>Air-gapped deployment</a>
   </div>
 </nav>
 
@@ -183,6 +184,11 @@
       <span class="num">11</span>
       <span class="title">Index a folder of PDFs, Word docs &amp; web pages</span>
       <p class="lead">One <code class="inline">xerj-index</code> pass walks a recursive folder of PDF/DOCX/HTML/MD/TXT, extracts + chunks + auto-embeds every file, then lexical, semantic &amp; hybrid search return ranked, cited passages — measured 21/22 vs a fair grep baseline's 14/22, with the decisive win on binary_only (6/7 vs 0/7) because grep can't read a PDF/DOCX.</p>
+    </a>
+    <a class="recipe" href="/docs/recipes/air-gapped-deployment.html">
+      <span class="num">13 · OPERATIONS</span>
+      <span class="title">Run XERJ fully offline — air-gapped deployment</span>
+      <p class="lead">Stage the release archive, checksum, and optional three-file neural model bundle on a connected machine, then run the standard binary without runtime internet access. Covers lexical defaults, local neural assets, proxy/ONNX boundaries, loopback/auth posture, WAL overlays, and the Console's system-font fallback.</p>
     </a>
   </div>
 
