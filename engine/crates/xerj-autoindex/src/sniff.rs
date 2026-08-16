@@ -483,18 +483,44 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
             // there is no fixed byte to pin. Walk the sub-block chain instead:
             // a real Comment terminates with a 0x00 and is followed by another
             // introducer. Prose has to land that whole structure, not one byte.
-            (Some(0xfe), Some(_)) => {
+            (Some(0xfe), Some(&first)) if first != 0 => {
+                // Walk the sub-block chain. Two outcomes are decisive and one
+                // is not, and conflating them is what broke real GIFs: a
+                // comment longer than the 8 KiB prefix simply cannot be walked
+                // to its end here, and "I ran out of buffer" is not evidence
+                // of text.
                 let mut at = block + 2;
-                for _ in 0..MAX_COMMENT_SUB_BLOCKS {
+                // Of the sizes we get to see before the buffer ends, every one
+                // but the last must be a full 255. The last may legitimately be
+                // a short remainder whose terminator sits just past the edge.
+                let mut prior_were_full = true;
+                let mut last: Option<u8> = None;
+                let mut seen = 0usize;
+                loop {
                     match prefix.get(at) {
+                        // Terminated inside the prefix: decisive. A real
+                        // comment is followed by another block. `None` means
+                        // the terminator is the last byte we hold, which is
+                        // the prefix edge, not a malformed file.
                         Some(0) => {
-                            return matches!(prefix.get(at + 1), Some(0x21 | 0x2c | 0x3b));
+                            return matches!(prefix.get(at + 1), None | Some(0x21 | 0x2c | 0x3b));
                         }
-                        Some(&len) => at += 1 + usize::from(len),
-                        None => return false,
+                        Some(&len) => {
+                            if let Some(prev) = last {
+                                prior_were_full &= prev == 0xff;
+                            }
+                            last = Some(len);
+                            seen += 1;
+                            at += 1 + usize::from(len);
+                        }
+                        // Ran past the prefix. Every encoder packs a long
+                        // comment into maximal 255-byte sub-blocks, so every
+                        // size we got to see is 0xFF. Prose cannot do that:
+                        // its "sizes" are the text's own bytes, which are
+                        // printable ASCII, never 0xFF.
+                        None => return seen > 1 && prior_were_full,
                     }
                 }
-                false
             }
             _ => false,
         },
@@ -542,12 +568,6 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
         _ => false,
     }
 }
-
-/// Bound on the Comment-extension sub-block walk in `gif_screen_descriptor`.
-/// A comment is at most 255 bytes per sub-block and the whole first block sits
-/// inside the 8 KiB prefix, so a real one terminates in far fewer; the cap only
-/// stops a crafted chain from walking the buffer.
-const MAX_COMMENT_SUB_BLOCKS: usize = 64;
 
 /// Windows bitmap: `BM`, then a 14-byte BITMAPFILEHEADER, then a DIB header
 /// that opens with its own size.
@@ -1855,6 +1875,81 @@ mod printable_magic_tests {
              extension and no encoder writes it into the container"
         );
     }
+    /// The Comment-extension arm, which round 2 of #379 added and which an
+    /// independent verification then broke real images with. It is the only
+    /// branch here carrying a loop, so it is the one that needed fixtures and
+    /// did not have them.
+    ///
+    /// The hazard is specific: `sniff` sees only an 8 KiB prefix
+    /// (`read_prefix(.., 8192)`), and a GIF comment may be longer than that.
+    /// The first attempt treated "the sub-block chain did not terminate inside
+    /// the prefix" as evidence of text, so a real, decodable GIF carrying a
+    /// licence notice was handed to the prose extractor — #379 with the sign
+    /// flipped. Encoders pack a long comment into maximal 255-byte sub-blocks,
+    /// and prose cannot: its "sizes" are its own bytes, which are printable
+    /// ASCII and never 0xFF. That is what separates the two here.
+    #[test]
+    fn a_comment_longer_than_the_sniff_prefix_is_still_a_gif() {
+        /// GIF89a, 4x4, 2-entry global colour table, opening on a Comment
+        /// Extension of `comment_len` bytes, then a minimal image.
+        fn comment_gif(comment_len: usize) -> Vec<u8> {
+            let mut g: Vec<u8> = b"GIF89a".to_vec();
+            g.extend_from_slice(&4u16.to_le_bytes());
+            g.extend_from_slice(&4u16.to_le_bytes());
+            g.push(0x80); // GCT present, 2 entries
+            g.push(0);
+            g.push(0);
+            g.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]); // GCT
+            g.extend_from_slice(&[0x21, 0xfe]); // Comment Extension
+            let mut left = comment_len;
+            while left > 0 {
+                let take = left.min(255);
+                g.push(take as u8);
+                g.extend(std::iter::repeat_n(b'D', take));
+                left -= take;
+            }
+            g.push(0x00); // block terminator
+            g.extend_from_slice(&[0x2c, 0, 0, 0, 0, 4, 0, 4, 0, 0, 0x02]);
+            g
+        }
+
+        for len in [13usize, 255, 300, 4000, 8_192, 20_000, 60_000] {
+            let g = comment_gif(len);
+            // What `sniff` actually gets to see.
+            let prefix: Vec<u8> = g.iter().copied().take(8192).collect();
+            let p = Path::new("frame.gif");
+            let sn = sniff_bytes(&prefix, p, p, false).unwrap();
+            assert_eq!(
+                sn.family,
+                Family::Binary,
+                "comment of {len} B: a real GIF was refused and would be handed \
+                 to the prose extractor — this is #379 inverted"
+            );
+            assert_eq!(sn.binary_kind.as_deref(), Some("gif"), "comment of {len} B");
+        }
+    }
+
+    /// The other half of the same arm: prose must not reach it. `0xFE` is not
+    /// ASCII, so this needs a windows-1252 byte — which `decode()` reads back
+    /// as text, exactly the path that made the label-only check unsound.
+    #[test]
+    fn cp1252_prose_behind_a_comment_label_is_still_text() {
+        let mut prose: Vec<u8> = b"GIF89a fichie!".to_vec();
+        prose.push(0xfe);
+        for _ in 0..400 {
+            prose.extend_from_slice(
+                "Le format GIF est tres ancien et reste partout sur le web. ".as_bytes(),
+            );
+        }
+        let p = Path::new("notes.txt");
+        let sn = sniff_bytes(&prose, p, p, false).unwrap();
+        assert_eq!(
+            sn.family,
+            Family::TxtProse,
+            "prose was junked as {:?} through the comment arm (#379)",
+            sn.binary_kind
+        );
+    }
 
     /// The other half of the same trade: widening the qualifiers must not
     /// hand #379 back. The GIF block introducers are `0x21`, `0x2C` and
@@ -1865,6 +1960,7 @@ mod printable_magic_tests {
     ///
     /// This is the repository's "a fix that reintroduces the very class it
     /// fixes", caught in the same file it would have been reintroduced in.
+
     #[test]
     fn prose_that_lands_a_block_introducer_at_the_right_offset_is_still_text() {
         for (label, opener) in [
