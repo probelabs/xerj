@@ -318,8 +318,7 @@ async fn ensure_builtin(state: &ConsoleState) -> ConsoleResult<()> {
         created_by: "system".into(),
         etag: "1".into(),
     };
-    let _ = idx.delete_document(BUILTIN_ID).await;
-    idx.create_document(BUILTIN_ID.into(), serde_json::to_value(&conn)?)
+    idx.index_document(Some(BUILTIN_ID.into()), serde_json::to_value(&conn)?)
         .await?;
     Ok(())
 }

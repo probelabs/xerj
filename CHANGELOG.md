@@ -94,6 +94,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Console delete/upsert no longer reports success after a refused write.**
+  `DELETE /_xerj-console/api/v1/views/{id}` swallowed `delete_document`
+  errors and returned `204` while the view stayed on disk (the same class
+  as the passkey revoke fix). Auth and prefs writes used delete-then-create,
+  so a replacement the engine rejected (write block, unparseable date)
+  dropped the only live user, session, token, or prefs row. Deletes now
+  propagate the engine error; upserts use a single `index_document`.
+
 - **`sort` on an ES meta-field other than `_score` / `_doc` / `_id` resolved to
   `null` on every hit** ([#401](https://github.com/xerj-org/xerj/issues/401)).
   `compute_sort_values` special-cased exactly those three keys and sent

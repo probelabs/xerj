@@ -55,8 +55,9 @@ pub async fn put(
         .insert("updated_at".into(), Value::String(now_iso()));
 
     let idx = state.engine.get_index(indices::PREFS)?;
-    let _ = idx.delete_document(&sess.user.id).await;
-    idx.create_document(sess.user.id.clone(), body.clone())
+    // One in-place upsert. delete-then-create used to drop the live prefs
+    // row when the replacement write was refused.
+    idx.index_document(Some(sess.user.id.clone()), body.clone())
         .await?;
     Ok(ok(body, None))
 }
