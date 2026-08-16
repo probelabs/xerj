@@ -153,7 +153,12 @@ pub struct IndexTemplate {
 /// continuation, enforced on access, and swept in the background.
 pub struct ScrollContext {
     pub index: String,
-    pub hits: Vec<xerj_query::executor::Hit>,
+    /// Each hit paired with the name of the index it actually came from.
+    /// Pairing is structural on purpose (#414): a multi-index scroll used to
+    /// store bare hits plus one context-level `index`, so every continuation
+    /// page stamped the same name onto hits from different indices and
+    /// `(_index, _id)` stopped being distinct.
+    pub hits: Vec<(String, xerj_query::executor::Hit)>,
     pub position: usize,
     pub page_size: usize,
     pub created: Instant,

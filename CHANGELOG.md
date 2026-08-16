@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A multi-index `scroll` reported the wrong `_index` on every continuation
+  page, so `(_index, _id)` stopped being distinct**
+  ([#414](https://github.com/xerj-org/xerj/issues/414)). The scroll context
+  stored bare hits plus one context-level `index` — `index_names.first()` — and
+  every page after the first stamped that single name onto every hit. Page one
+  was correct, because it maps the real per-hit index, so the divergence only
+  appeared once paging crossed into the second index.
+
+  Ids routinely collide across indices (each numbers its own documents), so a
+  consumer keyed on `(_index, _id)` silently kept a fraction of the corpus.
+  Measured on two 300-document indices with identical id ranges: **600 hits
+  collapsed to 300 distinct `(_index, _id)` pairs**, all labelled with the first
+  index. `search_after` over the same two indices was unaffected and returned
+  600 of 600 — the two paging APIs disagreed about which index a document came
+  from. The blast radius is reindex, migration, backup and CDC consumers, which
+  are exactly the readers that use scroll and least survive losing half a
+  corpus.
+
+  The comment at the context-creation site asserted the opposite of the
+  behaviour — that keeping the raw index spec left per-hit `_index`
+  "authoritative when paging" — which is why the defect outlived review.
+
+  `ScrollContext::hits` is now `Vec<(String, Hit)>`: a hit cannot exist in a
+  context without the index it came from, so the association cannot be dropped
+  again. Both context-creation sites previously discarded it with the same
+  `.map(|(_, h)| h.clone())`.
+
 ### Documentation
 
 - **The 10,000-document scroll snapshot cap is now published, and pinned to the
