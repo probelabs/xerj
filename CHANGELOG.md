@@ -140,6 +140,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`xerj autoindex` now skips hidden names that are not valid UTF-8.**
+  The walker already refused `.env`, `.ssh`, and `.git`, but the check
+  used `file_name().to_str().starts_with('.')`. On Unix a name whose
+  first byte is `.` and that is not valid UTF-8 (`to_str()` is `None`)
+  was walked and indexed. The skip now compares the first encoded byte
+  to `.`. Typical UTF-8 secrets were already skipped.
+
 - **Autoindex snapshot and replay one-shot failpoints can no longer be stolen by unrelated parallel tests.** ([#385](https://github.com/xerj-org/xerj/issues/385)).
   The two test-only failpoints are now owned by the thread that arms them, while
   retaining their existing one-shot behavior and serialization locks.

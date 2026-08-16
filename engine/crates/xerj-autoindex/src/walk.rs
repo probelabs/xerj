@@ -9,7 +9,15 @@
 
 use crate::ignore_rules::{IgnoreOptions, IgnoreReport, IgnoreStack};
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+/// Hidden names start with `.` even when they are not valid UTF-8.
+/// `OsStr::to_str()` is `None` for those, so a UTF-8 `starts_with('.')`
+/// would walk them.
+fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
+}
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -139,12 +147,7 @@ pub fn walk_reporting(
         // itself (depth 0) is exempt so a brain over a dot-named folder still
         // works. `--no-ignore` does NOT turn this off: it is not one of the
         // ignore rules, it is the reason secrets stay out.
-        if entry.depth() > 0
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with('.'))
-        {
+        if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
             stack.record_hidden(is_dir);
             if is_dir {
                 it.skip_current_dir();
@@ -267,6 +270,58 @@ mod hidden_skip_tests {
         assert!(
             !rels.iter().any(|r| r.ends_with(".secret")),
             "indexed a nested dotfile: {rels:?}"
+        );
+    }
+
+    /// A name whose first byte is '.' but is not valid UTF-8 must still be
+    /// treated as hidden. `file_name().to_str()` is `None` for that name, so
+    /// the UTF-8 `starts_with('.')` check misses it.
+    #[cfg(unix)]
+    #[test]
+    fn hidden_non_utf8_dot_name_is_detected() {
+        use super::is_hidden_name;
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let hidden = OsStr::from_bytes(b".\x80");
+        assert!(
+            hidden.to_str().is_none(),
+            "fixture must be non-UTF-8 so to_str() cannot save us"
+        );
+        assert!(
+            is_hidden_name(hidden),
+            "first byte is '.', even when to_str() is None"
+        );
+        assert!(is_hidden_name(OsStr::from_bytes(b".env")));
+        assert!(!is_hidden_name(OsStr::from_bytes(b"README.md")));
+        assert!(!is_hidden_name(OsStr::from_bytes(b"\x80env")));
+    }
+
+    /// Same name on disk. APFS/HFS reject non-UTF-8 names; Linux does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidden_non_utf8_dotfile_is_never_indexed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        fs::write(root.join("README.md"), "hello").unwrap();
+        fs::write(root.join(OsStr::from_bytes(b".\x80")), "SECRET=pat-abc123").unwrap();
+
+        let files = walk(root, false).unwrap();
+        let rels: Vec<String> = files.iter().map(|e| e.rel.clone()).collect();
+        assert!(
+            rels.contains(&"README.md".to_string()),
+            "visible file must still be indexed: {rels:?}"
+        );
+        assert!(
+            !files.iter().any(|e| {
+                e.path
+                    .file_name()
+                    .is_some_and(|n| n.as_encoded_bytes().first() == Some(&b'.'))
+            }),
+            "indexed a hidden non-UTF-8 name: {rels:?}"
         );
     }
 
