@@ -60,8 +60,8 @@
 
 <div class="uc-hero">
   <div class="uc-eyebrow">CASE STUDY · REFERENCE-CODING</div>
-  <h1>STOP RE-DERIVING APIs.<br><span class="accent">START LOOKING THEM UP.</span></h1>
-  <p class="uc-lead">When a coding agent meets an API it does not know, it guesses, fails, and guesses again — each lap burning the expensive kind of token. Reference-coding fixes that: clone the libraries that already solved your problem, index them with XERJ, and retrieve the real implementation before writing code. We measured it across <strong>13 purpose-built libraries in 5 languages</strong> against the <em>same</em> Claude Code. Below is the one prompt that turns it on — and every number behind it.</p>
+  <h1>REFERENCE CODING MAKES CLAUDE CODE<br><span class="accent">6.5× CHEAPER — MEASURED.</span></h1>
+  <p class="uc-lead">When a coding agent meets an API it does not know, it guesses, fails, and guesses again — each lap burning the expensive kind of token. Reference-coding fixes that: clone the libraries that already solved your problem, index them with XERJ, and retrieve the real implementation before writing code. Measured across <strong>13 purpose-built libraries in 5 languages</strong> against the <em>same</em> Claude Code: on code it has not memorised, plain Claude Code solved <strong>1 of 21</strong> tasks and burned <strong>$21.90</strong> doing it — with XERJ retrieval it solved <strong>21 of 21</strong> for <strong>$3.38</strong>. Same model, same tasks — only the retrieval differs. Paste the one line below to turn it on. Every number behind it is underneath, including where retrieval is worth nothing.</p>
 </div>
 
 <!-- OPENER PROMPT -->
@@ -74,7 +74,6 @@
         <button type="button" class="prompt-copy" data-copy="Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up reference coding: clone and index the open-source repos closest to what we're building, and search how they solved a problem before writing code.">COPY THE PROMPT</button>
       </div>
     </div>
-    <div class="hint">That is the current one-line setup, and the only one to paste — <a href="https://xerj.org/llms.txt" rel="external" style="color:var(--accent);">llms.txt</a> walks the agent through the whole loop with nothing else to install: start a node, <code class="inline">git clone --depth 1</code> each reference repo, <code class="inline">xerj autoindex</code> it, then query the <code class="inline">ax-*</code> indices before writing code.</div>
     <div class="lbl" style="margin-top:18px;">◆ HISTORICAL · the long-form prompt this study measured — kept verbatim for reproducibility, not current instructions</div>
     <pre>Set me up for reference-coding with XERJ and then use it automatically for the
 rest of our work, so I stop burning output tokens re-deriving APIs I could just
