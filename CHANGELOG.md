@@ -145,7 +145,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used `file_name().to_str().starts_with('.')`. On Unix a name whose
   first byte is `.` and that is not valid UTF-8 (`to_str()` is `None`)
   was walked and indexed. The skip now compares the first encoded byte
-  to `.`. Typical UTF-8 secrets were already skipped.
+  to `.`. Typical UTF-8 secrets were already skipped. `--dry-run`'s
+  `ignored_files_in_pruned_dirs` count uses the same predicate, so a
+  hidden non-UTF-8 file (or the contents of a hidden non-UTF-8
+  directory) is no longer reported as a non-hidden file inside a
+  pruned directory.
+
+  **Upgrade.** A corpus indexed by a pre-fix binary that contains a
+  hidden non-UTF-8 name looks like a file removal to the graph-enabled
+  path (the default, and what `xerj brain` uses). Until
+  [#439](https://github.com/xerj-org/xerj/issues/439) lands, the first
+  rerun exits 1 with `unsupported_content_group_removal`, writes
+  nothing, and the already-indexed documents stay live. Do not follow
+  the refusal's first recovery route ("restore the removed file(s)"):
+  the file is still on disk, just no longer walked. Recovery that
+  works: delete the published indices and the state directory, then
+  re-index the folder. An isolated rebuild with a new `--state-dir` /
+  `--prefix` also exits 0, but leaves the old target's documents live
+  until those indices are deleted by hand.
 
 - **Autoindex snapshot and replay one-shot failpoints can no longer be stolen by unrelated parallel tests.** ([#385](https://github.com/xerj-org/xerj/issues/385)).
   The two test-only failpoints are now owned by the thread that arms them, while

@@ -7,17 +7,9 @@
 //! descended, so its contents cost nothing — no stat, no hash, no bulk body.
 //! The matching itself lives in [`crate::ignore_rules`].
 
-use crate::ignore_rules::{IgnoreOptions, IgnoreReport, IgnoreStack};
+use crate::ignore_rules::{is_hidden_name, IgnoreOptions, IgnoreReport, IgnoreStack};
 use anyhow::{Context, Result};
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-
-/// Hidden names start with `.` even when they are not valid UTF-8.
-/// `OsStr::to_str()` is `None` for those, so a UTF-8 `starts_with('.')`
-/// would walk them.
-fn is_hidden_name(name: &OsStr) -> bool {
-    name.as_encoded_bytes().first() == Some(&b'.')
-}
 
 #[derive(Debug, Clone)]
 pub struct FileEntry {
@@ -279,7 +271,7 @@ mod hidden_skip_tests {
     #[cfg(unix)]
     #[test]
     fn hidden_non_utf8_dot_name_is_detected() {
-        use super::is_hidden_name;
+        use crate::ignore_rules::is_hidden_name;
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
