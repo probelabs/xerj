@@ -61,7 +61,15 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder, Glob};
 use ignore::Match;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+/// Hidden names start with `.` even when they are not valid UTF-8.
+/// `OsStr::to_str()` is `None` for those, so a UTF-8 `starts_with('.')`
+/// would walk them (and, here, would count them as non-hidden).
+pub(crate) fn is_hidden_name(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.')
+}
 
 /// Ignore file honoured in every directory, ranked below `.xerjignore`.
 pub const GITIGNORE: &str = ".gitignore";
@@ -730,11 +738,7 @@ impl IgnoreStack {
             .follow_links(false)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| {
-                !e.file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with('.'))
-            });
+            .filter_entry(|e| !is_hidden_name(e.file_name()));
         for entry in walker {
             if self.budget == 0 {
                 self.report.deep_count_complete = false;
@@ -764,12 +768,7 @@ mod tests {
         while let Some(next) = it.next() {
             let Ok(entry) = next else { continue };
             let is_dir = entry.file_type().is_dir();
-            if entry.depth() > 0
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with('.'))
-            {
+            if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
                 stack.record_hidden(is_dir);
                 if is_dir {
                     it.skip_current_dir();
@@ -1098,6 +1097,47 @@ mod tests {
                 .any(|l| l.contains("(3 non-hidden files inside them)")),
             "{lines:?}"
         );
+    }
+
+    /// After the walker started treating a non-UTF-8 `.\x80` name as hidden,
+    /// `count_inside` still used `to_str().starts_with('.')` and counted those
+    /// files (and descended those directories). APFS rejects the name; Linux
+    /// does not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn count_inside_skips_hidden_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        write(root, ".xerjignore", "pruned/\n");
+        write(root, "keep.md", "x");
+        write(root, "pruned/visible1.txt", "x");
+        write(root, "pruned/.hiddenutf8", "x");
+        fs::write(
+            root.join("pruned").join(OsStr::from_bytes(b".\x80hidden")),
+            "x",
+        )
+        .unwrap();
+        fs::create_dir(root.join("pruned").join(OsStr::from_bytes(b".\x80dir"))).unwrap();
+        fs::write(
+            root.join("pruned")
+                .join(OsStr::from_bytes(b".\x80dir"))
+                .join("inside.txt"),
+            "x",
+        )
+        .unwrap();
+
+        let (kept, deep) = survivors(root, IgnoreOptions::default().with_deep_count(true));
+        assert_eq!(kept, vec!["keep.md".to_string()], "{kept:?}");
+        assert_eq!(
+            deep.files_inside_pruned_dirs, 1,
+            "only pruned/visible1.txt is a non-hidden file inside the pruned \
+             tree; .hiddenutf8, .\\x80hidden, and .\\x80dir/inside.txt are \
+             hidden: {deep:?}"
+        );
+        assert!(deep.files_inside_pruned_dirs_is_exact());
     }
 
     /// #279. The claim the reporting makes about its own number, checked as
