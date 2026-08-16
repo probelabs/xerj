@@ -97,13 +97,14 @@ After transfer, set the same approved `TAG` in the enclave and verify before
 extracting:
 
 ```bash
+set -eu
 : "${TAG:?set TAG to the same operator-approved release tag}"
 VERSION="${TAG#v}"
 ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 cd /opt/xerj-staging/release
-sha256sum -c "$ASSET.sha256"
-tar -xzf "$ASSET"
-test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"
+sha256sum -c "$ASSET.sha256" \
+  && tar -xzf "$ASSET" \
+  && test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"
 ```
 
 ## 2. Install the base lexical node

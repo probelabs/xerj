@@ -100,13 +100,14 @@ curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
   "$STAGE/xerj" --version
 )</pre>
   <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. After transfer, set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
-<pre class="code">: "${TAG:?set TAG to the same operator-approved release tag}"
+<pre class="code">set -eu
+: "${TAG:?set TAG to the same operator-approved release tag}"
 VERSION="${TAG#v}"
 ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
 cd /opt/xerj-staging/release
-sha256sum -c "$ASSET.sha256"
-tar -xzf "$ASSET"
-test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"</pre>
+sha256sum -c "$ASSET.sha256" \
+  && tar -xzf "$ASSET" \
+  && test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"</pre>
 
   <h2>2. Install the base lexical node</h2>
   <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
