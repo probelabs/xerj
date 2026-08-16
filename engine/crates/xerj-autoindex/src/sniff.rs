@@ -97,6 +97,16 @@ pub struct Sniffed {
     pub logical_name: Option<std::path::PathBuf>,
 }
 
+/// Bytes read for ordinary classification.
+const PREFIX: usize = 8192;
+
+/// Bytes read when the file already carries GIF magic. A Comment Extension is
+/// unbounded by the format, so this is a budget rather than a guarantee: it
+/// covers every commented GIF in the measured corpus with room to spare, and
+/// when a chain still outruns it the qualifier declines rather than inventing
+/// a discriminator — which is what the previous four rounds did wrong.
+const GIF_PREFIX: usize = 1 << 20;
+
 fn read_prefix(path: &Path, gzip: bool, n: usize) -> Result<Vec<u8>> {
     let f = std::fs::File::open(path)?;
     let mut buf = Vec::with_capacity(n.min(1 << 20));
@@ -123,7 +133,21 @@ pub fn sniff(path: &Path) -> Result<Sniffed> {
 pub fn sniff_with_name(content_path: &Path, logical_path: &Path) -> Result<Sniffed> {
     let head = read_prefix(content_path, false, 8)?;
     let gzip = head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b;
-    let prefix = read_prefix(content_path, gzip, 8192)?;
+    let mut prefix = read_prefix(content_path, gzip, PREFIX)?;
+    // A GIF's first data block can sit arbitrarily far in — a Comment
+    // Extension is a chain of 1..=255-byte sub-blocks with no length bound,
+    // and real files carry licence notices of tens of kilobytes. Deciding
+    // whether such a file is an image from 8 KiB means deciding it before its
+    // structure is visible, and four successive attempts to guess that from
+    // bytes inside the window were each refuted for junking real images
+    // (#379): a rule keyed on any fixed offset reads unconstrained image data
+    // there. So read further for a GIF candidate instead of guessing — the
+    // chain's terminator then falls inside the buffer and the decisive check
+    // applies. One extra read, only for files already carrying GIF magic.
+    if prefix.len() == PREFIX && prefix.len() >= 6 && matches!(&prefix[..6], b"GIF87a" | b"GIF89a")
+    {
+        prefix = read_prefix(content_path, gzip, GIF_PREFIX)?;
+    }
     let mut s = sniff_bytes(&prefix, content_path, logical_path, gzip)?;
     s.gzip = gzip;
     s.logical_name = logical_path.file_name().map(std::path::PathBuf::from);
