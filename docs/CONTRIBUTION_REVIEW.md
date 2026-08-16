@@ -32,6 +32,39 @@ At minimum, consider:
 
 If behavior must become fail-closed, refuse only the unsafe case. Name what was detected, state whether remote or durable state changed, and give an executable recovery route. Test that the recovery route actually works; an error that merely says “retry” or recommends a now-rejected flag is not a recovery contract.
 
+## Operational documentation and runnable recipes
+
+Treat every shell, TOML, systemd, configuration, and copy-paste command in a
+recipe as a program, not illustrative prose. Execute the ordered success path
+and a deliberate negative control (for example, a bad checksum, missing
+artifact, or disallowed egress) and verify that the unsafe path fails closed
+before extraction, publication, or service exposure. Record the observed exit
+status and recovery command.
+
+Exercise the process lifecycle: startup, readiness/health, the first real
+operation, graceful stop, cleanup, port release, and restart from the same
+state. For persistent configuration or data, test fresh state, an existing
+state, migration/reindex requirements, unchanged rerun, and the documented
+recovery or rollback transition; distinguish what is preserved from what is
+discarded.
+
+Make inventories honest. Separate shipped artifacts from source templates and
+generated copies, and state whether a count means files, pages, variants, link
+elements, requests, routes, or something else. For completeness claims, audit
+the declared universe (all, only, none, or no-egress variants), state the tested
+and unsupported feature, platform, transport, and fallback variants, list
+excluded targets, and verify every publication copy. Document mitigations that
+are executable in the stated environment—firewall policy, source rebuild,
+service hardening, or a verified release check—not a runtime workaround the
+product does not implement.
+
+When a document is published through multiple paths, trace the publication
+topology from its source through generated pages, indexes, navigation, and
+agent-facing copies. Reuse the repository release verifier for shipped-artifact
+claims rather than replacing it with a partial check. For docs-only changes,
+run the scoped documentation/link/render verifier and record Cargo and ES-YAML
+as not applicable; do not imply that an unrelated engine suite validated prose.
+
 ## Durable state is not invocation state
 
 Treat a resume journal, sealed snapshot, mapping, catalog document, index, or generation marker as authority. Treat counters, temporary files, process IDs, clocks, caches, and in-memory collections as invocation-local unless explicitly persisted.
