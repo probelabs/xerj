@@ -88,6 +88,83 @@ fn a_real_bitmap_on_disk_is_still_binary() {
     assert_eq!(sn.binary_kind.as_deref(), Some("bmp"));
 }
 
+/// The comment arm on the path that actually loses data: a file on disk whose
+/// comment is longer than the 8 KiB `read_prefix` buffer, so the sub-block
+/// chain cannot be walked to its end and the terminator is never seen.
+///
+/// The unit fixtures in `sniff::printable_magic_tests` truncate to 8192 by
+/// hand; these are real files of 20 KB and 60 KB, cut by `read_prefix` itself.
+/// The chain shapes are the ones the ground-truth corpus found on disk —
+/// giflib's streaming API writes one sub-block per `EGifPutExtensionBlock` call
+/// at the caller's length, so 64-byte and 100-byte chains are ordinary output,
+/// and the "every size is 0xFF" rule that round 3 shipped refuses them: 43 of
+/// the corpus's 92 outrunning images, 37 of them into `TxtProse`.
+///
+/// The negative in the same shape is the file below it: prose only has to land
+/// `!` and a windows-1252 `0xFE`, and it must NOT be junked.
+#[test]
+fn a_long_commented_gif_on_disk_survives_the_prefix_cut() {
+    let dir = tempfile::tempdir().unwrap();
+
+    fn streamed(sub_block: u8, comment_len: usize) -> Vec<u8> {
+        let mut g: Vec<u8> = b"GIF89a".to_vec();
+        g.extend_from_slice(&48u16.to_le_bytes());
+        g.extend_from_slice(&48u16.to_le_bytes());
+        g.push(0x80); // GCT present, 2 entries
+        g.push(0);
+        g.push(0);
+        g.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]);
+        g.extend_from_slice(&[0x21, 0xfe]);
+        let mut left = comment_len;
+        while left > 0 {
+            let take = left.min(usize::from(sub_block));
+            g.push(take as u8);
+            g.extend(std::iter::repeat_n(b'D', take));
+            left -= take;
+        }
+        g.push(0x00);
+        g.extend_from_slice(&[0x2c, 0, 0, 0, 0, 48, 0, 48, 0, 0, 0x02]);
+        g
+    }
+
+    for (name, sub_block, len) in [
+        ("stream64.gif", 64u8, 20_000usize),
+        ("stream100.gif", 100, 60_000),
+        ("stream255.gif", 255, 60_000),
+    ] {
+        let p = dir.path().join(name);
+        let bytes = streamed(sub_block, len);
+        assert!(bytes.len() > 8192, "{name}: fixture must outrun the prefix");
+        std::fs::write(&p, &bytes).unwrap();
+        let sn = sniff(&p).unwrap();
+        assert_eq!(
+            (sn.family, sn.binary_kind.as_deref()),
+            (Family::Binary, Some("gif")),
+            "{name}: a real GIF with a {sub_block}-byte comment chain classified \
+             {}/{:?} — `scan_file` hands that to the prose extractor",
+            sn.family.as_str(),
+            sn.binary_kind
+        );
+    }
+
+    // The same shape, in prose: `!` at 13, a windows-1252 0xFE at 14, and a
+    // chain of printable "sizes" that never terminates inside the prefix.
+    let mut notes: Vec<u8> = b"GIF89a fichie!".to_vec();
+    notes.push(0xfe);
+    for _ in 0..400 {
+        notes.extend_from_slice("Le format GIF reste partout sur le web. ".as_bytes());
+    }
+    let np = dir.path().join("notes.txt");
+    std::fs::write(&np, &notes).unwrap();
+    let sn = sniff(&np).unwrap();
+    assert_eq!(
+        sn.family,
+        Family::TxtProse,
+        "prose was junked as {:?} through the comment arm (#379)",
+        sn.binary_kind
+    );
+}
+
 /// An actual GIF, checked into this repository, read off disk.
 ///
 /// Every other fixture in this file and in `sniff::printable_magic_tests` is
