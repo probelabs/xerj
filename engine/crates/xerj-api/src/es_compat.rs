@@ -11199,8 +11199,10 @@ async fn search_impl(
     // Snapshot every matching hit for the scroll context BEFORE we consume
     // merged_hits to build `hits`. We'll register the context after the
     // response_body is built.
-    let scroll_snapshot: Option<Vec<xerj_query::executor::Hit>> = if is_scroll_request {
-        Some(merged_hits.iter().map(|(_, h)| h.clone()).collect())
+    let scroll_snapshot: Option<Vec<(String, xerj_query::executor::Hit)>> = if is_scroll_request {
+        // Keep the index name with each hit (#414): dropping it here is what
+        // made continuation pages fall back to a single context-level name.
+        Some(merged_hits.clone())
     } else {
         None
     };
@@ -14217,9 +14219,11 @@ async fn search_impl(
             }
         }
         let snapshot = scroll_snapshot.unwrap_or_default();
-        // Pick the first backing index for the scroll context (multi-index
-        // scrolls are rare and we keep the raw index spec so `_index` on
-        // each hit remains authoritative when paging).
+        // Context-level fallback only. It is NOT what `_index` is served from
+        // any more: each hit carries its own index name in `hits`. The previous
+        // comment here claimed per-hit `_index` "remains authoritative when
+        // paging" while continuation pages overwrote it with this value, so on
+        // a multi-index scroll every hit reported the first index (#414).
         let scroll_index = index_names
             .first()
             .map(|s| s.to_string())
@@ -19749,8 +19753,8 @@ pub async fn search_with_scroll(
         }
         let scroll_id = Uuid::new_v4().to_string();
         // Extract just the hits from the pairs.
-        let hits_only: Vec<xerj_query::executor::Hit> =
-            all_hits.iter().map(|(_, h)| h.clone()).collect();
+        // Index name stays paired with its hit (#414).
+        let hits_only: Vec<(String, xerj_query::executor::Hit)> = all_hits.clone();
 
         // Return first page.
         let first_page: Vec<EsHit> = all_hits
@@ -20013,7 +20017,7 @@ async fn scroll_page_response(
             let has_non_score_sort = ctx
                 .hits
                 .first()
-                .map(|h| !h.sort.is_empty())
+                .map(|(_, h)| !h.sort.is_empty())
                 .unwrap_or(false);
 
             let page_hits: Vec<EsHit> = ctx
@@ -20021,8 +20025,9 @@ async fn scroll_page_response(
                 .iter()
                 .skip(position)
                 .take(page_size)
-                .map(|h| EsHit {
-                    index: ctx.index.clone(),
+                .map(|(hit_index, h)| EsHit {
+                    // Per-hit index, not the context-level one (#414).
+                    index: hit_index.clone(),
                     id: h.id.clone(),
                     score: Some(h.score as f64),
                     version: Some(1),
@@ -20155,7 +20160,10 @@ mod passage_scroll_tests {
             scroll_id.clone(),
             xerj_engine::engine::ScrollContext {
                 index: "reports".into(),
-                hits: vec![passage_hit("page-1", 0), passage_hit("page-2", 1)],
+                hits: vec![
+                    ("reports".to_string(), passage_hit("page-1", 0)),
+                    ("reports".to_string(), passage_hit("page-2", 1)),
+                ],
                 position: 1,
                 page_size: 1,
                 created: now,
@@ -20186,6 +20194,64 @@ mod passage_scroll_tests {
         assert_eq!(body["hits"]["hits"][0]["fields"]["_passage"][0]["page"], 2);
     }
 
+    /// Regression test for #414. A scroll spanning two indices stored bare
+    /// hits plus one context-level `index`, so every continuation page stamped
+    /// that single name onto hits regardless of which index they came from.
+    /// With ids colliding across indices — the normal case for a reindex or
+    /// migration, where each index numbers its own documents — `(_index, _id)`
+    /// stopped being distinct and a consumer keyed on it silently kept half
+    /// the corpus. Measured before the fix on 300+300 documents: 600 hits
+    /// collapsed to 300 distinct `(_index, _id)` pairs, every one labelled
+    /// with the first index.
+    ///
+    /// The pairing is now structural (`hits: Vec<(String, Hit)>`), so a hit
+    /// cannot exist in a context without the index it came from.
+    #[tokio::test]
+    async fn scroll_continuation_reports_the_index_each_hit_came_from() {
+        let state = test_state();
+        let scroll_id = Uuid::new_v4().to_string();
+        let now = Instant::now();
+        // Same `_id` in both indices: only `_index` tells them apart.
+        state.engine.scrolls.insert(
+            scroll_id.clone(),
+            xerj_engine::engine::ScrollContext {
+                index: "mi_a".into(),
+                hits: vec![
+                    ("mi_a".to_string(), passage_hit("dup-1", 0)),
+                    ("mi_b".to_string(), passage_hit("dup-1", 1)),
+                ],
+                position: 1,
+                page_size: 1,
+                created: now,
+                keep_alive: Duration::from_secs(60),
+                expires_at: now + Duration::from_secs(60),
+            },
+        );
+        let app = crate::router::build_es_compat_router(state);
+        let response = app
+            .oneshot(
+                Request::post("/_search/scroll")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"scroll_id": scroll_id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["hits"]["hits"][0]["_id"], "dup-1");
+        // The continuation hit belongs to mi_b. Before the fix this was
+        // "mi_a" — the context-level name — making it indistinguishable
+        // from the mi_a document with the same id on page 1.
+        assert_eq!(
+            body["hits"]["hits"][0]["_index"], "mi_b",
+            "continuation page must report the index the hit came from, not the context's"
+        );
+    }
+
     /// Regression test for a real bug found live: OpenSearch Dashboards
     /// 3.7.0's saved-objects migration (`.kibana_1` → `.kibana_2`) continues
     /// its scroll via `GET /_search/scroll/{scroll_id}` (the legacy
@@ -20202,7 +20268,10 @@ mod passage_scroll_tests {
             scroll_id.clone(),
             xerj_engine::engine::ScrollContext {
                 index: "reports".into(),
-                hits: vec![passage_hit("page-1", 0), passage_hit("page-2", 1)],
+                hits: vec![
+                    ("reports".to_string(), passage_hit("page-1", 0)),
+                    ("reports".to_string(), passage_hit("page-2", 1)),
+                ],
                 position: 1,
                 page_size: 1,
                 created: now,
