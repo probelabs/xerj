@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Autoindex snapshot and replay one-shot failpoints can no longer be stolen by unrelated parallel tests.** ([#385](https://github.com/xerj-org/xerj/issues/385)).
+  The two test-only failpoints are now owned by the thread that arms them, while
+  retaining their existing one-shot behavior and serialization locks.
+
 - **Console delete/upsert no longer reports success after a refused write.**
   `DELETE /_xerj-console/api/v1/views/{id}` swallowed `delete_document`
   errors and returned `204` while the view stayed on disk (the same class
