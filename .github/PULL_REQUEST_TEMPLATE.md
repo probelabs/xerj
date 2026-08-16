@@ -31,10 +31,11 @@
 - [ ] New ES-compatible behaviour has a matching YAML case under `engine/tests/es-compat-yaml/yaml/`
 - [ ] Docs updated if user-visible behaviour changed
 - [ ] For non-trivial changes: the applicable audit in [`docs/CONTRIBUTION_REVIEW.md`](../docs/CONTRIBUTION_REVIEW.md)
-- [ ] Operational docs/recipe audit records ordered success and failure execution,
-  lifecycle/readiness/cleanup, persistent-data transitions/reindex,
-  generated-copy propagation, and the scoped verifier (or explicitly records it
-  as not applicable)
+- [ ] Operational docs/recipe audit is complete: it records ordered success and
+  failure execution, lifecycle/readiness/cleanup, persistent-data
+  transitions/reindex, generated-copy propagation, and the declared
+  inventory/completeness scope; each inapplicable item is marked `N/A` with a
+  reason.
 
 **Not run:** <!-- name any check above you skipped, and why. This is expected and fine; hiding it is not. -->
 

@@ -60,7 +60,7 @@ product does not implement.
 
 When a document is published through multiple paths, trace the publication
 topology from its source through generated pages, indexes, navigation, and
-agent-facing copies. Reuse the repository release verifier for shipped-artifact
+agent-facing copies. Reuse `scripts/verify-release.sh` for shipped-artifact
 claims rather than replacing it with a partial check. For docs-only changes,
 run the scoped documentation/link/render verifier and record Cargo and ES-YAML
 as not applicable; do not imply that an unrelated engine suite validated prose.
