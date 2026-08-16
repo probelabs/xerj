@@ -31,10 +31,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour — that keeping the raw index spec left per-hit `_index`
   "authoritative when paging" — which is why the defect outlived review.
 
-  `ScrollContext::hits` is now `Vec<(String, Hit)>`: a hit cannot exist in a
-  context without the index it came from, so the association cannot be dropped
-  again. Both context-creation sites previously discarded it with the same
-  `.map(|(_, h)| h.clone())`.
+  `ScrollContext::hits` is now `Vec<(String, Hit)>`, so a hit carries the index
+  it came from rather than borrowing one from the context. Both context-creation
+  sites previously discarded it with the same `.map(|(_, h)| h.clone())`.
+
+  **Scope, established by an independent adversarial verification of the fix and
+  stated here rather than discovered later.** This covers scrolls addressed by a
+  comma list (`/a,b/_search?scroll=`), a wildcard, or `_all`. It does **not**
+  cover a scroll addressed through an **alias** spanning several indices: alias
+  names are not expanded by the index resolver, so every hit still reports the
+  alias and `(_index, _id)` remains non-distinct there. That matters because
+  reindex and CDC tooling routinely scrolls an alias, which is exactly the
+  audience named above — tracked separately rather than folded into this entry.
+  The type change is also a breaking one for any out-of-tree reader of the
+  public `ScrollContext::hits` field.
 
 ### Documentation
 
