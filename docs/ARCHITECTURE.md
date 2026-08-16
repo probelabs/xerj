@@ -8,11 +8,13 @@ build/run/test commands and the supported ES surface.
 
 XERJ is an AI-native search, vector, and log-analytics engine written from
 scratch in Rust and published under Apache-2.0 — designed for AI-agent workloads
-(zero-config `autoindex` onboarding, agent data map, `/_memory`), sharing no code
-or architecture with Elasticsearch or Lucene. It additionally speaks the
+(zero-config `autoindex` onboarding, agent data map, `/_memory`), with an
+independent implementation and no shared code or file formats with Elasticsearch
+or Lucene. It additionally speaks the
 Elasticsearch 8.x HTTP protocol as a zero-migration adoption bridge, so existing
 ES clients, dashboards, and ingest tooling talk to it unchanged (see
-[WHY_XERJ.md](./WHY_XERJ.md) for the design rationale).
+[WHY_XERJ.md](./WHY_XERJ.md) for the design rationale). For a six-axis,
+source-linked comparison with Lucene, see [XERJ vs Lucene](./XERJ_VS_LUCENE.md).
 
 ## Bird's-eye view
 
@@ -71,7 +73,7 @@ HTTP POST /{index}/_search
     → xerj-query    parse_request(): raw ES JSON → SearchRequest (QueryNode tree)
     → xerj-engine   Engine::get_index() looks up the named index
     → xerj-engine   Index::search()
-         ├─ memtable scan        in-memory BM25 via FtsMemtable
+         ├─ memtable scan        in-memory BM25 via ShardedFtsMemtable
          ├─ segment scan         on-disk FTS via FtsIndexReader + BM25
          ├─ doc_matches_query()  term-level / geo predicate evaluation
          ├─ run_aggs()           aggregation pipeline (columnar fast path for size:0)
@@ -94,20 +96,33 @@ segments that are later merged:
 ```
 PUT /{index}/_doc/{id}   or   POST /_bulk
     → xerj-api → xerj-engine → xerj-storage (IndexStore)
-         ├─ WAL append          single Mutex<WalWriter>; monotonic seq_no, one fsync per batch
-         ├─ 16-shard memtable   shard = xxh3_64(doc_id) & 15  (memtable_shards: Vec<Mutex<Vec<MemEntry>>>)
-         ├─ flush               take_memtable_for_flush() drains all shards,
-         │                      sorts by WAL seq_no to preserve global order,
-         │                      writes an immutable segment (LZ4/Zstd blocks)
+         ├─ WAL append          exact selected N Mutex<WalWriter>s; global AtomicU64 seq_no
+         ├─ storage memtable    max(N, 1).next_power_of_two() hash partitions
+         ├─ FTS memtable        global engine.ingest_shards hash partitions
+         ├─ flush               Index::flush() fans out per-shard do_flush_shard tasks;
+         │                      each drains its shard and writes an immutable segment
+         │                      with FTS/doc-values sidecars (LZ4/Zstd blocks)
          └─ merge               background segment merge compacts small segments;
                                 _forcemerge is synchronous + quiescent (ES-like)
 ```
 
-The WAL writer is a single mutex so that sequence numbers are globally monotonic;
-lock hold time is kept short (one batched write and fsync). The storage memtable is
-sharded 16 ways to spread write contention. The engine-side FTS memtable is
-currently `Arc<RwLock<FtsMemtable>>`; a `ShardedFtsMemtable` scaffold exists in
-`memtable.rs` for a future refactor.
+The global `engine.ingest_shards` value is validated as a non-zero power of two
+no greater than 256 ([global validation](../engine/crates/xerj-common/src/config.rs#L1512-L1570)).
+An index may instead select its WAL count with `index.xerj_ingest_shards`; that
+override accepts any integer in `1..=256`, not only powers of two, and an absent
+or invalid override falls back to the global value ([override parsing](../engine/crates/xerj-engine/src/index.rs#L28488-L28517)).
+`IndexStore` opens exactly that selected number `N` of WAL writers, all sharing
+one global `seq_counter: AtomicU64`, while its separate storage memtable rounds
+`N` up to the next power of two for hash-mask routing ([construction](../engine/crates/xerj-storage/src/index_store.rs#L660-L720),
+[routing](../engine/crates/xerj-storage/src/index_store.rs#L1607-L1643)). These
+counts are therefore not necessarily paired one-to-one. The engine-side FTS
+memtable is separate again: create and reopen pass the global
+`engine.ingest_shards`, not the per-index WAL override, into
+[`ShardedFtsMemtable`](../engine/crates/xerj-engine/src/memtable.rs#L628-L709)
+([create](../engine/crates/xerj-engine/src/index.rs#L6022-L6026),
+[reopen](../engine/crates/xerj-engine/src/index.rs#L6220-L6224)).
+Query paths iterate its shards, and production flush drains each FTS shard
+through [`Index::flush`](../engine/crates/xerj-engine/src/index.rs#L18002-L18125)/[`do_flush_shard`](../engine/crates/xerj-engine/src/index.rs#L24433-L24920).
 
 ### Recovery
 
@@ -125,10 +140,11 @@ Engine::new() scans data_dir/
 
 Elasticsearch compatibility is verified by the `es-yaml-runner` harness against the
 ES 8.13 REST-API-spec YAML suites (search, aggregations, vectors, bulk, indices,
-scroll, cluster). XERJ currently passes 1,360 of 1,363 cases (3 skipped). The YAML tests are the
-source of truth: if XERJ returns a different response than a test expects, XERJ is
-considered wrong. See the README's "Running the conformance tests" section for how to run the suites and the full list
-of supported query types and aggregations.
+scroll, cluster). The hard gate is zero failed cases; skipped cases are reported
+separately and totals can change as the upstream suite changes. The YAML tests are
+the source of truth: if XERJ returns a different response than a test expects, XERJ
+is considered wrong. See the README's "Running the conformance tests" section for
+how to run the suites and the full list of supported query types and aggregations.
 
 Performance is tracked with a reproducible full-matrix head-to-head against live
 Elasticsearch 8.13.4, published at <https://xerj.org/benchmarks> (per-cell results
