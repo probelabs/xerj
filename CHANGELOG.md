@@ -12,10 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A multi-index `scroll` reported the wrong `_index` on every continuation
   page, so `(_index, _id)` stopped being distinct**
   ([#414](https://github.com/xerj-org/xerj/issues/414)). The scroll context
-  stored bare hits plus one context-level `index` — `index_names.first()` — and
-  every page after the first stamped that single name onto every hit. Page one
-  was correct, because it maps the real per-hit index, so the divergence only
-  appeared once paging crossed into the second index.
+  stored bare hits plus one context-level `index`, and every page after the first
+  stamped that single name onto every hit. Page one was correct, because it maps
+  the real per-hit index, so the divergence only appeared once paging crossed
+  into the second index.
+
+  The two context-creation sites stored *different* wrong values, which is why
+  the symptom has two faces: `search_impl` (`/{a,b}/_search?scroll=`) stored
+  `index_names.first()`, so hits were labelled with the first concrete index
+  (`mi_a`), while `search_with_scroll` (`/{spec}/_search_scroll`) stored the raw
+  path spec, so hits were labelled with the un-split string — the
+  `_index: "sa,sb"` that #414 reported, 11,900 of 12,000 hits.
 
   Ids routinely collide across indices (each numbers its own documents), so a
   consumer keyed on `(_index, _id)` silently kept a fraction of the corpus.
