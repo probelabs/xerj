@@ -21,15 +21,17 @@ use std::path::Path;
 const SNAPSHOT_VERSION: u32 = 2;
 
 #[cfg(test)]
-static SNAPSHOT_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+thread_local! {
+    // Test failpoints belong to the thread that arms them: an unrelated test
+    // running in parallel must not consume another test's one-shot failure.
+    static SNAPSHOT_FAILPOINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    static REPLAY_FAIL_AFTER_APPLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 #[cfg(test)]
 static SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 static POST_SEAL_SOURCE_REPLACEMENT: std::sync::Mutex<Option<(std::path::PathBuf, Vec<u8>)>> =
     std::sync::Mutex::new(None);
-#[cfg(test)]
-static REPLAY_FAIL_AFTER_APPLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static REPLAY_FAILPOINT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
@@ -1744,18 +1746,20 @@ fn apply_post_seal_source_replacement(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 fn fail_next_snapshot(boundary: u8) {
-    SNAPSHOT_FAILPOINT.store(boundary, std::sync::atomic::Ordering::SeqCst);
+    SNAPSHOT_FAILPOINT.with(|failpoint| failpoint.set(boundary));
 }
 
 #[cfg(test)]
 fn snapshot_failpoint(boundary: u8) -> Result<()> {
-    if SNAPSHOT_FAILPOINT.compare_exchange(
-        boundary,
-        0,
-        std::sync::atomic::Ordering::SeqCst,
-        std::sync::atomic::Ordering::SeqCst,
-    ) == Ok(boundary)
-    {
+    let armed = SNAPSHOT_FAILPOINT.with(|failpoint| {
+        if failpoint.get() == boundary {
+            failpoint.set(0);
+            true
+        } else {
+            false
+        }
+    });
+    if armed {
         anyhow::bail!("injected snapshot failure at boundary {boundary}");
     }
     Ok(())
@@ -1768,12 +1772,12 @@ fn snapshot_failpoint(_boundary: u8) -> Result<()> {
 
 #[cfg(test)]
 fn fail_replay_after_next_apply() {
-    REPLAY_FAIL_AFTER_APPLY.store(true, std::sync::atomic::Ordering::SeqCst);
+    REPLAY_FAIL_AFTER_APPLY.with(|failpoint| failpoint.set(true));
 }
 
 #[cfg(test)]
 fn replay_fail_after_apply() -> Result<()> {
-    if REPLAY_FAIL_AFTER_APPLY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+    if REPLAY_FAIL_AFTER_APPLY.with(|failpoint| failpoint.replace(false)) {
         anyhow::bail!("injected crash after accepted operation");
     }
     Ok(())
@@ -2482,6 +2486,80 @@ mod tests {
                 recovered
             );
         }
+    }
+
+    #[test]
+    fn snapshot_failpoint_cannot_be_stolen_by_an_unrelated_thread() {
+        let _guard = SNAPSHOT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (thief_done_tx, thief_done_rx) = std::sync::mpsc::channel();
+
+        let owner = std::thread::spawn(move || {
+            fail_next_snapshot(2);
+            armed_tx.send(()).unwrap();
+            thief_done_rx.recv().unwrap();
+            (
+                snapshot_failpoint(2).is_err(),
+                snapshot_failpoint(2).is_ok(),
+            )
+        });
+
+        armed_rx.recv().unwrap();
+        let thief_result = snapshot_failpoint(2);
+        thief_done_tx.send(()).unwrap();
+        let (owner_consumed_once, owner_second_probe_succeeded) = owner.join().unwrap();
+
+        assert!(
+            thief_result.is_ok(),
+            "a thread that did not arm the snapshot failpoint consumed it"
+        );
+        assert!(
+            owner_consumed_once,
+            "the thread that armed the snapshot failpoint did not consume it"
+        );
+        assert!(
+            owner_second_probe_succeeded,
+            "the snapshot failpoint must retain one-shot semantics"
+        );
+    }
+
+    #[test]
+    fn replay_failpoint_cannot_be_stolen_by_an_unrelated_thread() {
+        let _guard = REPLAY_FAILPOINT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+        let (thief_done_tx, thief_done_rx) = std::sync::mpsc::channel();
+
+        let owner = std::thread::spawn(move || {
+            fail_replay_after_next_apply();
+            armed_tx.send(()).unwrap();
+            thief_done_rx.recv().unwrap();
+            (
+                replay_fail_after_apply().is_err(),
+                replay_fail_after_apply().is_ok(),
+            )
+        });
+
+        armed_rx.recv().unwrap();
+        let thief_result = replay_fail_after_apply();
+        thief_done_tx.send(()).unwrap();
+        let (owner_consumed_once, owner_second_probe_succeeded) = owner.join().unwrap();
+
+        assert!(
+            thief_result.is_ok(),
+            "a thread that did not arm the replay failpoint consumed it"
+        );
+        assert!(
+            owner_consumed_once,
+            "the thread that armed the replay failpoint did not consume it"
+        );
+        assert!(
+            owner_second_probe_succeeded,
+            "the replay failpoint must retain one-shot semantics"
+        );
     }
 
     #[test]
