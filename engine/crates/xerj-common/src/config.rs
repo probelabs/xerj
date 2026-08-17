@@ -74,7 +74,7 @@ pub struct Config {
     pub logs: LogsConfig,
     /// External embedding service — 19 settings.
     pub embedding: EmbeddingConfig,
-    /// Resource limits — 13 settings.
+    /// Resource limits — 14 settings.
     pub limits: LimitsConfig,
     /// High-throughput turbo indexing — 3 settings.
     pub indexing: IndexingConfig,
@@ -2776,7 +2776,7 @@ mod tests {
         ("vector", 6),
         ("logs", 2),
         ("embedding", 19),
-        ("limits", 13),
+        ("limits", 14),
         ("indexing", 3),
         ("engine", 4),
         ("cluster", 5),
