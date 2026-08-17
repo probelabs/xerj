@@ -110,8 +110,15 @@ const PREFIX: usize = 8192;
 /// the answer "image" (see the `None` arm of the comment walk). LOWERING the
 /// budget therefore admits MORE files, not fewer: at 128 KiB every text file
 /// over 128 KiB carrying the header shape is called an image, where at 1 MiB
-/// only those over 1 MiB are. Raising it costs a larger read per GIF candidate
-/// and narrows that window. Pinned by `the_budget_is_the_threshold_it_claims`.
+/// only those over 1 MiB are — **by this path**. Raising it costs a larger read
+/// per GIF candidate and narrows that window.
+///
+/// This budget is not the whole rule, and reading it as such is the mistake to
+/// avoid when deciding whether to change it. The arm is `full || canvas`: the
+/// canvas disjunct admits text of ANY size, so no value of this constant closes
+/// that window. `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`
+/// pins a 3,000-byte prose file called an image at a 1 MiB budget. Pinned by
+/// `the_budget_is_the_threshold_it_claims`, which measures this path only.
 const GIF_PREFIX: usize = 1 << 20;
 
 fn read_prefix(path: &Path, gzip: bool, n: usize) -> Result<Vec<u8>> {
@@ -579,8 +586,10 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // with 0x7E in that slot stays TxtProse and with 0xFE
                         // becomes binary/gif. All this arm decides is how much
                         // text has to accumulate behind that gate before it is
-                        // admitted, which is why the budget is the whole rule
-                        // and the chain is not.
+                        // admitted — so on THIS path the budget is the rule and
+                        // the chain is not. Not on the other one: the canvas
+                        // disjunct below is ungated by size, as the paragraph
+                        // twenty-five lines down already says.
                         //
                         // Given that, a FULL buffer answers image. A SHORT one
                         // asks the canvas rule from round 4.
@@ -664,7 +673,7 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // instead (round 2's rejected `true`) junks 10 corpus
                         // text files — windows-1252 prose carrying `þ` in that
                         // slot — so the full-buffer half stays as it is. Pinned
-                        // by `a_truncated_gif_is_called_text_and_that_is_the_trade`,
+                        // by `a_truncated_gif_is_called_an_image_and_that_is_the_trade`,
                         // which now asserts Binary.
                         None => {
                             return prefix.len() >= GIF_PREFIX
@@ -761,8 +770,9 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
 // written down as a property of the format. The budget test is not that: a
 // full buffer means a megabyte of sub-block chain was actually traversed.
 //
-// HISTORICAL, and left here because the mistake is instructive. For three
-// commits the short-buffer answer was plain `prefix.len() >= GIF_PREFIX`, and
+// HISTORICAL, and left here because the mistake is instructive. For four
+// commits (a182317, 0e5d740, d778f70, cf60b65) the short-buffer answer was
+// plain `prefix.len() >= GIF_PREFIX`, and
 // this paragraph recorded its cost in the present tense: truncated GIFs, plain
 // and gzipped alike, going to the prose extractor — 7 of 7 plain cuts, after an
 // earlier draft had wrongly narrowed it to `.gif.gz` only. All true then.
@@ -2367,20 +2377,36 @@ mod printable_magic_tests {
 
     /// A truncated GIF is still called an image, by the canvas fallback.
     ///
-    /// Deliberate, and the reasoning is not that this is harmless. A cut real
-    /// GIF goes to the prose extractor and is sectioned into junk records —
-    /// exactly the harm #379 and #427 were fighting, with the sign flipped.
-    /// It is preferred anyway because a truncated GIF is a broken file that no
-    /// decoder accepts, while the alternative (answer "image" on a short
-    /// buffer, round 2's rejected `true`) silently drops 10 good corpus text
-    /// files, and a dropped good file is never noticed.
+    /// Deliberate, and the reasoning is not that this is harmless. The cost is
+    /// paid in the other direction: the canvas disjunct calls a text file an
+    /// image whenever it carries the header shape and a sub-0x20 byte at
+    /// offset 7 or 9, at any size, which is what
+    /// `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`
+    /// pins. That is a good file dropped, and a dropped good file is never
+    /// noticed.
+    ///
+    /// HISTORICAL, and kept because it is the reasoning that lost. Between
+    /// `0e5d740` and `12b4a4e` the arm was `prefix.len() >= GIF_PREFIX` alone,
+    /// and this paragraph read: "A cut real GIF goes to the prose extractor and
+    /// is sectioned into junk records — exactly the harm #379 and #427 were
+    /// fighting, with the sign flipped. It is preferred anyway because a
+    /// truncated GIF is a broken file that no decoder accepts, while the
+    /// alternative (answer "image" on a short buffer, round 2's rejected
+    /// `true`) silently drops 10 good corpus text files."
+    ///
+    /// `12b4a4e` restored the canvas disjunct and inverted that answer. It
+    /// changed this doc's summary line and the assertion below from
+    /// `Family::TxtProse` to `Family::Binary`, and left the paragraph in place,
+    /// describing a rule that no longer existed — through four commits and
+    /// seven reviews, including the round that rewrote the identical paragraph
+    /// twenty lines above the arm and did not look for its copies.
     ///
     /// The 8192 case is here because the fixtures that used to cover it were
     /// retargeted to `GIF_PREFIX`: a GIF-magic file of exactly 8 KiB still
     /// reaches `sniff_bytes` with an 8192-byte prefix, and the answer for that
     /// state inverted in this change.
     #[test]
-    fn a_truncated_gif_is_called_text_and_that_is_the_trade() {
+    fn a_truncated_gif_is_called_an_image_and_that_is_the_trade() {
         /// A real-shaped commented GIF, then cut.
         fn commented_gif(total: usize) -> Vec<u8> {
             let mut g: Vec<u8> = b"GIF89a".to_vec();
@@ -2407,8 +2433,9 @@ mod printable_magic_tests {
                 Family::Binary,
                 "a GIF cut to {cut} B must still read as an image: the chain ran \
                  past EOF, which a complete GIF cannot do, and the canvas then \
-                 settles it. This asserted TxtProse for one commit, which sent \
-                 11 of 13 truncated corpus images to the prose extractor"
+                 settles it. This asserted TxtProse for three commits \
+                 (0e5d740, d778f70, cf60b65), which sent 11 of 13 truncated \
+                 corpus images to the prose extractor"
             );
         }
     }
