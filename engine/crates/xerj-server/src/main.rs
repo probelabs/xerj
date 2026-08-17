@@ -356,7 +356,18 @@ fn url_host(bind: &str) -> String {
     }
 }
 
-fn print_banner(cfg: &Config, startup_ms: u128) {
+/// The three addresses the node actually holds, as reported by the kernel.
+///
+/// The banner is printed from *these*, never from `cfg.server.*_port`, because
+/// a port in the config is a request and a port in here is a fact. See
+/// step 10a of `async_main` for why that distinction is load-bearing (#465).
+struct BoundAddrs {
+    rest: SocketAddr,
+    es: SocketAddr,
+    grpc: SocketAddr,
+}
+
+fn print_banner(cfg: &Config, bound: &BoundAddrs, startup_ms: u128) {
     let tls = if cfg.tls.enabled { "TLS " } else { "plain" };
     println!();
     println!("  ██╗  ██╗███████╗██████╗      ██╗");
@@ -378,24 +389,22 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
     // Bracketed for IPv6 so `host:port` stays unambiguous.
     let bind_hostport = url_host(&cfg.server.bind_address);
     let bind = bind_hostport.as_str();
-    println!(" Native REST  {}:{} [{}]", bind, cfg.server.rest_port, tls);
-    println!(
-        " ES-compat    {}:{} [{}]",
-        bind, cfg.server.es_compat_port, tls
-    );
+    println!(" Native REST  {}:{} [{}]", bind, bound.rest.port(), tls);
+    println!(" ES-compat    {}:{} [{}]", bind, bound.es.port(), tls);
     // Never interpolated with `tls`: the gRPC listener is h2c whatever
     // `[tls]` says (issue #229), and a line that read "TLS" here would be the
     // exact false promise the startup check exists to prevent.
     println!(
         " gRPC         {}:{} [h2c — plaintext, no TLS]",
-        bind, cfg.server.grpc_port
+        bind,
+        bound.grpc.port()
     );
     println!(" Data dir     {}", cfg.server.data_dir);
     println!(" Started in   {}ms", startup_ms);
     println!();
     println!(
         " Xerj Console UI    http://localhost:{}/_xerj-console/  ({} files bundled)",
-        cfg.server.es_compat_port,
+        bound.es.port(),
         xerj_console_api::spa::asset_count(),
     );
     println!();
@@ -434,14 +443,14 @@ fn print_banner(cfg: &Config, startup_ms: u128) {
         if !cfg.bind_address_is_loopback() {
             println!(
                 " │ ⚠  gRPC:   :{} is NOT covered by TLS — cleartext h2c on a non-loopback",
-                cfg.server.grpc_port
+                bound.grpc.port()
             );
             println!(" │           bind, allowed by tls.allow_insecure_grpc_h2c (issue #229).");
             println!(" │           Terminate TLS for it at your proxy/mesh, or bind loopback.");
         } else {
             println!(
                 " │ ⚠  gRPC:   :{} is NOT covered by TLS — cleartext h2c, loopback-only",
-                cfg.server.grpc_port
+                bound.grpc.port()
             );
         }
     }
@@ -1005,12 +1014,51 @@ fn spawn_periodic_flusher(
 /// bought an unlimited quota (#76 S5-4). Forwarding headers are believed only
 /// when the peer is listed in `server.trusted_proxies`; without connect-info on
 /// *both* listeners the limiter would fall back to a single shared bucket.
+/// Take an address and bind it, then serve. Kept for tests, which want the
+/// convenience of `:0` and do not care about startup ordering.
+///
+/// The server itself must NOT use this: it binds every listener up front at
+/// step 10a of `async_main`, so that a taken port is a startup failure rather
+/// than a line in the log under a banner that already claimed success
+/// (issue #465).
+#[cfg(test)]
 async fn serve(
     router: Router,
     addr: SocketAddr,
     name: &'static str,
     tls: Option<RustlsConfig>,
 ) -> Result<()> {
+    serve_on(router, bind_listener(addr, name)?, name, tls).await
+}
+
+/// Bind one listener, or fail.
+///
+/// Binding is synchronous and eager on purpose. The three listeners are bound
+/// before the banner prints and before anything reports readiness, so the node
+/// can never advertise a port another process owns — the failure mode that
+/// sent one user's contracts, invoices and bank export into a stranger's data
+/// directory under `ok=true exit=0` (issue #465).
+fn bind_listener(addr: SocketAddr, name: &str) -> Result<std::net::TcpListener> {
+    let listener =
+        std::net::TcpListener::bind(addr).with_context(|| format!("{name}: bind {addr}"))?;
+    // Both axum's accept loop and axum-server's rustls acceptor drive this
+    // listener from the reactor; a blocking fd would stall the runtime thread
+    // on the first accept.
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("{name}: set the listener on {addr} non-blocking"))?;
+    Ok(listener)
+}
+
+async fn serve_on(
+    router: Router,
+    listener: std::net::TcpListener,
+    name: &'static str,
+    tls: Option<RustlsConfig>,
+) -> Result<()> {
+    let addr = listener
+        .local_addr()
+        .with_context(|| format!("{name}: read the bound address"))?;
     // ── TLS path: in-process rustls termination via axum-server ──────────
     //
     // When TLS is enabled the plain `axum::serve` (hyper) accept loop can't
@@ -1033,7 +1081,7 @@ async fn serve(
 
         info!("{name} listening on {addr} (TLS)");
 
-        axum_server::bind_rustls(addr, tls)
+        axum_server::from_tcp_rustls(listener, tls)
             .handle(handle)
             .serve(router.into_make_service_with_connect_info::<SocketAddr>())
             .await
@@ -1044,9 +1092,8 @@ async fn serve(
     }
 
     // ── Plain path: unchanged cleartext HTTP ─────────────────────────────
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("{name}: bind {addr}"))?;
+    let listener = TcpListener::from_std(listener)
+        .with_context(|| format!("{name}: adopt the bound listener on {addr}"))?;
 
     info!("{name} listening on {addr}");
 
@@ -2271,12 +2318,7 @@ async fn async_main() -> Result<()> {
         es_router = es_router.merge(xerj_console_router);
     }
 
-    // 10. Banner (includes total startup time)
-    let startup_ms = startup_start.elapsed().as_millis();
-    info!("startup complete in {}ms", startup_ms);
-    print_banner(&cfg, startup_ms);
-
-    // 11. Bind addresses. Composed from the parsed IP, never by formatting
+    // 10. Bind addresses. Composed from the parsed IP, never by formatting
     //     `"{bind}:{port}"` — that string is unparseable for every IPv6
     //     literal (`"::1:9200"`), which made `bind_address = "::1"` a node
     //     that could not start at all.
@@ -2295,6 +2337,46 @@ async fn async_main() -> Result<()> {
     let grpc_addr: SocketAddr = cfg
         .socket_addr(cfg.server.grpc_port)
         .with_context(|| bad_bind_address(&cfg))?;
+
+    // 10a. Bind all three listeners NOW — before the banner, before anything
+    //      reports readiness, and fatally.
+    //
+    //      This used to happen inside the three `tokio::spawn`s below, where a
+    //      bind error was `error!`-logged and explicitly non-fatal. Because
+    //      `tokio::join!` returns only when all three tasks end, a node that
+    //      lost just one port stayed up — and the banner, printed earlier,
+    //      had already announced that port and this data directory as its own.
+    //
+    //      That is not a cosmetic lie. The node that *does* own :9200 answers
+    //      `GET /_cluster/health` with `green`, which is the readiness probe
+    //      the docs prescribe, so `xerj autoindex` proceeds and streams the
+    //      user's corpus into a datastore they have never heard of. It was
+    //      reported by three independent agents; one of them put 905 files —
+    //      contracts, invoices, a bank export — into another node's data
+    //      directory and got `ok=true exit=0` for it (issue #465).
+    //
+    //      Binding first collapses the whole class: the kernel decides who
+    //      owns the port before we make any claim about owning it.
+    let rest_listener = bind_listener(rest_addr, "native REST")?;
+    let es_listener = bind_listener(es_addr, "ES-compat")?;
+    let grpc_listener = bind_listener(grpc_addr, "gRPC")?;
+
+    // 11. Banner (includes total startup time). Printed from the addresses the
+    //     kernel gave us, so every port on it is one this process holds.
+    let bound = BoundAddrs {
+        rest: rest_listener
+            .local_addr()
+            .context("native REST: read the bound address")?,
+        es: es_listener
+            .local_addr()
+            .context("ES-compat: read the bound address")?,
+        grpc: grpc_listener
+            .local_addr()
+            .context("gRPC: read the bound address")?,
+    };
+    let startup_ms = startup_start.elapsed().as_millis();
+    info!("startup complete in {}ms", startup_ms);
+    print_banner(&cfg, &bound, startup_ms);
 
     // 12. Background flush timer
     let flusher = storage_available.then(|| {
@@ -2324,24 +2406,26 @@ async fn async_main() -> Result<()> {
     // 13. Start servers concurrently
     let rest_tls = tls_config.clone();
     let rest = tokio::spawn(async move {
-        if let Err(e) = serve(native_router, rest_addr, "native REST", rest_tls).await {
+        if let Err(e) = serve_on(native_router, rest_listener, "native REST", rest_tls).await {
             error!("native REST: {e:#}");
         }
     });
 
     let es_tls = tls_config.clone();
     let es = tokio::spawn(async move {
-        if let Err(e) = serve(es_router, es_addr, "ES-compat", es_tls).await {
+        if let Err(e) = serve_on(es_router, es_listener, "ES-compat", es_tls).await {
             error!("ES-compat: {e:#}");
         }
     });
 
     // Real tonic XerjSearch service. Exits on the same SIGTERM/SIGINT as the
     // REST listeners so `tokio::join!` below returns and the shutdown flush
-    // hook runs. A bind/transport failure is logged, not fatal.
+    // hook runs. The bind already succeeded above — a *later* transport
+    // failure is logged rather than fatal, because by then the process has
+    // made no false claim: it did hold the port.
     let grpc_state = state.clone();
     let grpc = tokio::spawn(async move {
-        if let Err(e) = grpc::serve_grpc(grpc_addr, grpc_state, shutdown_signal()).await {
+        if let Err(e) = grpc::serve_grpc_on(grpc_listener, grpc_state, shutdown_signal()).await {
             error!("gRPC server: {e:#}");
         }
     });
