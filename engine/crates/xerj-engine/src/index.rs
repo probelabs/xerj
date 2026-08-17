@@ -33789,10 +33789,17 @@ fn doc_matches_query(q: &QueryNode, source: &Value) -> bool {
                     multi_match_field_values_lc(source, field)
                 })
                 .collect();
-            let field_texts: Vec<String> = field_value_lists
-                .iter()
-                .map(|values| values.join(" "))
-                .collect();
+            // Only the non-phrase arms below read the joined form; building it
+            // for the phrase arm would be a per-field allocation this scan pays
+            // once per buffered doc per query.
+            let field_texts: Vec<String> = if is_phrase && !phrase_q_tokens.is_empty() {
+                Vec::new()
+            } else {
+                field_value_lists
+                    .iter()
+                    .map(|values| values.join(" "))
+                    .collect()
+            };
             if is_phrase && !phrase_q_tokens.is_empty() {
                 // phrase / phrase_prefix: POSITIONAL, per field (issue
                 // #230). ES lowers these types to a dis_max over per-field

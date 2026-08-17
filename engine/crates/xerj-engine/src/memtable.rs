@@ -1782,6 +1782,28 @@ impl ShardedFtsMemtable {
         Some((counts, missing))
     }
 
+    /// True when ANY shard's single-valued doc-values column for `field` is
+    /// lossy, so no shard's column may be trusted for whole-value matching.
+    ///
+    /// #332 — the per-shard `doc_values_term_query` / `doc_values_terms_query`
+    /// return `None` for two very different reasons: "this shard holds no
+    /// column for the field" (a true zero-match answer) and "this shard's
+    /// column cannot answer" (array-valued → first element only;
+    /// analyzed-text → whitespace values). The cross-shard wrappers below
+    /// could not tell them apart and folded a REFUSAL into "zero hits here",
+    /// so a two-shard memtable with `{"tags":["red","blue"]}` in shard A and
+    /// `{"tags":"red"}` in shard B answered `term tags:red` with shard B's
+    /// doc only. `doc_values_bool_query` already propagates a per-shard
+    /// refusal globally (`?` inside its loop); this makes the single-leaf
+    /// wrappers behave the same way.
+    fn dv_column_unusable(&self, field: &str) -> bool {
+        self.shards.iter().any(|s| {
+            let g = s.read();
+            g.doc_values.array_fields.contains(field)
+                || g.doc_values.keyword_has_whitespace.contains(field)
+        })
+    }
+
     /// DocValues term query — aggregates hits across all shards.
     /// Returns `Some(Vec<(doc_id, local_idx)>)` if any shard matched.
     /// The `local_idx` is shard-local; callers use the doc_id to
@@ -1792,6 +1814,9 @@ impl ShardedFtsMemtable {
         value: &str,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
+        if self.dv_column_unusable(field) {
+            return None;
+        }
         let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
@@ -1829,6 +1854,11 @@ impl ShardedFtsMemtable {
     ) -> Option<(Vec<(String, usize)>, u64)> {
         // #191 — per-shard bound + global `(seq_no, _id)` narrowing, as in
         // `doc_values_term_query`.
+        // #332 — one lossy shard poisons the whole field; see
+        // `dv_column_unusable`.
+        if self.dv_column_unusable(field) {
+            return None;
+        }
         let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
@@ -3284,6 +3314,19 @@ impl FtsMemtable {
     /// a bool of term+range predicates matches the same doc set the
     /// per-child queries would intersect to — without intermediate
     /// per-child hit vectors.
+    ///
+    /// #332 — the array bailout is part of "mirror the standalone paths
+    /// exactly" and was MISSING here: `doc_values_term_query`,
+    /// `doc_values_terms_query` and `filtered_docs_arc` all refuse a field
+    /// that has ever carried an array, because `push_field` stores only the
+    /// array's FIRST element in these single-valued columns. This walk did
+    /// not, so it answered a bare `term` on a multi-valued keyword field
+    /// from the lossy column and silently dropped every doc whose match was
+    /// in a non-first element (`{"tags":["red","blue"]}` → `term tags:blue`
+    /// = 0 hits) for as long as the doc stayed memtable-resident. It is the
+    /// arm a plain `term` search actually takes (`is_doc_scan_query` →
+    /// fused columnar, ahead of `try_doc_values_query`), so the standalone
+    /// path's bailout never got a chance to fire.
     pub fn doc_values_bool_hits(
         &self,
         preds: &[MemBoolPred],
@@ -3304,6 +3347,12 @@ impl FtsMemtable {
         for p in preds {
             match p {
                 MemBoolPred::Term { field, value } => {
+                    // Array-valued field: the column is lossy (first element
+                    // only) → bail so a later matching element can't be
+                    // dropped (#332; mirrors `filtered_docs_arc`).
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
                     if let Some(col) = self.doc_values.keyword.get(field.as_str()) {
                         // Step 2: analyzed-text bailout via the insert-time
                         // cached flag instead of an O(N) per-query column
@@ -3331,6 +3380,9 @@ impl FtsMemtable {
                     lte,
                     lt,
                 } => {
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
                     let col = self.doc_values.numeric.get(field.as_str())?;
                     cols.push(Col::Num(col, *gte, *gt, *lte, *lt));
                 }

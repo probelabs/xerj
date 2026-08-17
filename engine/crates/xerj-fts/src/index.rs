@@ -659,9 +659,11 @@ fn index_field_values<'a>(
         let tokens = analyzer.analyze(value);
         let mut max_position = 0u32;
         for token in &tokens {
-            field_data
-                .postings
-                .add_occurrence(&token.text, doc_ord, base.saturating_add(token.position));
+            field_data.postings.add_occurrence(
+                &token.text,
+                doc_ord,
+                base.saturating_add(token.position),
+            );
             max_position = max_position.max(token.position);
         }
         if !tokens.is_empty() {
@@ -930,7 +932,8 @@ impl FtsIndexWriter {
             .map(|(k, v)| (k.clone(), v.config.clone()))
             .collect();
 
-        let per_field_vec: Vec<(String, Vec<(u32, &FieldValues)>)> = per_field.into_iter().collect();
+        let per_field_vec: Vec<(String, Vec<(u32, &FieldValues)>)> =
+            per_field.into_iter().collect();
 
         let built: Vec<(String, FieldData)> = per_field_vec
             .into_par_iter()
@@ -1904,6 +1907,90 @@ mod tests {
         }
     }
 
+    /// #332 — a `keyword`-analyzed field with N values must produce N terms,
+    /// and must NOT produce the space-joined concatenation of them.
+    #[test]
+    fn keyword_field_indexes_each_value_as_its_own_term() {
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg-mv-kw", make_registry());
+        writer.configure_field(
+            "tags",
+            FieldIndexConfig {
+                analyzer: "keyword".to_owned(),
+                ..Default::default()
+            },
+        );
+        writer.add_document(
+            0,
+            &[(
+                "tags".to_owned(),
+                FieldValues::from(vec!["red".to_owned(), "blue".to_owned()]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        writer.finish().unwrap();
+
+        let reader = FtsIndexReader::open(dir.path(), "seg-mv-kw", &["tags"]).unwrap();
+        let mut terms = reader.all_terms("tags");
+        terms.sort();
+        assert_eq!(
+            terms,
+            vec!["blue".to_owned(), "red".to_owned()],
+            "each array element is its own keyword term, and \"red blue\" is not a term"
+        );
+        // The norm is the SUM over values, as in Lucene: one token each.
+        assert_eq!(reader.field_length("tags", 0), Some(2));
+        // One (doc, field) pair, however many values it carried.
+        assert_eq!(reader.field_stats("tags").unwrap().total_docs, 1);
+    }
+
+    /// #332 — consecutive values are separated by `POSITION_INCREMENT_GAP`, so
+    /// a phrase cannot straddle the boundary between two array elements.
+    #[test]
+    fn position_increment_gap_separates_consecutive_values() {
+        use crate::postings::PostingsReader;
+
+        let dir = TempDir::new().unwrap();
+        let mut writer = FtsIndexWriter::new(dir.path(), "seg-mv-pos", make_registry());
+        writer.configure_field(
+            "notes",
+            FieldIndexConfig {
+                analyzer: "whitespace".to_owned(),
+                ..Default::default()
+            },
+        );
+        writer.add_document(
+            0,
+            &[(
+                "notes".to_owned(),
+                FieldValues::from(vec!["alpha bravo".to_owned(), "charlie delta".to_owned()]),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        writer.finish().unwrap();
+
+        let reader = FtsIndexReader::open(dir.path(), "seg-mv-pos", &["notes"]).unwrap();
+        let position_of = |term: &str| -> u32 {
+            let tp = reader.lookup_term("notes", term).expect("term present");
+            let data = reader.postings_data("notes", &tp).expect("postings");
+            let mut pr = PostingsReader::new_with_positions(data, tp.doc_frequency, true);
+            let p = pr.next().expect("one posting");
+            p.positions[0]
+        };
+
+        // Value 0 occupies positions 0 and 1.
+        assert_eq!(position_of("alpha"), 0);
+        assert_eq!(position_of("bravo"), 1);
+        // Value 1 restarts one past the previous value, plus the gap.
+        assert_eq!(position_of("charlie"), 2 + POSITION_INCREMENT_GAP);
+        assert_eq!(position_of("delta"), 3 + POSITION_INCREMENT_GAP);
+        // `bravo charlie` is therefore 100 positions apart, not adjacent —
+        // no realistic `slop` bridges it.
+        assert_eq!(position_of("charlie") - position_of("bravo"), 101);
+    }
+
     #[test]
     fn term_lookup_returns_correct_metadata() {
         let dir = TempDir::new().unwrap();
@@ -2042,8 +2129,14 @@ mod tests {
         let source_fields = ["source_unsafe", "source_alias"];
         let mut writer = FtsIndexWriter::new(segment_dir, segment_id, make_registry());
         let document: HashMap<String, FieldValues> = [
-            (source_fields[0].to_owned(), FieldValues::from("unsafeneedle")),
-            (source_fields[1].to_owned(), FieldValues::from("aliasneedle")),
+            (
+                source_fields[0].to_owned(),
+                FieldValues::from("unsafeneedle"),
+            ),
+            (
+                source_fields[1].to_owned(),
+                FieldValues::from("aliasneedle"),
+            ),
         ]
         .into_iter()
         .collect();
@@ -2323,7 +2416,10 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, field)| {
-                ((*field).to_owned(), FieldValues::One(format!("needle{index}")))
+                (
+                    (*field).to_owned(),
+                    FieldValues::One(format!("needle{index}")),
+                )
             })
             .collect();
         writer.add_document(0, &document);

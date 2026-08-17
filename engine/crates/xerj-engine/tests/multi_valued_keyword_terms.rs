@@ -7,14 +7,30 @@
 //! `arr.join(" ")`).  The keyword analyzer emits its whole input as one token,
 //! so the segment carried the term `"red blue"` and neither `"red"` nor
 //! `"blue"` existed as a posting.  Every clause that projects to a whole-value
-//! `FtsQuery::Term` therefore missed the document once it was flushed —
-//! visible in the live engine as `multi_match: {"query": "red"}` returning 0
-//! hits while `multi_match: {"query": "red blue"}` returned 1, the exact
-//! inverse of Elasticsearch.
+//! `FtsQuery::Term` therefore missed the document once it was flushed.
 //!
-//! Every test asserts the hit set is the same BEFORE and AFTER `flush()`:
-//! this class of defect is flush-dependent, and a post-flush-only assertion
-//! would pass on a build that had simply stopped indexing the field.
+//! Measured on `main` at d8be09cf, one doc `{"tags": ["red","blue"]}`, `tags`
+//! mapped `keyword` — the exact inverse of Elasticsearch, and the hit set
+//! CHANGES at `_flush`:
+//!
+//! ```text
+//! BEFORE flush | term tags=red   (first value)              -> 1 hit(s)
+//! BEFORE flush | term tags=blue  (non-first value)          -> 0 hit(s)
+//! BEFORE flush | term tags='red blue' (joined artefact)     -> 0 hit(s)
+//! AFTER  flush | term tags=red   (first value)              -> 0 hit(s)
+//! AFTER  flush | term tags=blue  (non-first value)          -> 0 hit(s)
+//! AFTER  flush | term tags='red blue' (joined artefact)     -> 1 hit(s)
+//! ```
+//!
+//! The pre-flush half had a second, independent cause: the memtable's
+//! single-valued doc-values columns keep only an array's FIRST element, and
+//! the fused columnar walk that serves a bare `term` never bailed out on such
+//! a field the way its three sibling paths did.
+//!
+//! Nearly every case below asserts the hit set is the same BEFORE and AFTER
+//! `flush()`: this class of defect is flush-dependent, and a post-flush-only
+//! assertion would pass on a build that had simply stopped indexing the field.
+//! The one deliberate exception is documented at its assertion.
 
 use std::collections::BTreeSet;
 
@@ -55,7 +71,9 @@ fn expect(ids: &[&str]) -> BTreeSet<String> {
 /// * `2` — the single-valued control, `tags: "red"`, `notes: "alpha bravo"`
 async fn seed(engine: &Engine, name: &str) -> std::sync::Arc<Index> {
     let mut schema = Schema::empty();
-    schema.fields.push(FieldConfig::new("body", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
     schema
         .fields
         .push(FieldConfig::new("notes", FieldType::Text));
@@ -158,22 +176,38 @@ async fn joined_array_is_not_a_term() {
 
     assert_flush_parity(
         &idx,
-        &[
-            (json!({"term": {"tags": "red blue"}}), &[], "term joined"),
-            (
-                json!({"multi_match": {"query": "red blue", "fields": ["tags"]}}),
-                &[],
-                "multi_match joined",
-            ),
-        ],
+        &[(json!({"term": {"tags": "red blue"}}), &[], "term joined")],
     )
     .await;
+
+    // `multi_match` for the joined string is asserted POST-flush only, and
+    // deliberately so.  The segment is the side this fix owns, and it is now
+    // right: no keyword value equals `"red blue"`, so nothing matches.  The
+    // memtable answers `{"1","2"}` instead — but NOT because of arrays.  The
+    // stored-source scan that serves a memtable-resident `multi_match` /
+    // `match` whitespace-splits the query and ORs the tokens without ever
+    // consulting the mapping, so it treats a `keyword` field as analyzed
+    // `text`.  Doc 2 carries the SCALAR `tags: "red"` and diverges the same
+    // way with no array anywhere in the index, which is what makes this a
+    // separate defect rather than an unfinished corner of #332 — filed as
+    // #354, whose fix wants its own ES-YAML run.
+    idx.flush().await.unwrap();
+    assert_eq!(
+        ids(
+            &idx,
+            &json!({"multi_match": {"query": "red blue", "fields": ["tags"]}})
+        )
+        .await,
+        expect(&[]),
+        "POST-flush: the joined array must not be reachable as a multi_match term"
+    );
 }
 
 /// A phrase must not span two elements of an array — Lucene separates them by
 /// `position_increment_gap` (100), and so does the segment writer now.
-/// Pre-fix the memtable said 0 hits and the flushed segment said 1: the
-/// joined string put `bravo` and `charlie` at adjacent positions.
+/// Pre-fix BOTH sides said 1 hit for `"bravo charlie"` (measured on d8be09cf):
+/// the joined string put `bravo` and `charlie` at adjacent positions in the
+/// segment, and the stored-source scan matched the same joined text.
 #[tokio::test]
 async fn phrase_does_not_span_array_elements() {
     let dir = TempDir::new().unwrap();
@@ -235,7 +269,10 @@ async fn terms_agg_buckets_every_array_element() {
             idx.flush().await.unwrap();
         }
         let res = idx.search(&parse_request(&body).unwrap()).await.unwrap();
-        let buckets = res.aggs.as_ref().and_then(|a| a["t"]["buckets"].as_array())
+        let buckets = res
+            .aggs
+            .as_ref()
+            .and_then(|a| a["t"]["buckets"].as_array())
             .cloned()
             .unwrap_or_default();
         let trimmed: Vec<Value> = buckets
@@ -273,4 +310,54 @@ async fn source_round_trips_unchanged() {
             "{state}: _source must keep the original array"
         );
     }
+}
+
+/// The MERGE path must index arrays the same way the flush path does.
+///
+/// It used to carry its own copy of the extraction walk
+/// (`index::extract_field_text`, joining with `" "`), so a merged segment
+/// reproduced the bug even once a freshly flushed one had stopped having it —
+/// a defect that only appears after a second flush plus a merge, which no
+/// flush-only test can see. `extract_fts_fields_excluding` now delegates to
+/// `memtable::extract_field_values_excluding`, the flush path's own walker.
+#[tokio::test]
+async fn merged_segments_keep_every_array_element() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let idx = seed(&engine, "mvk_merge").await;
+
+    // Segment 1: docs 1 and 2.
+    idx.flush().await.unwrap();
+    // Segment 2: a third doc, so the merge has something to merge.
+    idx.index_document(
+        Some("3".into()),
+        json!({"body": "hello", "tags": ["green", "blue"], "notes": "alpha bravo"}),
+    )
+    .await
+    .unwrap();
+    idx.flush().await.unwrap();
+
+    let merged = idx.force_merge(1).await.unwrap();
+    assert!(merged >= 1, "force_merge should have merged something");
+
+    assert_eq!(
+        ids(&idx, &json!({"term": {"tags": "blue"}})).await,
+        expect(&["1", "3"]),
+        "MERGED: a non-first array element must still be its own term"
+    );
+    assert_eq!(
+        ids(&idx, &json!({"term": {"tags": "red"}})).await,
+        expect(&["1", "2"]),
+        "MERGED: the first array element and the scalar control"
+    );
+    assert_eq!(
+        ids(&idx, &json!({"term": {"tags": "red blue"}})).await,
+        expect(&[]),
+        "MERGED: the joined string must not survive the merge as a term"
+    );
+    assert_eq!(
+        ids(&idx, &json!({"match_phrase": {"notes": "bravo charlie"}})).await,
+        expect(&[]),
+        "MERGED: the position gap between array elements must survive the merge"
+    );
 }
