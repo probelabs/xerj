@@ -289,6 +289,7 @@ pub struct StoreBody {
 async fn dedup_probe(
     state: &AppState,
     index: &str,
+    principal: &Principal,
     text: &str,
     vector: Option<&[f32]>,
 ) -> Option<(String, f32)> {
@@ -313,6 +314,7 @@ async fn dedup_probe(
         State(state.clone()),
         Path(index.to_string()),
         axum::extract::Query(EsSearchQueryParams::default()),
+        principal.clone(),
         EsSearchJson(Some(search_body)),
     )
     .await
@@ -364,8 +366,14 @@ pub async fn store(
     // exists. Off by default; only runs when the caller sets `dedup: true`.
     if body.dedup == Some(true) {
         let threshold = body.dedup_threshold.unwrap_or(DEFAULT_DEDUP_THRESHOLD);
-        if let Some((existing_id, score)) =
-            dedup_probe(&state, &index, &body.text, body.vector.as_deref()).await
+        if let Some((existing_id, score)) = dedup_probe(
+            &state,
+            &index,
+            &principal,
+            &body.text,
+            body.vector.as_deref(),
+        )
+        .await
         {
             if score >= threshold {
                 return (
@@ -711,6 +719,7 @@ pub async fn recall(
         State(state.clone()),
         Path(index.clone()),
         axum::extract::Query(EsSearchQueryParams::default()),
+        principal.clone(),
         EsSearchJson(Some(search_body)),
     )
     .await
@@ -1207,6 +1216,7 @@ pub async fn list(
         State(state.clone()),
         Path(index.clone()),
         axum::extract::Query(EsSearchQueryParams::default()),
+        principal.clone(),
         EsSearchJson(Some(search_body)),
     )
     .await
