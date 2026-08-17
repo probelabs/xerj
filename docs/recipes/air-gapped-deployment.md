@@ -93,9 +93,9 @@ The following stages the Linux x86_64 musl archive only.
     < <(tr -d '\r' < "$ASSET.sha256")
 
   tar -xzf "$ASSET"
+  trap 'rm -rf "$OUT/release/$STAGE"' EXIT
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
-  rm -rf "$STAGE"
   echo "staged $ASSET ($want) in $OUT"
 )
 ```
@@ -108,11 +108,21 @@ evidence separately; `.sha256` alone does not provide it.
 
 `"$STAGE/xerj" --version` executes the staged binary, so this block wants a
 staging host of the same platform as the target — Linux x86_64 for the archive
-above. On any other staging host that one line fails, the block stops, and
-nothing is staged; drop it, or set `TARGET` to the triple you are actually
-staging. The extracted tree is removed either way: only the archive and its
-`.sha256` should cross the airgap, so that no unverified binary travels beside
-the verified one.
+above. On any other staging host that one line fails and the block stops with
+the archive and its `.sha256` already downloaded; either drop the line, or stage
+a different target, which means changing `TARGET` here **and** the triple
+written into `STAGE` in the enclave block below, because that one is spelled out
+rather than derived.
+
+The extracted tree is removed by the `trap`, on every exit path including those
+two failures — only the archive and its `.sha256` should cross the airgap, so
+that no unverified binary travels beside the verified one. The `trap` is what
+makes that true: an earlier version of this page ran `rm -rf` as the last line
+of the block and claimed the tree was "removed either way", which was false
+precisely on the wrong-platform path the sentence was written for — `set -e`
+ended the subshell at the failing line and never reached the `rm`. Measured at
+the time: exec-format failure `rc=126`, missing exec bit `rc=1`, non-zero exit
+`rc=7`, tree left behind in all three, removed only on success.
 
 **Transfer `$OUT` itself, and land it in the enclave at `/opt/xerj-staging`**,
 so that the archive is at `/opt/xerj-staging/release/` — that is the path the
@@ -185,10 +195,12 @@ form: with errexit gone, a failed `grep -qxF` no longer stops `tar -xzf`, and
 the block extracts and runs the archive it just refused. Inside, a failure ends
 the subshell and the operator keeps their session, so that pressure never
 arises. Every block on this page that decides something now has its `set -eu`
-inside its own parentheses; the two that must leave variables behind for a later
-paste — the verification blocks in section 4 — carry no `set -eu` at all, and
-use `curl -fsS`, which reports its own failures without arming errexit in the
-operator's session.
+inside its own parentheses. The blocks that must leave variables behind for a
+later paste — section 4's checks, which set `KEY` and `XERJ`, and the `wal_tap`
+block that reads `KEY` — carry no `set -eu` at all. Every command in them is a
+`curl -fsS` or an assignment, so each reports its own failure without arming
+errexit in the operator's session, and none of them decides whether anything
+gets installed.
 
 **The archive is copied once, then hashed and extracted from that copy.** This
 is the defect eight earlier versions of this recipe shared without noticing.
@@ -288,7 +300,10 @@ This runs in the foreground and stops when you log out, so it is a first-start
 check rather than a deployment. Section 4 needs the node reachable while you
 type into a shell: use a second terminal, or supervise it. The unit file is in
 [Operations](../../landing/docs/operations.html); this page deliberately does
-not carry a second copy of it to drift out of date.
+not carry a second copy of it to drift out of date. Point its `ExecStart` at
+`/opt/xerj/bin/xerj`, which is where the block above installs — that unit is
+written for the one-line installer's `/usr/local/bin/xerj`, and a unit copied
+across unedited fails to start.
 
 Keep the listener on loopback. A network-facing listener requires the separate
 production TLS/auth procedure; this recipe does not teach a cleartext opt-out.

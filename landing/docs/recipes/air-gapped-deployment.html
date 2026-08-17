@@ -104,12 +104,12 @@
     &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
 
   tar -xzf "$ASSET"
+  trap 'rm -rf "$OUT/release/$STAGE"' EXIT
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
-  rm -rf "$STAGE"
   echo "staged $ASSET ($want) in $OUT"
 )</pre>
-  <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. <code class="inline">"$STAGE/xerj" --version</code> executes the staged binary, so the staging host must match the target platform; drop that line or change <code class="inline">TARGET</code> otherwise. The extracted tree is removed so that only the archive and its <code class="inline">.sha256</code> cross the airgap.</p>
+  <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. <code class="inline">"$STAGE/xerj" --version</code> executes the staged binary, so the staging host must match the target platform; drop that line, or stage a different target by changing <code class="inline">TARGET</code> here <strong>and</strong> the triple spelled out in the enclave block below. The extracted tree is removed by the <code class="inline">trap</code> on every exit path, including those failures, so that only the archive and its <code class="inline">.sha256</code> cross the airgap.</p>
   <p><strong>Transfer <code class="inline">$OUT</code> itself and land it in the enclave at <code class="inline">/opt/xerj-staging</code></strong>, so the archive sits at <code class="inline">/opt/xerj-staging/release/</code> &mdash; the fixed path the enclave blocks read. Then set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
 <pre class="code">(
   set -eu
@@ -163,7 +163,7 @@ mode = "lexical"
 default_endpoint = ""
 default_model = ""</pre>
 <pre class="code">sudo -u xerj /opt/xerj/bin/xerj --config /etc/xerj/xerj.toml</pre>
-  <p>Start it as <code class="inline">xerj</code>. On first start the authenticated admin key is written to <code class="inline">/var/lib/xerj/admin.key</code>. Keep the listener on loopback; a network-facing listener needs the production TLS/auth procedure. This command runs in the foreground and stops at logout, so it is a first-start check rather than a deployment &mdash; section 4 needs the node reachable from a shell, so use a second terminal or the unit file in <a href="/docs/operations.html">Operations</a>.</p>
+  <p>Start it as <code class="inline">xerj</code>. On first start the authenticated admin key is written to <code class="inline">/var/lib/xerj/admin.key</code>. Keep the listener on loopback; a network-facing listener needs the production TLS/auth procedure. This command runs in the foreground and stops at logout, so it is a first-start check rather than a deployment &mdash; section 4 needs the node reachable from a shell, so use a second terminal or the unit file in <a href="/docs/operations.html">Operations</a> &mdash; pointing its <code class="inline">ExecStart</code> at <code class="inline">/opt/xerj/bin/xerj</code>, where the block above installs, since that unit is written for the one-line installer's <code class="inline">/usr/local/bin/xerj</code>.</p>
 
   <h2>3. Optional neural model</h2>
   <p>Only when neural semantics are needed, stage the three loader files on the connected machine:</p>
