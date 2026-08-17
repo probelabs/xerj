@@ -137,7 +137,6 @@ fn execution(generation_id: &str) -> ExecutionIdentity {
         url: "http://engine".into(),
         prefix: "ax".into(),
         follow_symlinks: false,
-        follow_symlinks_outside_root: false,
         chunker_identity: "prepared-records-v1".into(),
         embedding_identity_sha256: "a".repeat(64),
         embedding_backend: "lexical".into(),

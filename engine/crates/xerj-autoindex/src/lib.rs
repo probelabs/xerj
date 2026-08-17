@@ -543,7 +543,6 @@ fn begin_non_graph_generation(
             url: cfg.url.clone(),
             prefix: cfg.prefix.clone(),
             follow_symlinks: cfg.follow_symlinks,
-            follow_symlinks_outside_root: cfg.follow_symlinks_outside_root,
             chunker_identity,
             embedding_identity_sha256: identity.identity_sha256,
             embedding_backend: identity.backend,
@@ -3155,8 +3154,6 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         && expected.url == cfg.url
                         && expected.prefix == cfg.prefix
                         && expected.follow_symlinks == cfg.follow_symlinks
-                        && expected.follow_symlinks_outside_root
-                            == cfg.follow_symlinks_outside_root
                         && expected.chunker_identity == prepared_records_identity(&cfg)?
                         && !expected.graph_enabled
                         && expected.brain == "disabled"
