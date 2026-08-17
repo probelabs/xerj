@@ -78,6 +78,9 @@ enum SymlinkVerdict {
     /// The resolved target is under the root but its real path runs through a
     /// hidden component — the link's visible name was hiding a dotfile.
     HiddenTarget,
+    /// The path could not be resolved at all, so neither question could be
+    /// answered. Refused rather than admitted; see `escaped_or_hidden_target`.
+    Unresolvable,
 }
 
 /// Judge a followed entry by where it actually resolves.
@@ -88,10 +91,30 @@ enum SymlinkVerdict {
 /// and a link partway up a directory path behave the same as a direct one.
 ///
 /// `None` means the entry is where it appears to be and the ordinary rules
-/// govern it. An unresolvable path is `None` too: a broken link has no target
-/// to leak, and walkdir already reports it through the error arm.
+/// govern it.
+///
+/// A resolution FAILURE is not `None`. An earlier version of this function
+/// wrote `path.canonicalize().ok()?`, which collapsed every error into "the
+/// entry is where it appears" and justified it with "a broken link has no
+/// target to leak". That is true of `NotFound` and of nothing else, and the
+/// difference is a bypass rather than a nicety: `canonicalize` is `realpath(3)`
+/// and is bounded by `PATH_MAX`, while the kernel's own resolution is not, so an
+/// entry can be unresolvable HERE and perfectly readable by every later stage —
+/// `stat`, `open`, hashing, extraction. The guard was then skipped for exactly
+/// the entries it could not vet, which is the wrong direction for a rule whose
+/// job is to keep `.ssh` out of a queryable index. `ELOOP` and `EACCES` land in
+/// the same arm.
+///
+/// So only `NotFound` is treated as "nothing here to leak" — walkdir already
+/// reports a dangling link through its error arm. Everything else is refused
+/// and named in the report, because an answer that could not be computed is not
+/// an answer of "yes".
 fn escaped_or_hidden_target(root_canon: &Path, path: &Path) -> Option<SymlinkVerdict> {
-    let real = path.canonicalize().ok()?;
+    let real = match path.canonicalize() {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(SymlinkVerdict::Unresolvable),
+    };
     let rel = real.strip_prefix(root_canon).ok();
     let Some(rel) = rel else {
         return Some(SymlinkVerdict::OutsideRoot);
@@ -206,6 +229,13 @@ pub fn walk_reporting(
                     }
                     continue;
                 }
+                Some(SymlinkVerdict::Unresolvable) => {
+                    stack.record_symlink_unresolved(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
                 None => {}
             }
         }
@@ -294,6 +324,50 @@ fn stable_path_id(path: &Path) -> String {
 
 #[cfg(test)]
 mod hidden_skip_tests {
+    use super::{escaped_or_hidden_target, SymlinkVerdict};
+
+    /// The dispatch this file was refuted for. `canonicalize` failing is not
+    /// evidence that the entry is where it appears; only `NotFound` is.
+    ///
+    /// A path with an interior NUL cannot be canonicalised and reports
+    /// `InvalidInput`, which stands in here for the errno that actually
+    /// motivates the arm: `realpath(3)` is `PATH_MAX`-bounded while the kernel
+    /// is not, so a canonical path over that limit gives `ENAMETOOLONG` here
+    /// while `open` on the walk path still succeeds. That asymmetry is what
+    /// made `.ok()?` a bypass — the guard was skipped for precisely the entries
+    /// it could not vet.
+    #[test]
+    fn an_unresolvable_entry_is_refused_not_admitted() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+
+        // Exists and resolves inside the root: admitted.
+        std::fs::write(root.join("plain.txt"), "x").unwrap();
+        assert!(
+            escaped_or_hidden_target(&root, &root.join("plain.txt")).is_none(),
+            "an ordinary in-root file must be governed by the ordinary rules"
+        );
+
+        // Does not exist: nothing to leak, so also admitted — walkdir reports it.
+        assert!(
+            escaped_or_hidden_target(&root, &root.join("gone.txt")).is_none(),
+            "a dangling link has no target and must not be reported as a refusal"
+        );
+
+        // Cannot be resolved for any OTHER reason: refused.
+        let bad = root.join(OsStr::from_bytes(b"nul\0inside"));
+        assert!(
+            matches!(
+                escaped_or_hidden_target(&root, &bad),
+                Some(SymlinkVerdict::Unresolvable)
+            ),
+            "an unresolvable path must be refused — `could not compute` is not `yes`"
+        );
+    }
+
     use super::walk;
     use std::fs;
 

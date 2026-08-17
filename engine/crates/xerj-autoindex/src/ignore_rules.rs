@@ -114,6 +114,16 @@ pub const HIDDEN_RULE: &str = "hidden:dotfile";
 /// going to do.
 pub const ESCAPED_ROOT_RULE: &str = "symlink:outside-root";
 
+/// A followed entry whose path could not be resolved for a reason other than
+/// "it does not exist" — `realpath(3)` is bounded by `PATH_MAX` where the
+/// kernel is not, so a canonical path over that limit fails here while `open`
+/// on the walk path still succeeds; `ELOOP` and `EACCES` behave the same.
+///
+/// Refused, because the hidden-name and root-boundary questions could not be
+/// answered and "could not compute" is not "yes". Reported so that a file the
+/// operator expected is named rather than silently missing.
+pub const UNRESOLVED_LINK_RULE: &str = "symlink:unresolved";
+
 const MAX_WARNINGS: usize = 20;
 /// Directory entries the `--dry-run` deep count may examine in total. A
 /// pathological `node_modules` is not allowed to turn "tell me the plan" into
@@ -701,6 +711,20 @@ impl IgnoreStack {
                 .dirs += 1;
         } else {
             self.record_file(ESCAPED_ROOT_RULE);
+        }
+    }
+
+    /// A followed entry that could not be resolved. See [`UNRESOLVED_LINK_RULE`].
+    pub fn record_symlink_unresolved(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(UNRESOLVED_LINK_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(UNRESOLVED_LINK_RULE);
         }
     }
 
