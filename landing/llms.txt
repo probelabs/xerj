@@ -140,8 +140,8 @@ The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm
   # Assert it IS a digest first. With no SHA-256 tool $want is empty, the patterns
   # below collapse to "  $asset" / " *$asset", and a .sha256 carrying that literal
   # line verifies with nothing hashed.
-  case "$want" in *[!0-9a-f]*|"") want="" ;; esac
-  [ "${#want}" -eq 64 ] || { echo "no working SHA-256 tool - refusing $asset" >&2; exit 1; }
+  printf %s "$want" | LC_ALL=C grep -qE '^[0-9a-f]{64}$' \
+    || { echo "no working SHA-256 tool - refusing $asset" >&2; exit 1; }
 
   tr -d '\r' < "$asset.sha256" \
     | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \

@@ -143,13 +143,14 @@
 
   <h2>Manual download</h2>
   <p>Every release publishes eight targets, each with a <code class="inline">.sha256</code> alongside: <code class="inline">x86_64</code>/<code class="inline">aarch64</code> × <code class="inline">unknown-linux-musl</code> (static, any distro), <code class="inline">unknown-linux-gnu</code>, <code class="inline">apple-darwin</code>, and <code class="inline">pc-windows-msvc</code> (.zip).</p>
-  <p>Paste the whole block. It runs in a subshell, so a refusal ends the block and not your shell:</p>
+  <p>Set <code class="inline">target</code> to your platform&rsquo;s triple (the eight published targets are listed above), then paste the whole block. It runs in a subshell, so a refusal ends the block and not your shell:</p>
 <pre class="code">(
   set -eu
 
   ver=$(curl -fsSL https://api.github.com/repos/xerj-org/xerj/releases/latest \
     | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-  stage="xerj-${ver}-x86_64-unknown-linux-musl"
+  target=x86_64-unknown-linux-musl              # set this to YOUR platform's triple
+  stage="xerj-${ver}-${target}"
   asset="${stage}.tar.gz"
   base="https://github.com/xerj-org/xerj/releases/download/v${ver}"
 
@@ -157,11 +158,8 @@
   curl -fsSLO "$base/$asset.sha256"
 
   want=$( { sha256sum "$asset" 2&gt;/dev/null || shasum -a 256 "$asset"; } | cut -d ' ' -f 1 )
-  case "$want" in *[!0-9a-f]*|"") want="" ;; esac
-  if [ "${#want}" -ne 64 ]; then
-    echo "no working SHA-256 tool — refusing to install an unverified $asset" &gt;&amp;2
-    exit 1
-  fi
+  printf %s "$want" | LC_ALL=C grep -qE '^[0-9a-f]{64}$' \
+    || { echo "no working SHA-256 tool — refusing to install an unverified $asset" &gt;&amp;2; exit 1; }
 
   tr -d '\r' &lt; "$asset.sha256" \
     | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
