@@ -19391,15 +19391,37 @@ async fn resolve_indices_for_op(
                 }
             }
         } else {
-            // Concrete name inside a comma list: ES's default
-            // `ignore_unavailable=false` 404s the whole request on a
-            // missing name instead of silently dropping it —
-            // `POST /real,typo/_refresh` must not report success.
-            if !all.iter().any(|n| n == part) {
+            // A concrete name may be a real index OR an alias. An index of
+            // that name wins, matching ES, where an alias may not share a
+            // name with an index.
+            if all.iter().any(|n| n == part) {
+                if !names.iter().any(|n| n == part) {
+                    names.push(part.to_string());
+                }
+            } else if let Some(members) = state.engine.aliases.get(part) {
+                // This branch did not exist, so an alias was simply "not an
+                // index" and the whole request 404'd. `POST /tri/_refresh`
+                // over a three-member alias returned index_not_found while
+                // `POST /idx-a/_refresh` worked — measured on _refresh,
+                // _forcemerge, _cache/clear and _terms_enum. An alias is a
+                // valid index selector for every one of these in ES.
+                //
+                // Expanding to ALL members, not `aliased.first()`: a
+                // maintenance op that silently addressed one member of a
+                // multi-index alias is the same defect class as #450 on the
+                // read side, and `_refresh` reaching only one member makes a
+                // subsequent search non-deterministic in a way nothing in the
+                // response admits.
+                for m in members.value() {
+                    if !names.iter().any(|n| n == m) {
+                        names.push(m.clone());
+                    }
+                }
+            } else {
+                // ES's default `ignore_unavailable=false` 404s the whole
+                // request on a missing name instead of silently dropping it —
+                // `POST /real,typo/_refresh` must not report success.
                 return Err(xerj_common::XerjError::index_not_found(part));
-            }
-            if !names.iter().any(|n| n == part) {
-                names.push(part.to_string());
             }
         }
     }
