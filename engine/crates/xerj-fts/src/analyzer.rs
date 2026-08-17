@@ -477,6 +477,117 @@ impl TokenFilter for SynonymFilter {
     }
 }
 
+/// Identifier-aware sub-word splitter for source-code fields, modelled on
+/// Elasticsearch/Lucene's `word_delimiter` filter.
+///
+/// For every input token it re-emits the **whole token unchanged** (so exact
+/// identifier and phrase queries still hit) and additionally emits sub-word
+/// tokens at the **same position** (mirroring [`SynonymFilter`]) split on:
+///  - non-alphanumeric delimiters (`_`, `-`, `.`, …),
+///  - lowerUpper camelCase transitions (`fooBar` → `foo`, `Bar`),
+///  - upper-run acronym boundaries (`getHTTPResponse` → `get`, `HTTP`,
+///    `Response`),
+///  - letter/digit boundaries (`utf8` → `utf`, `8`).
+///
+/// It also keeps the alphanumeric **run** intact as a sub-word (the "catenate"
+/// form), so a query for `utf8` matches even though the run is further split
+/// into `utf` + `8`. Sub-words identical to the whole token are dropped to
+/// avoid duplicate postings, and duplicates within one token are collapsed.
+///
+/// Case is intentionally preserved here — run this **before** [`LowercaseFilter`]
+/// so camelCase boundaries survive; the lowercase fold then normalises every
+/// emitted sub-word for matching.
+pub struct WordDelimiterFilter;
+
+impl WordDelimiterFilter {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for WordDelimiterFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Split a single alphanumeric run on camelCase, acronym, and letter/digit
+/// boundaries. The run must already be free of delimiter characters.
+fn split_run(run: &str) -> Vec<String> {
+    let chars: Vec<char> = run.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if !cur.is_empty() {
+            let prev = chars[i - 1];
+            let lower_to_upper = prev.is_lowercase() && c.is_uppercase();
+            let letter_to_digit = prev.is_alphabetic() && c.is_ascii_digit();
+            let digit_to_letter = prev.is_ascii_digit() && c.is_alphabetic();
+            // Acronym boundary: UPPER followed by UPPER-then-lower marks the
+            // start of a new word (`HTTPResponse` → `HTTP` | `Response`).
+            let acronym_tail = prev.is_uppercase()
+                && c.is_uppercase()
+                && i + 1 < chars.len()
+                && chars[i + 1].is_lowercase();
+            if lower_to_upper || letter_to_digit || digit_to_letter || acronym_tail {
+                words.push(std::mem::take(&mut cur));
+            }
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+}
+
+/// Produce the ordered, de-duplicated set of sub-words for one token.
+/// Does not include the whole token itself.
+fn word_delimiter_subwords(token: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for run in token.split(|c: char| !c.is_alphanumeric()) {
+        if run.is_empty() {
+            continue;
+        }
+        // Keep the whole alphanumeric run (catenate form) …
+        if run != token && seen.insert(run.to_string()) {
+            out.push(run.to_string());
+        }
+        // … and its camelCase / digit sub-words.
+        let parts = split_run(run);
+        if parts.len() > 1 {
+            for w in parts {
+                if w != token && seen.insert(w.clone()) {
+                    out.push(w);
+                }
+            }
+        }
+    }
+    out
+}
+
+impl TokenFilter for WordDelimiterFilter {
+    fn filter(&self, tokens: Vec<Token>) -> Vec<Token> {
+        let mut result = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            for sub in word_delimiter_subwords(&token.text) {
+                result.push(Token::new(
+                    sub,
+                    token.position,
+                    token.start_offset,
+                    token.end_offset,
+                ));
+            }
+            // Emit the whole token last so it wins de-dup ties downstream,
+            // but position is shared so ordering does not affect matching.
+            result.push(token);
+        }
+        result
+    }
+}
+
 /// Converts Unicode characters to their ASCII equivalents.
 ///
 /// Folds the Latin-1 Supplement diacritics *and* the full Latin Extended-A
@@ -1065,6 +1176,25 @@ impl AnalyzerRegistry {
                     Arc::new(LowercaseFilter) as Arc<dyn TokenFilter>,
                     Arc::new(SynonymFilter::new(ECOMMERCE_SYNONYMS)),
                     Arc::new(StemmerFilter::english()),
+                ],
+            ),
+        );
+
+        // "code" — identifier-aware analyzer for source-code fields.
+        //
+        // Splits snake_case / camelCase / letter-digit identifiers into their
+        // constituent sub-words while preserving the whole identifier, so a
+        // behavioural query like `field norm quantization` can match an
+        // identifier such as `id_to_fieldnorm` or `fieldNormQuant`.  The split
+        // runs BEFORE lowercasing so camelCase case boundaries survive.
+        self.register(
+            "code",
+            AnalyzerPipeline::new(
+                vec![],
+                Arc::new(StandardTokenizer),
+                vec![
+                    Arc::new(WordDelimiterFilter::new()) as Arc<dyn TokenFilter>,
+                    Arc::new(LowercaseFilter) as Arc<dyn TokenFilter>,
                 ],
             ),
         );
@@ -1838,6 +1968,9 @@ impl AnalyzerRegistry {
             "stop" | "english_stop" => Some(Arc::new(StopwordsFilter::english())),
             "stemmer" | "english_stemmer" => Some(Arc::new(StemmerFilter::english())),
             "asciifolding" => Some(Arc::new(AsciiFoldingFilter)),
+            "word_delimiter" | "word_delimiter_graph" => {
+                Some(Arc::new(WordDelimiterFilter::new()) as Arc<dyn TokenFilter>)
+            }
             _ => None,
         }
     }
@@ -2554,6 +2687,96 @@ mod tests {
         assert!(terms.contains(&"fi".to_string()), "terms={terms:?}");
         assert!(terms.contains(&"test".to_string()), "terms={terms:?}");
     }
+
+    #[test]
+    fn word_delimiter_splits_snake_camel_and_digits() {
+        let filter = WordDelimiterFilter::new();
+        let out: Vec<String> = filter
+            .filter(vec![Token::new("id_to_fieldnorm", 0, 0, 0)])
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        // Whole identifier preserved …
+        assert!(out.contains(&"id_to_fieldnorm".to_string()), "out={out:?}");
+        // … and its snake_case sub-words emitted.
+        for w in ["id", "to", "fieldnorm"] {
+            assert!(out.contains(&w.to_string()), "missing {w} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn word_delimiter_handles_acronym_runs() {
+        let filter = WordDelimiterFilter::new();
+        let out: Vec<String> = filter
+            .filter(vec![Token::new("getHTTPResponse", 0, 0, 0)])
+            .into_iter()
+            .map(|t| t.text)
+            .collect();
+        assert!(out.contains(&"getHTTPResponse".to_string()), "out={out:?}");
+        for w in ["get", "HTTP", "Response"] {
+            assert!(out.contains(&w.to_string()), "missing {w} in {out:?}");
+        }
+    }
+
+    #[test]
+    fn word_delimiter_keeps_all_positions_shared() {
+        let filter = WordDelimiterFilter::new();
+        let out = filter.filter(vec![Token::new("fooBar", 3, 0, 6)]);
+        // All emitted tokens share the source position.
+        assert!(out.iter().all(|t| t.position == 3), "out={out:?}");
+    }
+
+    #[test]
+    fn code_analyzer_splits_and_lowercases_identifiers() {
+        let registry = AnalyzerRegistry::default();
+        let analyzer = registry
+            .get_analyzer("code")
+            .expect("code analyzer registered");
+
+        let terms = analyzer.analyze_to_terms("id_to_fieldnorm");
+        for w in ["id", "to", "fieldnorm", "id_to_fieldnorm"] {
+            assert!(terms.contains(&w.to_string()), "missing {w} in {terms:?}");
+        }
+
+        let terms = analyzer.analyze_to_terms("getHTTPResponse");
+        for w in ["get", "http", "response", "gethttpresponse"] {
+            assert!(terms.contains(&w.to_string()), "missing {w} in {terms:?}");
+        }
+
+        // Letter/digit split keeps both the joined run and its parts.
+        let terms = analyzer.analyze_to_terms("utf8_len");
+        for w in ["utf8", "utf", "8", "len"] {
+            assert!(terms.contains(&w.to_string()), "missing {w} in {terms:?}");
+        }
+    }
+
+    #[test]
+    fn word_delimiter_filter_resolvable_by_name() {
+        let registry = AnalyzerRegistry::default();
+        assert!(registry.resolve_builtin_filter("word_delimiter").is_some());
+        assert!(registry
+            .resolve_builtin_filter("word_delimiter_graph")
+            .is_some());
+    }
+
+    #[test]
+    fn standard_analyzer_unchanged_by_code_additions() {
+        // Regression guard: the `standard` analyzer must NOT split identifiers,
+        // protecting ES-YAML conformance.
+        let registry = AnalyzerRegistry::default();
+        let analyzer = registry.standard();
+        let terms = analyzer.analyze_to_terms("id_to_fieldnorm getHTTPResponse");
+        // snake_case stays intact; camelCase stays a single (lowercased) token.
+        assert!(
+            terms.contains(&"id_to_fieldnorm".to_string()),
+            "terms={terms:?}"
+        );
+        assert!(
+            terms.contains(&"gethttpresponse".to_string()),
+            "terms={terms:?}"
+        );
+        assert!(!terms.contains(&"fieldnorm".to_string()), "terms={terms:?}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2780,11 +3003,15 @@ mod unsupported_analysis_tests {
 
     #[test]
     fn unresolvable_filter_is_reported() {
+        // `word_delimiter` is now a supported builtin filter, so it can no
+        // longer stand in as the "unknown filter" example here. Use a name
+        // that genuinely resolves to nothing instead. The typo'd `lowercse`
+        // remains the second unknown so the reported count stays 2.
         let problems = AnalyzerRegistry::unsupported_analysis(&json!({
             "analysis": {
                 "analyzer": {
                     "a": { "type": "custom", "tokenizer": "standard",
-                           "filter": ["lowercse", "word_delimiter"] }
+                           "filter": ["lowercse", "definitely_not_a_real_filter"] }
                 }
             }
         }));
@@ -2794,7 +3021,9 @@ mod unsupported_analysis_tests {
             "{problems:?}"
         );
         assert!(
-            problems.iter().any(|p| p.contains("word_delimiter")),
+            problems
+                .iter()
+                .any(|p| p.contains("definitely_not_a_real_filter")),
             "{problems:?}"
         );
     }
