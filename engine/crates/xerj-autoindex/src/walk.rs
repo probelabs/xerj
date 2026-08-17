@@ -321,7 +321,7 @@ pub fn walk_reporting_opts(
                     resolved = Some(real);
                 }
                 Err(SymlinkVerdict::HiddenOutsideRoot) => {
-                    stack.record_symlink_escape(is_dir);
+                    stack.record_symlink_hidden_escape(is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }

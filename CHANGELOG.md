@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A followed link is now judged by what it **resolves to**, not by the name it
   wears. Targets outside the folder are refused and reported under a new
   `symlink:outside-root` rule; targets inside a hidden directory are skipped
-  like any dotfile.
+  like any dotfile; and one that does both — left the folder AND resolved
+  through a dotted component — is reported as `symlink:outside-root+hidden`,
+  because it is refused even with the opt-in below and neither of the other two
+  labels tells the operator anything they can act on.
 
   **This will index less than the previous release for some setups**, and the
   first run after upgrading drops what it previously indexed through such a

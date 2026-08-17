@@ -129,6 +129,14 @@ pub const ESCAPED_ROOT_RULE: &str = "symlink:outside-root";
 /// operator expected is named rather than silently missing.
 pub const UNRESOLVED_LINK_RULE: &str = "symlink:unresolved";
 
+/// A followed link that left the folder AND resolved through a dotted
+/// component. Refused whatever `--follow-symlinks-outside-root` says, so it
+/// needs its own label: reporting it as [`ESCAPED_ROOT_RULE`] tells an operator
+/// who already passed that flag to pass it again, and reporting it as
+/// [`HIDDEN_RULE`] sends them looking for a dotfile in a folder that has none.
+/// Both were tried; this names the two facts that are actually true.
+pub const HIDDEN_OUTSIDE_ROOT_RULE: &str = "symlink:outside-root+hidden";
+
 const MAX_WARNINGS: usize = 20;
 /// Directory entries the `--dry-run` deep count may examine in total. A
 /// pathological `node_modules` is not allowed to turn "tell me the plan" into
@@ -716,6 +724,21 @@ impl IgnoreStack {
                 .dirs += 1;
         } else {
             self.record_file(ESCAPED_ROOT_RULE);
+        }
+    }
+
+    /// A followed link that left the root through a dotted component.
+    /// See [`HIDDEN_OUTSIDE_ROOT_RULE`].
+    pub fn record_symlink_hidden_escape(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(HIDDEN_OUTSIDE_ROOT_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(HIDDEN_OUTSIDE_ROOT_RULE);
         }
     }
 

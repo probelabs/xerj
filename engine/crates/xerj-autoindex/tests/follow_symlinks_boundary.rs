@@ -20,7 +20,9 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::Path;
-use xerj_autoindex::ignore_rules::{IgnoreOptions, ESCAPED_ROOT_RULE, HIDDEN_RULE};
+use xerj_autoindex::ignore_rules::{
+    IgnoreOptions, ESCAPED_ROOT_RULE, HIDDEN_OUTSIDE_ROOT_RULE, HIDDEN_RULE,
+};
 use xerj_autoindex::walk::walk_reporting;
 
 /// root/
@@ -351,16 +353,30 @@ fn out_of_root_entries_carry_the_resolved_path_and_are_reported_as_escapes() {
         !report.by_rule.contains_key(HIDDEN_RULE),
         "there is no dotfile in the operator's folder to blame: {report:?}"
     );
+    // Two different refusals, two different labels. `shared-lib` left the root
+    // and is plain `symlink:outside-root`; `keys.txt` left it THROUGH `.ssh`,
+    // which the opt-in cannot waive, so it carries its own label. Reporting the
+    // second as an escape tells an operator who already passed the flag to pass
+    // it again; reporting it as a dotfile sends them hunting for one they do
+    // not have.
     let escaped = report
         .by_rule
         .get(ESCAPED_ROOT_RULE)
         .copied()
         .unwrap_or_default();
-    // `keys.txt` is a file link and `shared-lib` a directory link, so they land
-    // in different counters — one each, not two files.
+    let hidden_escape = report
+        .by_rule
+        .get(HIDDEN_OUTSIDE_ROOT_RULE)
+        .copied()
+        .unwrap_or_default();
     assert_eq!(
         (escaped.files, escaped.dirs),
-        (1, 1),
-        "both links left the root: {report:?}"
+        (0, 1),
+        "the ordinary out-of-root link is a plain escape: {report:?}"
+    );
+    assert_eq!(
+        (hidden_escape.files, hidden_escape.dirs),
+        (1, 0),
+        "the one that left through a dotted component is labelled as such: {report:?}"
     );
 }
