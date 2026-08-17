@@ -35,8 +35,10 @@ pub struct Es {
     /// sequence pins the arity, the ordering, the doubling and the cap at once.
     /// It replaces a wall-clock bound that sat 20 ms above a 240 ms budget and
     /// failed about one run in five under load (#436).
+    /// `(requested, observed)` per backoff, in order. Shared by every clone of
+    /// this client, like `admission` — a clone is the same client.
     #[cfg(test)]
-    backoff_delays: Arc<std::sync::Mutex<Vec<Duration>>>,
+    backoff_delays: Arc<std::sync::Mutex<Vec<(Duration, Duration)>>>,
 }
 
 /// How many bulk requests a run may have in flight, and how a 429 changes
@@ -547,21 +549,22 @@ impl Es {
     /// `std::thread::sleep`, and moving only the sleep out of its guard produced
     /// a sixth backoff the counter still reported as five.
     ///
-    /// What this does NOT defend against, stated because the previous version of
-    /// this comment overclaimed it: a sleep that never routes through here is
-    /// invisible to the recorded sequence. Mutation testing found three —
-    /// a bare `thread::sleep` after the loop, the sleep moved out of `backoff`
-    /// itself while the push stays, and a second sleep alongside the recorded
-    /// one. Each adds 20-90 ms of real sleeping that no assertion over recorded
-    /// data can see. Only a tight wall-clock upper bound catches them, and a
-    /// tight upper bound is precisely what failed one run in five under load
-    /// (#436). That is a trade, not an oversight: the assertions pin the shape
-    /// of the sleeping that goes through here, and wall time pins that some
-    /// sleeping happened at all.
+    /// What this does NOT defend against: a sleep that never routes through
+    /// here. A bare `thread::sleep` elsewhere in the loop adds real delay that
+    /// no assertion over recorded data can observe, and the test carries no
+    /// wall-clock bound to catch it — deliberately, because a wall-clock bound
+    /// is what failed one run in five under load (#436). That is the whole of
+    /// the residual gap.
     ///
-    /// The recorded value is the OBSERVED duration rather than the requested
-    /// one, so a `Duration` that is computed correctly and then not honoured
-    /// shows up as a short entry instead of a correct-looking one.
+    /// An earlier version of this comment listed three survivors. Two of them
+    /// — the sleep moved out of `backoff`, and the sleep deleted while the push
+    /// stays — are killed by recording the OBSERVED duration alongside the
+    /// requested one, which the same commit introduced. Verification caught the
+    /// comment describing the code as it had been rather than as it was.
+    ///
+    /// Recording both is what makes `observed >= requested` checkable, so a
+    /// delay computed correctly and then not honoured shows up instead of
+    /// looking right.
     fn backoff(&self, delay: Duration) {
         #[cfg(test)]
         let started = Instant::now();
@@ -570,7 +573,7 @@ impl Es {
         self.backoff_delays
             .lock()
             .expect("backoff_delays poisoned")
-            .push(started.elapsed());
+            .push((delay, started.elapsed()));
     }
 
     /// PUT index with explicit mapping; tolerates already-exists.
@@ -922,6 +925,14 @@ mod tests {
         let mut buffer = [0u8; 4096];
         loop {
             let count = stream.read(&mut buffer).unwrap();
+            if count == 0 {
+                // Peer closed. Without this the loop spins on `Ok(0)` forever
+                // whenever the client gives up mid-request, and `server.join()`
+                // never returns — a HANGING test, which under load is worse
+                // than a failing one because CI has nothing to report. Seen
+                // 19 times in 219 runs at 20x CPU oversubscription.
+                break;
+            }
             request.extend_from_slice(&buffer[..count]);
             if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
                 let headers = String::from_utf8_lossy(&request[..header_end]);
@@ -1190,12 +1201,10 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        let started = Instant::now();
         let error = match es.bulk(b"{}\n".to_vec()) {
             Ok(_) => panic!("all six delayed responses unexpectedly succeeded"),
             Err(error) => error,
         };
-        let elapsed = started.elapsed();
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert_eq!(*accepted.lock().unwrap(), 6);
         // The property is a COUNT, not a duration: six attempts with five
@@ -1205,50 +1214,28 @@ mod tests {
         // on `main`, so it reddened pull requests that had not touched it
         // (#436). A sixth sleep is what the old bound was really looking for,
         // and it is visible here directly.
-        // Observed durations, so they round UP off the requested value; compare
-        // the floor at millisecond granularity rather than the exact number.
-        let delays: Vec<u64> = es
-            .backoff_delays
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|d| d.as_millis() as u64)
-            .collect();
+        // The REQUESTED sequence is asserted exactly, and each observed sleep
+        // only has to be at least what was asked for. That removes the last
+        // wall-clock upper bound from this test: an earlier version compared
+        // the observed value against `want + 50`, which is an upper bound on
+        // real time and therefore the one assertion load could break — while
+        // the comment eight lines above it said there was no such bound. A
+        // sleep can overrun and cannot underrun, so `observed >= requested` is
+        // safe at any load, and the requested sequence pins arity, ordering,
+        // the doubling and the `retry_max_delay` cap on its own.
+        let recorded = es.backoff_delays.lock().unwrap().clone();
+        let requested: Vec<u64> = recorded.iter().map(|(r, _)| r.as_millis() as u64).collect();
         assert_eq!(
-            delays.len(),
-            5,
-            "six attempts must back off five times, never after the final \
-             failure: {delays:?}"
+            requested,
+            vec![10, 20, 20, 20, 20],
+            "six attempts back off five times, never after the final failure, \
+             doubling to the cap"
         );
-        let requested = [10u64, 20, 20, 20, 20];
         assert!(
-            delays
-                .iter()
-                .zip(requested)
-                .all(|(observed, want)| *observed >= want && *observed < want + 50),
-            "each backoff must sleep for the delay it was given — arity, \
-             ordering, the doubling and the retry_max_delay cap all live in \
-             this sequence: got {delays:?}, wanted {requested:?}"
+            recorded.iter().all(|(r, o)| o >= r),
+            "a delay that is computed correctly and then not honoured is the \
+             one thing the requested sequence alone cannot see: {recorded:?}"
         );
-        // Timing, but only in the direction that is safe to assert. A sleep
-        // can overrun and cannot underrun, so a LOWER bound on the summed
-        // delays is immune to a loaded machine — which is what made the old
-        // upper bound flaky. Without it, deleting the sleep from `backoff`
-        // while still recording the delay passes everything above and turns the
-        // retry path into a six-shot hot loop against a struggling server.
-        // 6 x 25ms of request timeout + 90ms of summed backoff = 240ms at an
-        // absolute minimum; 200 leaves 40ms of slack DOWNWARD for timer
-        // granularity. Load can only push elapsed up, never down, which is what
-        // makes a lower bound safe where the old upper bound was not.
-        assert!(
-            elapsed >= Duration::from_millis(200),
-            "only {elapsed:?} elapsed against {}ms of recorded backoff — the \
-             delays were recorded without being slept",
-            delays.iter().sum::<u64>()
-        );
-        // And a runaway net, deliberately loose: the flake this replaced came
-        // from a 19 ms margin, not from having an upper bound at all.
-        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         server.join().unwrap();
     }
 
