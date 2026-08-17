@@ -102,6 +102,18 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 /// needs it named, so it shares the reporting.
 pub const HIDDEN_RULE: &str = "hidden:dotfile";
 
+/// A symlink whose resolved target lies outside the folder the operator
+/// pointed at. Only reachable with `--follow-symlinks`, and refused there:
+/// "index this folder" is not consent to index whatever else the filesystem
+/// links to, and `shared -> /etc` would otherwise put `/etc/shadow` in a
+/// queryable brain under the rel path `shared/shadow`.
+///
+/// Reported like a hidden directory — pruned, never deep-counted. The contents
+/// are outside the root, so they were never candidates and counting them would
+/// inflate [`IgnoreReport::files_inside_pruned_dirs`] with work no run was
+/// going to do.
+pub const ESCAPED_ROOT_RULE: &str = "symlink:outside-root";
+
 const MAX_WARNINGS: usize = 20;
 /// Directory entries the `--dry-run` deep count may examine in total. A
 /// pathological `node_modules` is not allowed to turn "tell me the plan" into
@@ -673,6 +685,22 @@ impl IgnoreStack {
                 .dirs += 1;
         } else {
             self.record_file(HIDDEN_RULE);
+        }
+    }
+
+    /// A symlink target outside the indexed root, also decided by the walker
+    /// (it needs the canonical root, which this stack does not carry) and
+    /// reported through the same accounting. See [`ESCAPED_ROOT_RULE`].
+    pub fn record_symlink_escape(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(ESCAPED_ROOT_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(ESCAPED_ROOT_RULE);
         }
     }
 

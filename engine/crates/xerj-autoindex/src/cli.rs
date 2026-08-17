@@ -151,7 +151,11 @@ pub fn help_text_with(feedback: bool) -> String {
              --snapshot-max-gb <N> logical payload cap for sealed source+prepared records\n\
                                   bytes (default 64); excludes filesystem/manifest overhead\n\
              --fresh              {fresh_help}\n\
-             --follow-symlinks    follow symlinks (loop-safe); off by default\n\
+             --follow-symlinks    follow symlinks (loop-safe); off by default.\n\
+                                  A link is judged by what it RESOLVES to: a\n\
+                                  target outside the folder is refused, and one\n\
+                                  inside a hidden directory is skipped like any\n\
+                                  dotfile, whatever the link itself is called\n\
              --stub <GLOB>        index matching files as ONE existence-only name\n\
                                   card (title + provenance); contents are never\n\
                                   opened. Repeatable. A pattern without '/'\n\

@@ -71,6 +71,36 @@ fn marker_generated_dir(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// Why a followed symlink was refused. See the call site in `walk_reporting`.
+enum SymlinkVerdict {
+    /// The resolved target is not under the indexed root.
+    OutsideRoot,
+    /// The resolved target is under the root but its real path runs through a
+    /// hidden component — the link's visible name was hiding a dotfile.
+    HiddenTarget,
+}
+
+/// Judge a followed entry by where it actually resolves.
+///
+/// `path` is the path the walk arrived by, so under `--follow-symlinks` it can
+/// name a link anywhere along its length. Canonicalising collapses every link
+/// in it at once, which is what makes a chain of links (`a -> b -> .secret/c`)
+/// and a link partway up a directory path behave the same as a direct one.
+///
+/// `None` means the entry is where it appears to be and the ordinary rules
+/// govern it. An unresolvable path is `None` too: a broken link has no target
+/// to leak, and walkdir already reports it through the error arm.
+fn escaped_or_hidden_target(root_canon: &Path, path: &Path) -> Option<SymlinkVerdict> {
+    let real = path.canonicalize().ok()?;
+    let rel = real.strip_prefix(root_canon).ok();
+    let Some(rel) = rel else {
+        return Some(SymlinkVerdict::OutsideRoot);
+    };
+    rel.components()
+        .any(|c| is_hidden_name(c.as_os_str()))
+        .then_some(SymlinkVerdict::HiddenTarget)
+}
+
 /// Walk with the default ignore rules on and the report discarded.
 pub fn walk(root: &Path, follow_symlinks: bool) -> Result<Vec<FileEntry>> {
     walk_reporting(root, follow_symlinks, IgnoreOptions::default()).map(|(files, _)| files)
@@ -145,6 +175,39 @@ pub fn walk_reporting(
                 it.skip_current_dir();
             }
             continue;
+        }
+        // The rule above judges the NAME the walk arrived by, which is the
+        // whole rule when links are not followed. Under `--follow-symlinks` it
+        // is not: a link is free to be called `notes.txt` and point at
+        // `.secretdir/k.txt`, and walkdir then yields the target's contents
+        // under the link's visible name. Both halves of the guarantee above
+        // fail that way — the secret is indexed, and a link to a directory
+        // outside the root drags in a tree the operator never pointed at
+        // (`shared -> /etc` indexes `/etc/shadow` as `shared/shadow`). The
+        // report made it worse by still saying the hidden directories were
+        // pruned, which was true of the traversal and false of the outcome.
+        //
+        // So under the flag the same two questions are asked of the RESOLVED
+        // path instead of the name. Loop-safety is walkdir's and unrelated;
+        // this is the secret rule and the root boundary.
+        if follow_symlinks && entry.depth() > 0 {
+            match escaped_or_hidden_target(&root_canon, entry.path()) {
+                Some(SymlinkVerdict::OutsideRoot) => {
+                    stack.record_symlink_escape(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                Some(SymlinkVerdict::HiddenTarget) => {
+                    stack.record_hidden(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                None => {}
+            }
         }
         if is_dir {
             // The root is never judged by the rules below it: pointing
