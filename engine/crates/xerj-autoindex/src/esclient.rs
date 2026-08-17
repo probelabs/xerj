@@ -22,6 +22,17 @@ pub struct Es {
     /// property of the server, so all of a run's workers must see the same
     /// admission limit.
     admission: Arc<BulkAdmission>,
+    /// Backoff sleeps this client has performed. Test-only, and per-instance
+    /// rather than global so a concurrent test cannot perturb the count —
+    /// `--test-threads=2` in CI is exactly the shape that would.
+    ///
+    /// It exists because the property worth pinning on the retry path is "five
+    /// backoffs between six attempts, and none after the last", which is a
+    /// count. Asserting it with a stopwatch measured the machine instead: the
+    /// old bound sat 20 ms above a 240 ms budget and failed about one run in
+    /// five (#436).
+    #[cfg(test)]
+    backoff_sleeps: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// How many bulk requests a run may have in flight, and how a 429 changes
@@ -335,6 +346,8 @@ impl Es {
             retry_initial_delay,
             retry_max_delay,
             admission: Arc::new(BulkAdmission::off()),
+            #[cfg(test)]
+            backoff_sleeps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -516,6 +529,9 @@ impl Es {
                 Err(e) => last_err = Some(e),
             }
             if attempt + 1 < MAX_ATTEMPTS {
+                #[cfg(test)]
+                self.backoff_sleeps
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(self.retry_max_delay);
             }
@@ -1140,17 +1156,24 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
-        let started = Instant::now();
         let error = match es.bulk(b"{}\n".to_vec()) {
             Ok(_) => panic!("all six delayed responses unexpectedly succeeded"),
             Err(error) => error,
         };
-        let elapsed = started.elapsed();
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert_eq!(*accepted.lock().unwrap(), 6);
-        // Six 25ms attempts plus 10+20+20+20+20ms backoffs. A sixth
-        // post-failure sleep would push this past the deliberately tight cap.
-        assert!(elapsed < Duration::from_millis(260), "{elapsed:?}");
+        // The property is a COUNT, not a duration: six attempts with five
+        // backoffs between them and none after the last. This used to be
+        // asserted as `elapsed < 260ms` against a 240ms budget, which measured
+        // the machine rather than the code and failed about one run in five —
+        // on `main`, so it reddened pull requests that had not touched it
+        // (#436). A sixth sleep is what the old bound was really looking for,
+        // and it is visible here directly.
+        assert_eq!(
+            es.backoff_sleeps.load(std::sync::atomic::Ordering::Relaxed),
+            5,
+            "six attempts must sleep five times, never after the final failure"
+        );
         server.join().unwrap();
     }
 
