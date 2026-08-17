@@ -119,9 +119,14 @@ ASSET="${STAGE}.tar.gz"
   tar -xzf "$ASSET" -C "$work"
   test -x "$work/$STAGE/xerj"
 
-  rm -rf "$STAGE.verified.$want"
-  mv -T "$work/$STAGE" "$STAGE.verified.$want"
-  echo "verified $ASSET -> $STAGE.verified.$want"
+  if ! getent passwd xerj >/dev/null; then
+    sudo useradd --system --user-group --home-dir /var/lib/xerj \
+      --shell /sbin/nologin xerj
+  fi
+  sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
+  sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
+  sudo install -m 0755 "$work/$STAGE/xerj" /opt/xerj/bin/xerj
+  echo "installed $ASSET ($want)"
 )
 ```
 
@@ -162,27 +167,12 @@ directory — survived and was installed. Clearing the install path before
 anything else is what makes "nothing to install" the default rather than a
 consequence.
 
-## 2. Install the base lexical node
+## 2. Configure the base lexical node
 
-The account and directories below are an example of the required ownership;
-use the equivalent account-management command on the target Linux image. No
-model directory is created for the lexical deployment.
-
-```bash
-set -eu
-
-: "${STAGE:?run section 1 in this shell first}"
-: "${ASSET:?run section 1 in this shell first}"
-if ! getent passwd xerj >/dev/null; then
-  sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
-fi
-sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
-sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
-sudo install -m 0755 \
-  "/opt/xerj-staging/release/${STAGE}.verified.$(cd /opt/xerj-staging/release \
-    && sha256sum "$ASSET" | cut -d ' ' -f 1)/xerj" \
-  /opt/xerj/bin/xerj
-```
+The account and directories are created by the block above, alongside the
+install; the ownership shown there is an example, so use the equivalent
+account-management command on the target Linux image. No model directory is
+created for the lexical deployment.
 
 Create `/etc/xerj/xerj.toml` with the complete base configuration. Explicitly
 selecting lexical mode and an empty endpoint prevents an accidental proxy or
@@ -240,16 +230,28 @@ installing anything — the same fail-closed rule as section 1, and the reason
 the check is a command here rather than a sentence:
 
 ```bash
-set -eu
-
 (
+  set -eu
   cd /opt/xerj-staging/model/all-MiniLM-L6-v2
-  sha256sum -c ../model.sha256
+
+  for f in config.json tokenizer.json model.safetensors; do
+    want="$(sha256sum "$f" | cut -d ' ' -f 1)"
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "could not compute a digest for $f" >&2
+      exit 1
+    fi
+    LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
+      < <(tr -d '\r' < ../model.sha256)
+  done
 )
 ```
 
-`model.sha256` names all three files, so a transfer that dropped or truncated
-one fails this check rather than installing a partial model. Then install the
+The same shape as section 1, and for the same reason: `model.sha256` crossed the
+airgap on the same medium as the files it describes, so `sha256sum -c` reading
+filenames out of it would verify whatever it happened to name. Each digest is
+computed here and the file is searched for that exact line, and every one of the
+three must be found — a transfer that dropped or truncated one fails rather than
+installing a partial model. Then install the
 files and change only the embedding block:
 
 ```bash

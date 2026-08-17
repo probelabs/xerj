@@ -122,27 +122,19 @@ ASSET="${STAGE}.tar.gz"
   tar -xzf "$ASSET" -C "$work"
   test -x "$work/$STAGE/xerj"
 
-  rm -rf "$STAGE.verified.$want"
-  mv -T "$work/$STAGE" "$STAGE.verified.$want"
-  echo "verified $ASSET -&gt; $STAGE.verified.$want"
+  if ! getent passwd xerj &gt;/dev/null; then
+    sudo useradd --system --user-group --home-dir /var/lib/xerj \
+      --shell /sbin/nologin xerj
+  fi
+  sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
+  sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
+  sudo install -m 0755 "$work/$STAGE/xerj" /opt/xerj/bin/xerj
+  echo "installed $ASSET ($want)"
 )</pre>
   <p>Three details are load-bearing, and each replaces something that looked right and was not. <strong>The digest is computed here and the file is searched for it, not the other way round</strong> &mdash; <code class="inline">sha256sum -c</code> reads the filename out of the <code class="inline">.sha256</code>, a file that crossed the airgap on the same medium as the archive, skips <code class="inline">#</code> comments silently, and exits <code class="inline">0</code> if any one line verified, so a decoy digest plus a comment naming the archive passes while the archive is never hashed. Filtering that file first does not fix it: <code class="inline">awk '$2 == asset'</code> compares one token while <code class="inline">sha256sum</code> takes the whole rest of the line as the filename, so a line naming <code class="inline">$ASSET decoy</code> satisfies the filter and hashes a decoy. Building the expected line in the shell and demanding it with <code class="inline">grep -qxF</code> removes the disagreement. The two patterns accept GNU text mode and <code class="inline">-b</code> binary mode; <code class="inline">tr -d '\r'</code> accepts a checksum file written on Windows. <strong><code class="inline">set -eu</code> is inside the subshell</strong> &mdash; at the top of the block it kills the operator&rsquo;s login shell on a bad digest, and the natural recovery is to re-paste without it, which is the fail-open form. <strong>Section 2 installs from <code class="inline">$STAGE.verified</code></strong>, which <code class="inline">mv</code> creates only after the digest, the extraction and <code class="inline">test -x</code> have all succeeded &mdash; so the block is safe even when its exit status is ignored, because on any failure there is nothing at the install path. That last part is only true because <code class="inline">rm -rf</code> runs <strong>first</strong>: placed after the digest check it is unreachable on exactly the failure that matters, and a <code class="inline">$STAGE.verified</code> left by an earlier run &mdash; or planted by anyone who can write to the staging directory &mdash; would survive and be installed.</p>
 
-  <h2>2. Install the base lexical node</h2>
+  <h2>2. Configure the base lexical node</h2>
   <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
-<pre class="code">set -eu
-
-: "${STAGE:?run section 1 in this shell first}"
-: "${ASSET:?run section 1 in this shell first}"
-if ! getent passwd xerj &gt;/dev/null; then
-  sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
-fi
-sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
-sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
-sudo install -m 0755 \
-  "/opt/xerj-staging/release/${STAGE}.verified.$(cd /opt/xerj-staging/release \
-    &amp;&amp; sha256sum "$ASSET" | cut -d ' ' -f 1)/xerj" \
-  /opt/xerj/bin/xerj</pre>
   <p>Create <code class="inline">/etc/xerj/xerj.toml</code> with the complete base configuration. Explicit lexical mode and an empty endpoint keep this path model-free:</p>
 <pre class="code">[server]
 bind_address = "127.0.0.1"
@@ -175,11 +167,19 @@ done
   sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256
 )</pre>
   <p>Transfer <code class="inline">OUT/model</code> with the release. Verify it inside the enclave before installing anything &mdash; the same fail-closed rule as section 1, and the reason the check is a command here rather than a sentence:</p>
-<pre class="code">set -eu
-
-(
+<pre class="code">(
+  set -eu
   cd /opt/xerj-staging/model/all-MiniLM-L6-v2
-  sha256sum -c ../model.sha256
+
+  for f in config.json tokenizer.json model.safetensors; do
+    want="$(sha256sum "$f" | cut -d ' ' -f 1)"
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "could not compute a digest for $f" &gt;&amp;2
+      exit 1
+    fi
+    LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
+      &lt; &lt;(tr -d '\r' &lt; ../model.sha256)
+  done
 )</pre>
   <p><code class="inline">model.sha256</code> names all three files, so a transfer that dropped or truncated one fails this check rather than installing a partial model. Then install the files:</p>
 <pre class="code">set -eu
