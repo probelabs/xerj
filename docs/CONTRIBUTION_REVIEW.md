@@ -34,36 +34,21 @@ If behavior must become fail-closed, refuse only the unsafe case. Name what was 
 
 ## Operational documentation and runnable recipes
 
-Treat every shell, TOML, systemd, configuration, and copy-paste command in a
-recipe as a program, not illustrative prose. Execute the ordered success path
-and a deliberate negative control (for example, a bad checksum, missing
-artifact, or disallowed egress) and verify that the unsafe path fails closed
-before extraction, publication, or service exposure. Record the observed exit
-status and recovery command.
+Treat every shell, TOML, systemd, configuration, and copy-paste command in a recipe as a program, not illustrative prose. Execute the ordered success path and a deliberate negative control, such as a bad checksum, missing artifact, or disallowed egress. A negative path fails closed only when the recipe exits non-zero and no artifact is extracted, installed, published, or served. Record the observed exit status, the state at refusal, and the recovery command, and prove that recovery succeeds.
 
-Exercise the process lifecycle: startup, readiness/health, the first real
-operation, graceful stop, cleanup, port release, and restart from the same
-state. For persistent configuration or data, test fresh state, an existing
-state, migration/reindex requirements, unchanged rerun, and the documented
-recovery or rollback transition; distinguish what is preserved from what is
-discarded.
+A runnable block that verifies an artifact must also be the block that acts on it. Do not hand off through a filesystem path between a verifying block and a privileged block.
 
-Make inventories honest. Separate shipped artifacts from source templates and
-generated copies, and state whether a count means files, pages, variants, link
-elements, requests, routes, or something else. For completeness claims, audit
-the declared universe (all, only, none, or no-egress variants), state the tested
-and unsupported feature, platform, transport, and fallback variants, list
-excluded targets, and verify every publication copy. Document mitigations that
-are executable in the stated environment—firewall policy, source rebuild,
-service hardening, or a verified release check—not a runtime workaround the
-product does not implement.
+Run each negative control in two additional compositions: one that discards the failing block's exit status, and one that appends the next documented block. In both compositions, require that no artifact is extracted, installed, published, or served and that no unsafe or privileged path is reached.
 
-When a document is published through multiple paths, trace the publication
-topology from its source through generated pages, indexes, navigation, and
-agent-facing copies. Reuse `scripts/verify-release.sh` for shipped-artifact
-claims rather than replacing it with a partial check. For docs-only changes,
-run the scoped documentation/link/render verifier and record Cargo and ES-YAML
-as not applicable; do not imply that an unrelated engine suite validated prose.
+For every directory or path a recipe reads or writes, name the trust boundary and who can write there. Treat an untrusted staging tree as attacker-controlled: assume an attacker can pre-create any path the recipe will use, including a path whose name is derived from a published digest. Create scratch space outside that tree, exercise the negative control with attacker-precreated paths already present, and verify the refusal state.
+
+Exercise the process lifecycle: startup, readiness/health, the first real operation, graceful stop, cleanup, port release, and restart from the same state. For persistent configuration or data, test fresh state, existing state, migration/reindex requirements, an unchanged rerun, and the documented recovery or rollback transition; distinguish what is preserved from what is discarded.
+
+Give every count an explicit unit, such as files, pages, variants, link elements, requests, or routes. If a claim says “all X”, “only X”, or “no X”, define X as a concrete set and enumerate its members. List exclusions. State which feature, platform, transport, and fallback variants were tested. Separately list every unsupported variant. Verify every publication copy.
+
+Document a concrete mitigation that is executable in the stated environment, such as a firewall rule paired with a negative egress probe, a source-rebuild command, or a service-hardening setting. Do not recommend a runtime switch or workaround that the product does not implement.
+
+When a document is published through multiple paths, trace the publication topology from its source through generated pages, indexes, navigation, and agent-facing copies. For claims about an already-published release, reuse `scripts/verify-release.sh`; it does not validate an unpublished pull request or an offline recipe.
 
 ## Durable state is not invocation state
 
@@ -247,6 +232,7 @@ Review this contribution against current upstream main, not only its tip commit.
 8. Reproduce performance/resource claims with matched builds, fixed inputs, repeated runs, correctness gates, raw evidence, and explicit workload boundaries.
 9. Inspect errors and help text for cause, state-change disclosure, exact recovery commands, related help, and agent-readable structure.
 10. Exercise ambiguous and equal-best durable-state/schema matches; prove incidental iteration or lexical order cannot silently choose the winner. List findings by severity, every section judged not applicable with a reason, explicit known gaps, and everything not verified. Do not infer completion from green unrelated tests.
+11. For every operational document or runnable recipe, execute the ordered success path and at least one negative control; require a non-zero exit with no artifact extracted, installed, published, or served; keep artifact verification and the action it authorizes in one runnable block with no filesystem handoff to a privileged block; rerun each negative control once with the failing block's exit status discarded and once with the next documented block appended, requiring that neither composition reaches an artifact or unsafe/privileged path; exercise lifecycle and recovery; identify path trust boundaries, attacker-precreated paths, and scratch space outside untrusted staging; enumerate completeness sets and exclusions; state which feature, platform, transport, and fallback variants were tested; separately list every unsupported variant; verify every publication copy and the documented mitigation.
 ```
 
 ## Evidence table
@@ -256,6 +242,7 @@ Include a table like this in the PR body or review record. Add or remove rows to
 | Claim or invariant | Authoritative source | Test or reproduction | Mutation / negative control | Result on final head | Evidence location | Known gap |
 |---|---|---|---|---|---|---|
 | Example: refusal happens before mutation | journal, snapshots, remote read-back | real HTTP refusal and recovery test | disable preflight guard | Pass: mutation is detected before writes | repository path or CI job | concurrent refusal not exercised |
+| Example: operational recipe fails closed at an untrusted staging boundary | recipe block boundaries, path ownership, publication topology | run the success path and confirm the verifying block also acts on the artifact | as the staging writer, pre-create a digest-derived destination; run the negative control once with the failing block's exit status discarded and once with the next documented block appended | Pass: neither composition extracts, installs, publishes, or serves an artifact or reaches an unsafe/privileged path; recovery succeeds | repository script or CI job | unsupported platforms are enumerated |
 |  |  |  |  |  |  |  |
 
 Evidence is useful only when another contributor can inspect or reproduce it. Prefer committed fixtures, scripts, CI jobs, and concise raw outputs over claims that depend on a private workstation path.

@@ -31,11 +31,7 @@
 - [ ] New ES-compatible behaviour has a matching YAML case under `engine/tests/es-compat-yaml/yaml/`
 - [ ] Docs updated if user-visible behaviour changed
 - [ ] For non-trivial changes: the applicable audit in [`docs/CONTRIBUTION_REVIEW.md`](../docs/CONTRIBUTION_REVIEW.md)
-- [ ] Operational docs/recipe audit is complete: it records ordered success and
-  failure execution, lifecycle/readiness/cleanup, persistent-data
-  transitions/reindex, generated-copy propagation, and the declared
-  inventory/completeness scope; each inapplicable item is marked `N/A` with a
-  reason.
+- [ ] For non-trivial changes: if this PR changes an operational document or runnable recipe, complete the operational audit in [`docs/CONTRIBUTION_REVIEW.md`](../docs/CONTRIBUTION_REVIEW.md). Record a negative control that exits non-zero with no artifact extracted, installed, published, or served. Keep verification and its action in one block; rerun the control with the failing exit discarded and with the next documented block appended, and require that neither reaches an artifact or unsafe/privileged path. List tested variants and unsupported variants separately, and verify every publication copy. Otherwise mark this item `N/A` with a reason.
 
 **Not run:** <!-- name any check above you skipped, and why. This is expected and fine; hiding it is not. -->
 
