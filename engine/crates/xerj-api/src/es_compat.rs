@@ -8605,7 +8605,17 @@ async fn search_impl(
         .map(|n| resolve_date_math_index(n.trim()))
         .collect();
     let raw_names: Vec<&str> = resolved_names_owned.iter().map(|s| s.as_str()).collect();
-    let needs_resolve = raw_names.iter().any(|n| *n == "_all" || n.contains('*'));
+    // An ALIAS also needs resolving, and used not to be counted here — which is
+    // why a multi-index alias behaved as an alias over one member on every read
+    // path (#433). `_count` and plain `_search` truncated the same way: three
+    // indices of 40 documents behind one alias answered 40, from the first
+    // member, with no error and a `_count` that agreed with the short result.
+    // The `_index`-stamping problem reported alongside it is downstream of this
+    // — the hits could not carry the right index because the other indices were
+    // never searched.
+    let needs_resolve = raw_names
+        .iter()
+        .any(|n| *n == "_all" || n.contains('*') || state.engine.aliases.contains_key(*n));
     let index_names: Vec<String> = if needs_resolve {
         let all = state.engine.list_indices().await;
         let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
@@ -8620,6 +8630,16 @@ async fn search_impl(
             } else if pattern.contains('*') {
                 for name in &all_names {
                     if glob_match_simple(pattern, name) && !resolved.contains(name) {
+                        resolved.push(name.clone());
+                    }
+                }
+            } else if let Some(targets) = state.engine.aliases.get(*pattern) {
+                // Expand to the concrete members, exactly as
+                // `resolve_index_selector` already does for every other
+                // endpoint. An alias naming one index resolves to that one, so
+                // the single-member case is unchanged.
+                for name in targets.value() {
+                    if !resolved.contains(name) {
                         resolved.push(name.clone());
                     }
                 }
@@ -17951,7 +17971,24 @@ pub async fn count_docs(
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
     // Multi-index / all selector: sum counts from every participating index.
-    if index == "_all" || index == "*" || index.contains(',') || index.contains('*') {
+    //
+    // An ALIAS belongs in this branch too. It used not to, so a multi-index
+    // alias fell through to the single-index path and answered one member's
+    // count — three indices of 40 documents behind one alias reported 40, with
+    // no error (#433). This is a THIRD copy of the same resolution, alongside
+    // `resolve_index_selector` and the one inside `search_impl`; they disagreed
+    // about aliases in different ways, which is why `_search` and `_count`
+    // could give different answers for the same selector.
+    let alias_selector = index
+        .split(',')
+        .map(str::trim)
+        .any(|n| state.engine.aliases.contains_key(n));
+    if index == "_all"
+        || index == "*"
+        || index.contains(',')
+        || index.contains('*')
+        || alias_selector
+    {
         let all = state.engine.list_indices().await;
         let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
         let wanted: Vec<String> = if index == "_all" || index == "*" {
@@ -17963,6 +18000,12 @@ pub async fn count_docs(
                 if pat.contains('*') {
                     for n in &all_names {
                         if glob_match_simple(pat, n) && !out.contains(n) {
+                            out.push(n.clone());
+                        }
+                    }
+                } else if let Some(targets) = state.engine.aliases.get(pat) {
+                    for n in targets.value() {
+                        if !out.contains(n) {
                             out.push(n.clone());
                         }
                     }
