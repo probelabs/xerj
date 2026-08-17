@@ -1,20 +1,79 @@
 # XERJ
 
-XERJ is a search engine for AI agents. Point it at a folder and one command makes
-your code, docs, logs and PDFs queryable, so an agent asks questions instead of
-reading files into its context window.
+**The new way for AI to search your data.**
+
+`xerj autoindex <folder>` makes an agent *know* your data instead of grepping for
+it. One command indexes code, docs, logs, PDFs, SQLite and hostile CSVs into
+typed, queryable indices — for search, RAG, security audits and agent memory —
+with no schema to write and no pipeline to configure. Elasticsearch-compatible,
+so the clients, dashboards and libraries you already use just work.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/xerj-org/xerj/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xerj-org/xerj?style=flat-square&label=release)](https://github.com/xerj-org/xerj/releases)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/xerj-org/xerj?style=flat-square)](https://github.com/xerj-org/xerj/stargazers)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-000000?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Discussions](https://img.shields.io/github/discussions/xerj-org/xerj?style=flat-square&label=discussions)](https://github.com/xerj-org/xerj/discussions)
 
+[![Autoindex](https://img.shields.io/badge/autoindex-zero%20config-ff8c00?style=flat-square)](https://xerj.org/docs/cli.html)
+[![Search](https://img.shields.io/badge/search-BM25%20%2B%20kNN%20%2B%20hybrid-8957e5?style=flat-square)](https://xerj.org/docs/queries.html)
+[![Agent memory](https://img.shields.io/badge/agent%20memory-%2F__memory-00b3a4?style=flat-square)](https://xerj.org/docs/recipes/agentic-memory.html)
+[![MCP](https://img.shields.io/badge/MCP-native-1f6feb?style=flat-square)](https://xerj.org/llms.txt)
+[![llms.txt](https://img.shields.io/badge/llms.txt-agent%20ready-6f42c1?style=flat-square)](https://xerj.org/llms.txt)
 [![ES-YAML conformance](https://img.shields.io/badge/ES--YAML%20conformance-1366%2F1369-brightgreen?style=flat-square)](https://xerj.org/benchmarks)
 [![Single static binary](https://img.shields.io/badge/single%20static%20binary-no%20JVM-orange?style=flat-square)](https://xerj.org/docs/install.html)
-[![Search](https://img.shields.io/badge/search-BM25%20%2B%20kNN%20%2B%20hybrid-8957e5?style=flat-square)](https://xerj.org/docs/queries.html)
 [![Default embedder](https://img.shields.io/badge/default%20embedder-lexical%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
 [![Neural](https://img.shields.io/badge/neural%20embedder-opt--in%2C%20downloads%20~90%20MB-9c6ade?style=flat-square)](https://xerj.org/docs/vectors.html)
-[![MCP](https://img.shields.io/badge/MCP-native-1f6feb?style=flat-square)](https://xerj.org/llms.txt)
+
+```sh
+curl -fsSL https://xerj.org/get | sh     # one static binary, no JVM, no deps
+xerj --insecure --data-dir ./data &      # start it
+xerj autoindex ~/my-project              # point it at anything
+```
+
+That is the whole setup. XERJ sniffs every file, works out what it is, and creates
+one index per dataset it finds — code arrives with its symbols and line numbers via
+tree-sitter, not as flat text.
+
+```
+phase A: 593 datasets inferred, 1955 junk/skipped files
+phase B: indexing 25329 files with 8 workers
+done in 158.1s, 593 datasets, 83103 records live, 790 junk records
+```
+
+## Why an agent wants this
+
+An agent that greps pulls whole files into its context — **up to 1.06M input
+tokens on one corpus in our measurements** — and still has to read them. An agent
+that queries XERJ gets the passage.
+
+Measured end-to-end on code the model had not memorised
+([case study](https://xerj.org/case-studies/reference-coding.html): 8 tasks, 4
+languages, 16 runs per arm, real `claude -p` token counts):
+
+| | output tokens | cost | solved |
+|---|---:|---:|---:|
+| from memory only | 260,916 | $11.18 | 11/16 |
+| grep-driven agent | 26,477 | $3.27 | 16/16 |
+| **XERJ** | **9,982** | **$1.58** | **16/16** |
+
+**2.7× fewer output tokens than grep**, **26× fewer than memory alone**, at the
+same solve rate — and up to **278× fewer** on a single Java task. Users running it
+in real development report roughly **5× fewer tokens** end to end
+([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md)).
+
+## What people point it at
+
+- **Codebase Q&A and RAG** — index a repo, ask for the mechanism, get the passage
+  with `file:line` instead of a directory listing.
+- **Security audits** — index a target tree and query for sink patterns, secrets
+  and dangerous calls across every file type at once.
+- **Log and incident analysis** — mixed formats become typed indices with the
+  aggregations you would expect from Elasticsearch.
+- **Agent long-term memory** — `/_memory/{namespace}` stores what an agent learns
+  and recalls it by meaning next session.
+- **Reference coding** — index the OSS projects nearest your problem and retrieve
+  how they solved it before writing code.
 
 ## Paste this to your AI agent
 
