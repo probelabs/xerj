@@ -9,11 +9,12 @@ reading files into its context window.
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue?style=flat-square)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/xerj-org/xerj?style=flat-square)](https://github.com/xerj-org/xerj/stargazers)
 
-[![ES 8.x conformance](https://img.shields.io/badge/ES%208.x%20conformance-1366%2F1369-brightgreen?style=flat-square)](https://xerj.org/benchmarks)
+[![ES-YAML conformance](https://img.shields.io/badge/ES--YAML%20conformance-1366%2F1369-brightgreen?style=flat-square)](https://xerj.org/benchmarks)
 [![Single static binary](https://img.shields.io/badge/single%20static%20binary-no%20JVM-orange?style=flat-square)](https://xerj.org/docs/install.html)
-[![Search](https://img.shields.io/badge/search-BM25%20%2B%20semantic%20%2B%20kNN-8957e5?style=flat-square)](https://xerj.org/docs/queries.html)
-[![Embedder](https://img.shields.io/badge/embedder-built--in%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
-[![MCP](https://img.shields.io/badge/MCP-native-black?style=flat-square)](https://xerj.org/llms.txt)
+[![Search](https://img.shields.io/badge/search-BM25%20%2B%20kNN%20%2B%20hybrid-8957e5?style=flat-square)](https://xerj.org/docs/queries.html)
+[![Default embedder](https://img.shields.io/badge/default%20embedder-lexical%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
+[![Neural](https://img.shields.io/badge/neural%20embedder-opt--in%2C%20downloads%20~90%20MB-9c6ade?style=flat-square)](https://xerj.org/docs/vectors.html)
+[![MCP](https://img.shields.io/badge/MCP-native-1f6feb?style=flat-square)](https://xerj.org/llms.txt)
 
 ## Paste this to your AI agent
 
