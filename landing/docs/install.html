@@ -136,7 +136,7 @@
 <pre class="code">$ curl -fsSL https://xerj.org/get | sh</pre>
   <p><strong>Windows</strong> (x64 and ARM64, PowerShell):</p>
 <pre class="code">&gt; powershell -ExecutionPolicy Bypass -c "irm https://xerj.org/get.ps1 | iex"</pre>
-  <p>Verification is <strong>fail-closed</strong>: if the checksum cannot be downloaded, or no SHA-256 tool (<code class="inline">sha256sum</code>, <code class="inline">shasum</code>, <code class="inline">openssl</code>, <code class="inline">busybox</code>…) can be found, the installer stops rather than installing an unverified binary.</p>
+  <p>Both installers verify <strong>fail-closed</strong>: each computes the archive's own SHA-256 and compares it against the published digest, and if the checksum cannot be downloaded, or no SHA-256 tool (<code class="inline">sha256sum</code>, <code class="inline">shasum</code>, <code class="inline">openssl</code>, <code class="inline">busybox</code>…) can be found, the installer stops rather than installing an unverified binary.</p>
   <p>On Linux the one-liner installs the <strong>static musl</strong> build by default — it runs on any distro including Alpine and has no glibc-version floor. Ask for the glibc build explicitly if you need it:</p>
 <pre class="code">$ curl -fsSL https://xerj.org/get | XERJ_LIBC=gnu sh</pre>
   <p>Other environment overrides: <code class="inline">XERJ_VERSION</code> (install a specific tag), <code class="inline">XERJ_INSTALL_DIR</code> (default <code class="inline">~/.local/bin</code>), <code class="inline">XERJ_REPO</code>.</p>
@@ -144,12 +144,18 @@
   <h2>Manual download</h2>
   <p>Every release publishes eight targets, each with a <code class="inline">.sha256</code> alongside: <code class="inline">x86_64</code>/<code class="inline">aarch64</code> × <code class="inline">unknown-linux-musl</code> (static, any distro), <code class="inline">unknown-linux-gnu</code>, <code class="inline">apple-darwin</code>, and <code class="inline">pc-windows-msvc</code> (.zip).</p>
 <pre class="code">$ ver=$(curl -fsSL https://api.github.com/repos/xerj-org/xerj/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
-$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/xerj-${ver}-x86_64-unknown-linux-musl.tar.gz.sha256
-$ sha256sum -c xerj-${ver}-x86_64-unknown-linux-musl.tar.gz.sha256
-$ tar xzf xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
+$ asset=xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
+$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/${asset}
+$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/${asset}.sha256
+$ want=$(sha256sum "$asset" | cut -d ' ' -f 1)          # macOS: shasum -a 256 "$asset" | cut -d ' ' -f 1
+$ if tr -d '\r' &lt; "$asset.sha256" | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset"; then
+&gt;   tar xzf "$asset"
+&gt; else
+&gt;   echo "CHECKSUM MISMATCH for $asset — do not install it"
+&gt; fi
 $ sudo install -m 0755 xerj-${ver}-x86_64-unknown-linux-musl/xerj /usr/local/bin/xerj
 $ xerj --version</pre>
+  <p>The digest is computed here and the <code class="inline">.sha256</code> is searched for that exact line, rather than letting <code class="inline">sha256sum -c</code> read a filename out of a file that arrived from the same place as the archive. <code class="inline">sha256sum -c</code> skips <code class="inline">#</code> comment lines silently and exits <code class="inline">0</code> if any one line verified, so a <code class="inline">.sha256</code> carrying a valid digest for some other file passes while the archive is never hashed at all. Both patterns accept GNU text mode and <code class="inline">-b</code> binary mode, and <code class="inline">tr -d '\r'</code> accepts a checksum file written on Windows.</p>
   <p>Deploying to a host with no runtime internet access? Follow the <a href="/docs/recipes/air-gapped-deployment.html">air-gapped deployment recipe</a> for release checksums, optional local neural model files, and the loopback/auth defaults.</p>
   <p><strong>macOS Gatekeeper:</strong> the release binaries are not code-signed or notarized. A tarball fetched with <code class="inline">curl</code> (both the one-liner and the commands above) is not quarantined and runs as-is. A tarball downloaded through a <em>browser</em> is: macOS attaches <code class="inline">com.apple.quarantine</code> and the first launch is blocked with <em>"cannot be opened because the developer cannot be verified"</em>. Clear it once, then run normally:</p>
 <pre class="code">$ xattr -d com.apple.quarantine ./xerj</pre>

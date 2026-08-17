@@ -122,9 +122,16 @@ The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm
 base=https://github.com/xerj-org/xerj/releases/download/<tag>       # e.g. tag v1.0.0-rc.16
 asset=xerj-<version-without-the-v>-<target>.tar.gz                  # .zip on pc-windows-msvc
 curl -fL -O "$base/$asset" && curl -fL -O "$base/$asset.sha256"
-sha256sum -c "$asset.sha256"     # macOS: shasum -a 256 -c — do not proceed if this fails
-tar -xzf "$asset"                # unpacks xerj-<version>-<target>/xerj
-install -m 755 xerj-*/xerj ~/.local/bin/xerj
+# Compute the digest and demand the .sha256 contain that exact line. Do NOT use
+# `sha256sum -c`: it skips `#` comments silently and exits 0 if any one line
+# verified, so a .sha256 naming some other file passes without ever hashing $asset.
+want=$(sha256sum "$asset" | cut -d ' ' -f 1)   # macOS: shasum -a 256 "$asset" | cut -d ' ' -f 1
+if tr -d '\r' < "$asset.sha256" | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset"; then
+  tar -xzf "$asset"              # unpacks xerj-<version>-<target>/xerj
+  install -m 755 xerj-*/xerj ~/.local/bin/xerj
+else
+  echo "CHECKSUM MISMATCH for $asset - do not install it" >&2
+fi
 ```
 
 `<target>` is `{x86_64,aarch64}-{unknown-linux-musl,unknown-linux-gnu,apple-darwin,pc-windows-msvc}` — e.g. `xerj-1.0.0-rc.16-x86_64-unknown-linux-musl.tar.gz`. Resolve `<tag>` from `https://api.github.com/repos/xerj-org/xerj/releases/latest`. Note what the checksum does and does not prove: it verifies the archive against the digest published beside it in the same release — integrity, not independent provenance.
