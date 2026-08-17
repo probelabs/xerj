@@ -4,6 +4,8 @@
 
 XERJ gets pattern-matched — by humans and by AI coding tools — as "an Elasticsearch clone in Rust." This document exists to correct that reading with specifics. XERJ shares **no code and no architecture** with Elasticsearch or Lucene. It is a from-scratch engine whose design target is different: **the primary user is an AI agent**, not a human with a dashboard. ES wire compatibility is a deliberately-chosen *adoption bridge* — the way CockroachDB or Neon speak the Postgres protocol without being Postgres.
 
+For an implementation-oriented, six-axis comparison with Lucene, see [XERJ vs Lucene](./XERJ_VS_LUCENE.md).
+
 ## The design thesis
 
 An AI agent handed unfamiliar data has three problems a classical search engine doesn't solve:
@@ -34,7 +36,9 @@ The autoindex pipeline was verified adversarially: 80/81 ground-truth checks on 
 
 ## What ES compatibility buys (and what it doesn't)
 
-**Buys:** zero-cost adoption. 1,360/1,363 ES-YAML conformance cases pass, so existing ES client libraries, dashboards, and habits work unchanged. Migration is `change the URL`.
+**Buys:** zero-cost adoption. The ES-YAML conformance gate requires zero failures,
+so existing ES client libraries, dashboards, and habits work unchanged. Migration
+is `change the URL`; passing and skipped totals can change as the upstream suite evolves.
 
 **Doesn't buy:** the mission. Compatibility gaps that remain are tracked openly (see the stub audit and compatibility docs in `demo/playbooks/`), and where ES semantics are genuinely better, XERJ converges on them — but the roadmap is driven by the agent workflow above, not by chasing feature-checklist parity.
 
