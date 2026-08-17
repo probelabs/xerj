@@ -101,17 +101,28 @@ curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
 )</pre>
   <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. After transfer, set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
 <pre class="code">set -eu
+
 : "${TAG:?set TAG to the same operator-approved release tag}"
 VERSION="${TAG#v}"
-ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
-cd /opt/xerj-staging/release
-sha256sum -c "$ASSET.sha256" \
-  && tar -xzf "$ASSET" \
-  && test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"</pre>
+STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
+ASSET="${STAGE}.tar.gz"
+
+(
+  cd /opt/xerj-staging/release
+  grep -qF "  $ASSET" "$ASSET.sha256"
+  sha256sum -c "$ASSET.sha256"
+  rm -rf "$STAGE"
+  tar -xzf "$ASSET"
+  test -x "$STAGE/xerj"
+)</pre>
+  <p>Each step is on its own line for a reason. <code class="inline">set -e</code> does not stop a command that is part of an <code class="inline">&amp;&amp;</code> list unless it is the last one, so writing this as <code class="inline">sha256sum -c &hellip; &amp;&amp; tar -xzf &hellip;</code> leaves the block exiting <code class="inline">0</code> after a failed digest and lets a wrapping script continue into section 2. The <code class="inline">grep</code> line is what makes the digest apply to this asset: <code class="inline">sha256sum -c</code> reports success for whatever filenames the <code class="inline">.sha256</code> happens to list, including a file that is not the archive you are about to extract. <code class="inline">rm -rf "$STAGE"</code> removes any tree left by an earlier run, so <code class="inline">test -x</code> cannot pass on a stale binary.</p>
 
   <h2>2. Install the base lexical node</h2>
   <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
-<pre class="code">if ! getent passwd xerj &gt;/dev/null; then
+<pre class="code">set -eu
+
+: "${VERSION:?run section 1 in this shell first, or set VERSION to the verified release}"
+if ! getent passwd xerj &gt;/dev/null; then
   sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
 fi
 sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
@@ -137,15 +148,30 @@ default_model = ""</pre>
 
   <h2>3. Optional neural model</h2>
   <p>Only when neural semantics are needed, stage the three loader files on the connected machine:</p>
-<pre class="code">MODEL="$OUT/model/all-MiniLM-L6-v2"
+<pre class="code">set -eu
+
+: "${OUT:?run section 1 in this shell first, or set OUT to the staging directory}"
+MODEL="$OUT/model/all-MiniLM-L6-v2"
 mkdir -p "$MODEL"
 for FILE in config.json tokenizer.json model.safetensors; do
   curl -fL --retry 3 -o "$MODEL/$FILE" \
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
 done
-( cd "$MODEL" &amp;&amp; sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256 )</pre>
-  <p>Transfer and verify <code class="inline">model.sha256</code>, then install the files:</p>
-<pre class="code">sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
+(
+  cd "$MODEL"
+  sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256
+)</pre>
+  <p>Transfer <code class="inline">OUT/model</code> with the release. Verify it inside the enclave before installing anything &mdash; the same fail-closed rule as section 1, and the reason the check is a command here rather than a sentence:</p>
+<pre class="code">set -eu
+
+(
+  cd /opt/xerj-staging/model/all-MiniLM-L6-v2
+  sha256sum -c ../model.sha256
+)</pre>
+  <p><code class="inline">model.sha256</code> names all three files, so a transfer that dropped or truncated one fails this check rather than installing a partial model. Then install the files:</p>
+<pre class="code">set -eu
+
+sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
 sudo install -o xerj -g xerj -m 0640 \
   /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
   /opt/xerj/models/all-MiniLM-L6-v2/</pre>
@@ -156,7 +182,9 @@ local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"</pre>
   <p>XERJ does not independently verify model checksums; the transferred digest is an operator check, not a XERJ signature. Omit this section and all model assets for lexical search.</p>
 
   <h2>4. Authenticate local clients and verify</h2>
-<pre class="code">XERJ=/opt/xerj/bin/xerj
+<pre class="code">set -eu
+
+XERJ=/opt/xerj/bin/xerj
 DATA=/var/lib/xerj
 KEY="$(sudo cat "$DATA/admin.key")"
 export XERJ_API_KEY="$KEY"
@@ -164,13 +192,15 @@ export XERJ_API_KEY="$KEY"
 curl -fsS -H "Authorization: ApiKey $KEY" \
   http://127.0.0.1:9200/_cluster/health</pre>
   <p>With the lexical node running, this semantic query uses the local lexical embedder and needs zero model files. Assert that it returns <code class="inline">_id</code> <code class="inline">1</code>:</p>
-<pre class="code">curl -fsS -X PUT http://127.0.0.1:9200/offline-demo \
+<pre class="code">set -eu
+
+curl -fsS -X PUT "http://127.0.0.1:9200/offline-demo" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"body":{"type":"semantic_text"}}}}'
-curl -fsS -X POST 'http://127.0.0.1:9200/offline-demo/_doc/1?refresh=true' \
+curl -fsS -X POST "http://127.0.0.1:9200/offline-demo/_doc/1?refresh=true" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"body":"A local lexical node can answer this without a network service."}'
-curl -fsS -X POST http://127.0.0.1:9200/offline-demo/_search \
+curl -fsS -X POST "http://127.0.0.1:9200/offline-demo/_search" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"query":{"semantic":{"field":"body","query":"local lexical"}}}'</pre>
   <p>Repeat health and query after restarting the same data directory. For the stronger boundary check, run the sequence with host egress disabled and inspect firewall/log counters; this recipe does not claim that test was run here.</p>
@@ -183,7 +213,9 @@ curl -fsS -X POST http://127.0.0.1:9200/offline-demo/_search \
 
   <h2>Existing data directories and local clients</h2>
   <p>WAL tap is disabled by default, but <code class="inline">PUT /_xerj/wal_tap</code> persists a runtime overlay and reapplies it over TOML on restart. Inspect and remove an old overlay before reusing a data directory:</p>
-<pre class="code">curl -fsS -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap
+<pre class="code">set -eu
+
+curl -fsS -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap
 curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap</pre>
   <p>Cluster mode remains disabled unless explicitly enabled and supplied a shared <code class="inline">cluster.auth_secret</code>. <code class="inline">xerj mcp</code> is a local stdio client to <code class="inline">XERJ_URL</code>; <code class="inline">xerj autoindex</code> also defaults to the local ES-compatible endpoint. Neither creates an external listener or silently uploads corpus data.</p>
 

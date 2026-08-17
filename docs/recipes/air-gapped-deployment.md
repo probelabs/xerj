@@ -98,14 +98,30 @@ extracting:
 
 ```bash
 set -eu
+
 : "${TAG:?set TAG to the same operator-approved release tag}"
 VERSION="${TAG#v}"
-ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
-cd /opt/xerj-staging/release
-sha256sum -c "$ASSET.sha256" \
-  && tar -xzf "$ASSET" \
-  && test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"
+STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
+ASSET="${STAGE}.tar.gz"
+
+(
+  cd /opt/xerj-staging/release
+  grep -qF "  $ASSET" "$ASSET.sha256"
+  sha256sum -c "$ASSET.sha256"
+  rm -rf "$STAGE"
+  tar -xzf "$ASSET"
+  test -x "$STAGE/xerj"
+)
 ```
+
+Each step is on its own line for a reason. `set -e` does not stop a command
+that is part of an `&&` list unless it is the last one, so writing the same
+sequence as `sha256sum -c … && tar -xzf …` leaves the block exiting `0` after a
+failed digest and lets a wrapping script continue into section 2. The `grep`
+line is what makes the digest apply to this asset: `sha256sum -c` reports
+success for whatever filenames the `.sha256` happens to list, including a file
+that is not the archive you are about to extract. `rm -rf "$STAGE"` removes any
+tree left behind by an earlier run, so `test -x` cannot pass on a stale binary.
 
 ## 2. Install the base lexical node
 
@@ -114,6 +130,9 @@ use the equivalent account-management command on the target Linux image. No
 model directory is created for the lexical deployment.
 
 ```bash
+set -eu
+
+: "${VERSION:?run section 1 in this shell first, or set VERSION to the verified release}"
 if ! getent passwd xerj >/dev/null; then
   sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
 fi
@@ -160,6 +179,9 @@ machine, download the three files consumed by the built-in loader and checksum
 them for the transfer:
 
 ```bash
+set -eu
+
+: "${OUT:?run section 1 in this shell first, or set OUT to the staging directory}"
 MODEL="$OUT/model/all-MiniLM-L6-v2"
 mkdir -p "$MODEL"
 for FILE in config.json tokenizer.json model.safetensors; do
@@ -172,10 +194,26 @@ done
 )
 ```
 
-Transfer `OUT/model` with the release and verify `model.sha256` inside the
-enclave. Then install the files and change only the embedding block:
+Transfer `OUT/model` with the release. Verify it inside the enclave before
+installing anything — the same fail-closed rule as section 1, and the reason
+the check is a command here rather than a sentence:
 
 ```bash
+set -eu
+
+(
+  cd /opt/xerj-staging/model/all-MiniLM-L6-v2
+  sha256sum -c ../model.sha256
+)
+```
+
+`model.sha256` names all three files, so a transfer that dropped or truncated
+one fails this check rather than installing a partial model. Then install the
+files and change only the embedding block:
+
+```bash
+set -eu
+
 sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
 sudo install -o xerj -g xerj -m 0640 \
   /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
@@ -199,6 +237,8 @@ documentation was live-tested against a disconnected firewall. They verify the
 actual binary and local files in your enclave.
 
 ```bash
+set -eu
+
 XERJ=/opt/xerj/bin/xerj
 DATA=/var/lib/xerj
 KEY="$(sudo cat "$DATA/admin.key")"
@@ -215,6 +255,8 @@ local lexical embedder and needs zero model files; assert that it returns
 `_id` `1`.
 
 ```bash
+set -eu
+
 curl -fsS -X PUT "http://127.0.0.1:9200/offline-demo" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"body":{"type":"semantic_text"}}}}'
@@ -255,6 +297,8 @@ data directory is reused. Inspect and remove that overlay before an offline run
 if the directory is not fresh:
 
 ```bash
+set -eu
+
 curl -fsS -H "Authorization: ApiKey $KEY" \
   http://127.0.0.1:9200/_xerj/wal_tap
 curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" \
