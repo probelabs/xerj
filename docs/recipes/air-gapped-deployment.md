@@ -106,6 +106,8 @@ ASSET="${STAGE}.tar.gz"
   set -eu
   cd /opt/xerj-staging/release
 
+  rm -rf "$STAGE" "$STAGE.verified"
+
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
     echo "could not compute a digest for $ASSET" >&2
@@ -114,7 +116,6 @@ ASSET="${STAGE}.tar.gz"
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
-  rm -rf "$STAGE" "$STAGE.verified"
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   mv "$STAGE" "$STAGE.verified"
@@ -148,7 +149,15 @@ form. Inside, a failure ends the subshell and the operator keeps their session.
 digest, the extraction and `test -x` have all succeeded.** That is what makes
 the block safe when its exit status is ignored — by a wrapping script, an agent,
 or a reader who pastes the next section anyway. Nothing needs to check a return
-code, because on any failure there is simply nothing at the install path.
+code, because on any failure there is nothing at the install path.
+
+That last sentence is only true because `rm -rf` runs FIRST. An earlier version
+placed it after the digest check, where it is unreachable on exactly the failure
+that matters: a bad digest exits the subshell before it, so a `$STAGE.verified`
+left by an earlier run — or planted by anyone who can write to the staging
+directory — survived and was installed. Clearing the install path before
+anything else is what makes "nothing to install" the default rather than a
+consequence.
 
 ## 2. Install the base lexical node
 
