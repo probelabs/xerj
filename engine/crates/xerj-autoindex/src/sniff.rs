@@ -102,12 +102,16 @@ const PREFIX: usize = 8192;
 
 /// Bytes read when the file already carries GIF magic. A Comment Extension is
 /// unbounded by the format, so this is a budget rather than a guarantee: it
-/// covers every commented GIF in the measured corpus with room to spare, and a
-/// chain that is still well-formed after a megabyte is itself the evidence that
-/// the file is an image — see the `None` arm of the comment walk. The size is
-/// load-bearing in one direction only: raising it costs a larger read on GIF
-/// candidates, lowering it moves files from "walked a megabyte" to "ran out of
-/// file", which is the answer text gets.
+/// covers every commented GIF in the measured corpus with room to spare.
+///
+/// The value is load-bearing, and in the direction that is easy to get
+/// backwards. `read_prefix` returns `min(file_size, GIF_PREFIX)`, so the buffer
+/// is full exactly when the file is at least this large — and a full buffer is
+/// the answer "image" (see the `None` arm of the comment walk). LOWERING the
+/// budget therefore admits MORE files, not fewer: at 128 KiB every text file
+/// over 128 KiB carrying the header shape is called an image, where at 1 MiB
+/// only those over 1 MiB are. Raising it costs a larger read per GIF candidate
+/// and narrows that window. Pinned by `the_budget_is_the_threshold_it_claims`.
 const GIF_PREFIX: usize = 1 << 20;
 
 fn read_prefix(path: &Path, gzip: bool, n: usize) -> Result<Vec<u8>> {
@@ -542,29 +546,54 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                             return matches!(prefix.get(at + 1), None | Some(0x21 | 0x2c | 0x3b));
                         }
                         Some(&len) => at += 1 + usize::from(len),
-                        // Ran out of bytes. Two different situations arrive
-                        // here and conflating them is what four rounds of this
-                        // fix got wrong:
+                        // Ran out of bytes, and the answer turns on WHY.
                         //
-                        //   * The buffer is FULL. The chain has been walked
-                        //     across a megabyte of sub-blocks without hitting a
-                        //     byte that breaks it. Text cannot do that: prose
-                        //     carries no NUL to terminate on and no structure to
-                        //     keep landing on, so a megabyte of "still
-                        //     consistent" is the evidence, not the absence of
-                        //     it. Image.
-                        //   * The buffer is SHORT, i.e. the file ended. A real
-                        //     GIF terminates its comment and follows it with
-                        //     image data and a trailer, so a chain still running
-                        //     at EOF is not one. This is the case a text file
-                        //     under the budget lands in, which is what keeps
-                        //     #379 fixed.
+                        // Be clear about what the walk proves, because the
+                        // obvious reading is backwards. Its only stop condition
+                        // is a NUL landing on a hop; every other byte 1..=255 is
+                        // a legal sub-block size. So "the chain survived" means
+                        // "no NUL landed on a hop" and nothing else. Text has no
+                        // NULs, so text survives with probability 1 — measured:
+                        // 265 of 265 corpus text negatives walk a full megabyte
+                        // unbroken when tiled past the budget. High-entropy
+                        // binary is what the walk rejects: 0 of 200 uniform
+                        // random megabytes survive, matching
+                        // (255/256)^(2^20/128.5) = 1.4e-14. It is not even much
+                        // of a walk — hops average 59 bytes in a prose fixture
+                        // and 256 in a real commented GIF, so it inspects 1.7%
+                        // and 0.4% of the buffer respectively.
                         //
-                        // This asks the chain a question the chain can answer.
-                        // The rule it replaces asked the canvas instead, which
-                        // is a guess dressed as a discriminator: it refuses any
-                        // image whose canvas high bytes happen to be printable,
-                        // and 18 real GIFs on main are junked into prose by it.
+                        // The discriminating is therefore done by the header
+                        // gate above, not here: `0x21` at 13+GCT and `0xFE` at
+                        // 14+GCT, and 0xFE is neither ASCII nor valid UTF-8.
+                        // Verified on disk — the same 1 MiB French-prose file
+                        // with 0x7E at offset 14 stays TxtProse and with 0xFE
+                        // becomes binary/gif. All this arm decides is how much
+                        // text has to accumulate behind that gate before it is
+                        // admitted, which is why the budget is the whole rule
+                        // and the chain is not.
+                        //
+                        // Given that, a FULL buffer answers image and a SHORT
+                        // one answers text. That is a choice between two harms,
+                        // both measured, not a discovered truth:
+                        //
+                        //   * answering image unconditionally (round 2's
+                        //     rejected `true`) junks 10 corpus text files —
+                        //     windows-1252 prose carrying `þ` at offset 14.
+                        //   * answering text on a short buffer sends a
+                        //     TRUNCATED real GIF to the prose extractor: 7 of 7
+                        //     cuts of real corpus GIFs at 300 KB..1,048,575 B go
+                        //     binary/gif here to TxtProse, as does a GIF-magic
+                        //     file of exactly 8192 bytes, and two 51-byte nmap
+                        //     pixels demote from binary/gif to binary/unknown.
+                        //     `sniff` runs on live paths (lib.rs:1151, 4258), so
+                        //     a file mid-copy in a watched directory reaches it.
+                        //
+                        // The second is preferred deliberately: a truncated GIF
+                        // is a broken file no decoder accepts, while a text file
+                        // called binary is a good file silently dropped, which
+                        // is the whole of #379. Pinned by
+                        // `a_truncated_gif_is_called_text_and_that_is_the_trade`.
                         None => return prefix.len() >= GIF_PREFIX,
                     }
                 }
@@ -657,13 +686,12 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
 // written down as a property of the format. The budget test is not that: a
 // full buffer means a megabyte of sub-block chain was actually traversed.
 //
-// One asymmetry is deliberate. `read_prefix` swallows a decompression error on
-// a gzip member (`read_to_end(..).ok()`), so a SHORT buffer does not strictly
-// prove EOF for a `.gif.gz`. A short buffer therefore decides text, which can
-// only mislabel a `.gif.gz` whose comment chain was still running when the
-// stream broke — a file no decoder accepts either. A FULL buffer is
-// unambiguous in both cases, and that is the only direction that answers
-// "image".
+// The short-buffer answer costs real files and the cost is stated at the arm
+// itself: truncated GIFs, plain and gzipped alike, go to the prose extractor.
+// An earlier draft of this comment claimed it "can only mislabel a `.gif.gz`";
+// that was false — 7 of 7 plain truncated corpus GIFs flip too — and it is
+// recorded here because narrowing a known cost until it sounds acceptable is
+// the same failure as inventing a discriminator, one document later.
 
 /// Windows bitmap: `BM`, then a 14-byte BITMAPFILEHEADER, then a DIB header
 /// that opens with its own size.
@@ -2248,6 +2276,87 @@ mod printable_magic_tests {
                 sn.binary_kind
             );
         }
+    }
+
+    /// The other side of the same trade: a truncated GIF is called text.
+    ///
+    /// Deliberate, and the reasoning is not that this is harmless. A cut real
+    /// GIF goes to the prose extractor and is sectioned into junk records —
+    /// exactly the harm #379 and #427 were fighting, with the sign flipped.
+    /// It is preferred anyway because a truncated GIF is a broken file that no
+    /// decoder accepts, while the alternative (answer "image" on a short
+    /// buffer, round 2's rejected `true`) silently drops 10 good corpus text
+    /// files, and a dropped good file is never noticed.
+    ///
+    /// The 8192 case is here because the fixtures that used to cover it were
+    /// retargeted to `GIF_PREFIX`: a GIF-magic file of exactly 8 KiB still
+    /// reaches `sniff_bytes` with an 8192-byte prefix, and the answer for that
+    /// state inverted in this change.
+    #[test]
+    fn a_truncated_gif_is_called_text_and_that_is_the_trade() {
+        /// A real-shaped commented GIF, then cut.
+        fn commented_gif(total: usize) -> Vec<u8> {
+            let mut g: Vec<u8> = b"GIF89a".to_vec();
+            g.extend_from_slice(&1920u16.to_le_bytes());
+            g.extend_from_slice(&1080u16.to_le_bytes());
+            g.push(0x80);
+            g.push(0);
+            g.push(0);
+            g.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]);
+            g.extend_from_slice(&[0x21, 0xfe]);
+            while g.len() < total {
+                g.push(255);
+                g.extend(std::iter::repeat_n(b'D', 255));
+            }
+            g.truncate(total);
+            g
+        }
+
+        let p = Path::new("cut.gif");
+        for cut in [8192usize, 300_000, 700_000, GIF_PREFIX - 1] {
+            let sn = sniff_bytes(&commented_gif(cut), p, p, false).unwrap();
+            assert_eq!(
+                sn.family,
+                Family::TxtProse,
+                "a GIF cut to {cut} B is expected to read as text — if this \
+                 assertion is what broke, the trade above was changed, and the \
+                 10 text files on the other side of it must be re-measured"
+            );
+        }
+    }
+
+    /// `GIF_PREFIX` is the whole rule, so pin it to a fixed byte count rather
+    /// than to itself. Both fixtures above are written in terms of the constant
+    /// and track any change to it; without this, `>= 300_000` passes the suite.
+    #[test]
+    fn the_budget_is_the_threshold_it_claims() {
+        let mut prose: Vec<u8> = b"GIF89ax".to_vec();
+        prose.push(b'\n');
+        prose.extend_from_slice(b"yzest");
+        prose.push(b'!');
+        prose.push(0xfe);
+        prose.push(b'L');
+        while prose.len() < 1_100_000 {
+            prose.extend_from_slice("Le format GIF reste partout sur le web. ".as_bytes());
+        }
+        let p = Path::new("notes.txt");
+
+        // 600 KB is over any plausible lowered budget and under this one. If a
+        // future change shrinks GIF_PREFIX below this, this file — ordinary
+        // windows-1252 prose — starts being indexed as an image.
+        let six_hundred_k: Vec<u8> = prose.iter().copied().take(600_000).collect();
+        assert_eq!(
+            sniff_bytes(&six_hundred_k, p, p, false).unwrap().family,
+            Family::TxtProse,
+            "600 KB of prose must not be called an image; lowering GIF_PREFIX \
+             below 600 KB is what would do it"
+        );
+        assert_eq!(
+            GIF_PREFIX,
+            1 << 20,
+            "the budget is the rule — changing it changes which text files are \
+             called images, so change the comment and the trade with it"
+        );
     }
 
     /// The cost of deciding a budget-exhausted chain as an image, pinned so it
