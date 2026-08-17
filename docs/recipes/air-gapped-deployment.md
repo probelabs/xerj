@@ -106,8 +106,6 @@ ASSET="${STAGE}.tar.gz"
   set -eu
   cd /opt/xerj-staging/release
 
-  rm -rf "$STAGE" "$STAGE.verified"
-
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
     echo "could not compute a digest for $ASSET" >&2
@@ -116,9 +114,14 @@ ASSET="${STAGE}.tar.gz"
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
-  tar -xzf "$ASSET"
-  test -x "$STAGE/xerj"
-  mv "$STAGE" "$STAGE.verified"
+  work="$(mktemp -d ./.xerj-verify.XXXXXX)"
+  trap 'rm -rf "$work"' EXIT
+  tar -xzf "$ASSET" -C "$work"
+  test -x "$work/$STAGE/xerj"
+
+  rm -rf "$STAGE.verified.$want"
+  mv -T "$work/$STAGE" "$STAGE.verified.$want"
+  echo "verified $ASSET -> $STAGE.verified.$want"
 )
 ```
 
@@ -168,14 +171,16 @@ model directory is created for the lexical deployment.
 ```bash
 set -eu
 
-: "${VERSION:?run section 1 in this shell first, or set VERSION to the verified release}"
+: "${STAGE:?run section 1 in this shell first}"
+: "${ASSET:?run section 1 in this shell first}"
 if ! getent passwd xerj >/dev/null; then
   sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
 fi
 sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
 sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
 sudo install -m 0755 \
-  "/opt/xerj-staging/release/xerj-${VERSION}-x86_64-unknown-linux-musl.verified/xerj" \
+  "/opt/xerj-staging/release/${STAGE}.verified.$(cd /opt/xerj-staging/release \
+    && sha256sum "$ASSET" | cut -d ' ' -f 1)/xerj" \
   /opt/xerj/bin/xerj
 ```
 
