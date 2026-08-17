@@ -108,9 +108,14 @@ VERSION="${TAG#v}"
 STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
 ASSET="${STAGE}.tar.gz"
 
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
+cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
+
 (
   set -eu
-  cd /opt/xerj-staging/release
+  cd "$work"
 
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
@@ -120,10 +125,8 @@ ASSET="${STAGE}.tar.gz"
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
-  work="$(mktemp -d)"
-  trap 'rm -rf "$work"' EXIT
-  tar -xzf "$ASSET" -C "$work"
-  test -x "$work/$STAGE/xerj"
+  tar -xzf "$ASSET"
+  test -x "$STAGE/xerj"
 
   if ! getent passwd xerj >/dev/null; then
     sudo useradd --system --user-group --home-dir /var/lib/xerj \
@@ -131,7 +134,7 @@ ASSET="${STAGE}.tar.gz"
   fi
   sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
   sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
-  sudo install -m 0755 "$work/$STAGE/xerj" /opt/xerj/bin/xerj
+  sudo install -m 0755 "$STAGE/xerj" /opt/xerj/bin/xerj
   echo "installed $ASSET ($want)"
 )
 ```
@@ -159,21 +162,35 @@ operator's login shell on a bad digest — actively harmful over a serial consol
 where the natural recovery is to re-paste without it, which is the fail-open
 form. Inside, a failure ends the subshell and the operator keeps their session.
 
-**The block that verifies is the block that installs.** Six earlier versions of
-this recipe handed the verified tree to a later section through a path on disk,
-and every one was broken through that handoff rather than through the digest:
-a directory planted at the agreed name, a `mv` that nested onto it, an attacker
-who computed the digest-named path themselves and swapped the tree before the
-install ran. There is no handoff now — the binary is installed out of the
-private work directory it was extracted into, inside the same subshell — so
-there is nothing for a later step to trust and no exit status that has to be
+**The archive is copied once, then hashed and extracted from that copy.** This
+is the defect eight earlier versions of this recipe shared without noticing.
+Whatever the digest check looked like, the archive at the staging path was
+opened TWICE — once by `sha256sum`, once by `tar` — and anyone who can write
+that directory swaps the file between the two opens. The genuine, untouched
+`.sha256` then verifies, the block prints the genuine digest, exits `0`, and
+installs a backdoor. Reproduced with plain regular files, no FIFOs, on a
+correctly configured system. Copying first collapses that to a single read: the
+bytes that are hashed are the same bytes that are extracted, because they are
+the same file, and it is a file in a directory the attacker cannot reach.
+
+**The block that verifies is the block that installs.** Six versions before that
+handed the verified tree to a later section through a path on disk, and every
+one was broken through the handoff rather than through the digest. There is no
+handoff now, so nothing later has to be trusted and no exit status has to be
 checked.
 
-`mktemp -d` with no argument puts that directory under `TMPDIR`, deliberately
-NOT under the staging directory: renaming or removing a directory entry needs
-write permission on its PARENT, so a work directory inside an attacker-writable
-staging area can be moved aside and replaced however restrictive its own mode
-is.
+**`mktemp -d` puts the work directory under `TMPDIR`, and that is an
+assumption.** It is safe when `TMPDIR` is sticky and not attacker-writable —
+the default `/tmp` on any normal system. It is NOT safe if `/tmp` has been made
+world-writable without the sticky bit, or if `TMPDIR` points into a directory
+the attacker controls: renaming a directory entry needs write on the parent, so
+the work directory can then be swapped however restrictive its own mode is. If
+your enclave is unusual here, set `TMPDIR` to a root-owned directory before
+running these blocks.
+
+An attacker who rewrites the archive AND recomputes its `.sha256` still passes,
+and always will: that is the one case a checksum cannot answer, and the prose
+above already says this is an integrity check and not a signature.
 
 ## 2. Configure the base lexical node
 
@@ -238,9 +255,15 @@ installing anything — the same fail-closed rule as section 1, and the reason
 the check is a command here rather than a sentence:
 
 ```bash
+mwork="$(mktemp -d)"
+trap 'rm -rf "$mwork"' EXIT
+cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
+  "$mwork/"
+cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
+
 (
   set -eu
-  cd /opt/xerj-staging/model/all-MiniLM-L6-v2
+  cd "$mwork"
 
   for f in config.json tokenizer.json model.safetensors; do
     want="$(sha256sum "$f" | cut -d ' ' -f 1)"
@@ -249,7 +272,7 @@ the check is a command here rather than a sentence:
       exit 1
     fi
     LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
-      < <(tr -d '\r' < ../model.sha256)
+      < <(tr -d '\r' < model.sha256)
   done
 
   sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
