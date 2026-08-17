@@ -388,7 +388,24 @@ pub struct GovernorSnapshot {
 /// `effective_memory_limit_bytes`) — this function has no way to detect a
 /// host-RAM value passed in by mistake, so getting that argument right is
 /// the caller's responsibility.
+/// Apply the configured process-memory ceiling to the machine-derived limit.
+///
+/// `cap_mb == 0` disables the ceiling. The result is never larger than the
+/// machine/cgroup limit — this lowers a budget, it never invents headroom that
+/// the host does not have.
+fn cap_memory_limit(machine_limit: u64, cap_mb: u64) -> u64 {
+    if cap_mb == 0 {
+        return machine_limit;
+    }
+    machine_limit.min(cap_mb.saturating_mul(1024 * 1024))
+}
+
 fn auto_memtable_budget(effective_limit: u64) -> u64 {
+    // The 2 GiB floor is clamped by the 50% ceiling on the SAME effective
+    // limit, so an 8 GiB cap yields 2 GiB (25% = 2 GiB) and a 2 GiB effective
+    // limit yields 1 GiB rather than the floor's 2 GiB. The floor raises a
+    // budget on a roomy host; it must never hand out more than half of what
+    // the host — or the configured cap — actually allows.
     (effective_limit / 4)
         .max(2 * 1024 * 1024 * 1024)
         .min(effective_limit / 2)
@@ -496,7 +513,19 @@ fn build(config: &Config) -> ResourceGovernor {
     let limits = &config.limits;
 
     // ── RSS watermark against the effective memory limit ──
-    let memory_limit_bytes = effective_memory_limit_bytes();
+    //
+    // Capped by `limits.max_process_memory_mb` (default 8 GiB). Every budget
+    // below derives from this one number, so capping HERE is what makes the
+    // ceiling coherent — capping each dependent budget separately would let
+    // their sum exceed the ceiling nobody set.
+    //
+    // The cap only lowers: a smaller machine, or a smaller cgroup limit, still
+    // wins. Users reported ~20 GiB resident for two projects because with no
+    // cgroup the derivation base was the whole machine, so a 64 GiB host asked
+    // for 16 GiB of memtables and a 12.8 GiB hydration cache before anything
+    // else allocated a byte.
+    let memory_limit_bytes =
+        cap_memory_limit(effective_memory_limit_bytes(), limits.max_process_memory_mb);
 
     // ── memtable budget: 0 = auto-derive from the effective (cgroup-aware)
     // memory limit — see `auto_memtable_budget`. Must be derived from the
@@ -881,6 +910,59 @@ mod tests {
     /// `system_total_bytes()` directly, so it had no coverage at all —
     /// this table pins the exact values a reviewer reproduced live on a
     /// real cgroup-v2 host (1 GiB cap → 512 MiB, not the pre-fix ~30 GiB).
+    /// The reported symptom, as arithmetic: a big machine bought a hungrier
+    /// XERJ. Every budget derives from the same base, so the base is what the
+    /// cap has to bind.
+    #[test]
+    fn the_default_cap_binds_on_the_machines_users_actually_run() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const DEFAULT_CAP_MB: u64 = 8192;
+
+        // 64 GiB Mac Pro, no cgroup — the reported case.
+        let uncapped = cap_memory_limit(64 * GIB, 0);
+        let capped = cap_memory_limit(64 * GIB, DEFAULT_CAP_MB);
+        assert_eq!(uncapped, 64 * GIB, "0 must mean no ceiling");
+        assert_eq!(capped, 8 * GIB, "the default must bind on a 64 GiB host");
+
+        // What that does to the budgets that actually allocate.
+        assert_eq!(auto_memtable_budget(uncapped), 16 * GIB);
+        assert_eq!(auto_memtable_budget(capped), 2 * GIB);
+
+        // 128 GiB workstation: still 8 GiB, not 32.
+        assert_eq!(cap_memory_limit(128 * GIB, DEFAULT_CAP_MB), 8 * GIB);
+    }
+
+    /// The cap lowers a budget; it must never invent headroom the host does
+    /// not have. A 4 GiB laptop stays a 4 GiB laptop.
+    #[test]
+    fn the_cap_never_raises_a_budget_above_the_machine() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(cap_memory_limit(4 * GIB, 8192), 4 * GIB);
+        assert_eq!(cap_memory_limit(2 * GIB, 8192), 2 * GIB);
+        // A cgroup smaller than the cap still wins.
+        assert_eq!(cap_memory_limit(512 * 1024 * 1024, 8192), 512 * 1024 * 1024);
+    }
+
+    /// The 2 GiB memtable floor must not punch through a smaller ceiling —
+    /// otherwise the floor alone would hand out the entire cap, or more than
+    /// the machine has.
+    #[test]
+    fn the_memtable_floor_cannot_exceed_half_the_capped_base() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for base_gib in [1u64, 2, 4, 8, 16, 64] {
+            let base = base_gib * GIB;
+            let budget = auto_memtable_budget(base);
+            assert!(
+                budget <= base / 2,
+                "memtable budget {budget} exceeds half of a {base_gib} GiB base"
+            );
+        }
+        // Concretely: at the 8 GiB default cap the floor does not apply at all.
+        assert_eq!(auto_memtable_budget(8 * GIB), 2 * GIB);
+        // And under a 2 GiB cgroup the floor is clamped to 1 GiB, not 2.
+        assert_eq!(auto_memtable_budget(2 * GIB), GIB);
+    }
+
     #[test]
     fn auto_memtable_budget_is_cgroup_proportional_and_bounded() {
         const GIB: u64 = 1024 * 1024 * 1024;
