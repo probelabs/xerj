@@ -22,17 +22,21 @@ pub struct Es {
     /// property of the server, so all of a run's workers must see the same
     /// admission limit.
     admission: Arc<BulkAdmission>,
-    /// Backoff sleeps this client has performed. Test-only, and per-instance
-    /// rather than global so a concurrent test cannot perturb the count —
-    /// `--test-threads=2` in CI is exactly the shape that would.
+    /// Every delay this client has actually backed off for, in order.
+    /// Test-only, and per-instance rather than global so a concurrent test
+    /// cannot perturb it — `--test-threads=2` in CI is exactly the shape that
+    /// would.
     ///
-    /// It exists because the property worth pinning on the retry path is "five
-    /// backoffs between six attempts, and none after the last", which is a
-    /// count. Asserting it with a stopwatch measured the machine instead: the
-    /// old bound sat 20 ms above a 240 ms budget and failed about one run in
-    /// five (#436).
+    /// The DELAYS and not a count. Counting alone pins the arity and nothing
+    /// else, so removing the doubling, ignoring `retry_max_delay`, or deleting
+    /// the sleep outright while still counting it all pass — the last turning
+    /// this into a six-shot hot loop against a struggling server, which is the
+    /// retry storm the doc comment on `with_retry` exists to prevent. The
+    /// sequence pins the arity, the ordering, the doubling and the cap at once.
+    /// It replaces a wall-clock bound that sat 20 ms above a 240 ms budget and
+    /// failed about one run in five under load (#436).
     #[cfg(test)]
-    backoff_sleeps: Arc<std::sync::atomic::AtomicUsize>,
+    backoff_delays: Arc<std::sync::Mutex<Vec<Duration>>>,
 }
 
 /// How many bulk requests a run may have in flight, and how a 429 changes
@@ -347,7 +351,7 @@ impl Es {
             retry_max_delay,
             admission: Arc::new(BulkAdmission::off()),
             #[cfg(test)]
-            backoff_sleeps: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            backoff_delays: Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -529,14 +533,28 @@ impl Es {
                 Err(e) => last_err = Some(e),
             }
             if attempt + 1 < MAX_ATTEMPTS {
-                #[cfg(test)]
-                self.backoff_sleeps
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                std::thread::sleep(delay);
+                self.backoff(delay);
                 delay = (delay * 2).min(self.retry_max_delay);
             }
         }
         Err(last_err.unwrap_or_else(|| anyhow!("{what}: retries exhausted")))
+    }
+
+    /// Sleep between attempts, recording what was slept for.
+    ///
+    /// One function so that recording and sleeping cannot come apart. An
+    /// earlier version incremented a counter next to a bare
+    /// `std::thread::sleep`, and moving only the sleep out of its guard then
+    /// produced a sixth backoff that the counter still reported as five — the
+    /// exact regression the test is named for, invisible to it. Bypassing this
+    /// now means writing a second sleep call rather than moving a line.
+    fn backoff(&self, delay: Duration) {
+        #[cfg(test)]
+        self.backoff_delays
+            .lock()
+            .expect("backoff_delays poisoned")
+            .push(delay);
+        std::thread::sleep(delay);
     }
 
     /// PUT index with explicit mapping; tolerates already-exists.
@@ -1156,10 +1174,12 @@ mod tests {
             Duration::from_millis(20),
         )
         .unwrap();
+        let started = Instant::now();
         let error = match es.bulk(b"{}\n".to_vec()) {
             Ok(_) => panic!("all six delayed responses unexpectedly succeeded"),
             Err(error) => error,
         };
+        let elapsed = started.elapsed();
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         assert_eq!(*accepted.lock().unwrap(), 6);
         // The property is a COUNT, not a duration: six attempts with five
@@ -1169,11 +1189,38 @@ mod tests {
         // on `main`, so it reddened pull requests that had not touched it
         // (#436). A sixth sleep is what the old bound was really looking for,
         // and it is visible here directly.
+        let delays: Vec<u64> = es
+            .backoff_delays
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.as_millis() as u64)
+            .collect();
         assert_eq!(
-            es.backoff_sleeps.load(std::sync::atomic::Ordering::Relaxed),
-            5,
-            "six attempts must sleep five times, never after the final failure"
+            delays,
+            vec![10, 20, 20, 20, 20],
+            "the backoff sequence pins arity, ordering, doubling and the \
+             retry_max_delay cap together; a count alone pins only the arity"
         );
+        // Timing, but only in the direction that is safe to assert. A sleep
+        // can overrun and cannot underrun, so a LOWER bound on the summed
+        // delays is immune to a loaded machine — which is what made the old
+        // upper bound flaky. Without it, deleting the sleep from `backoff`
+        // while still recording the delay passes everything above and turns the
+        // retry path into a six-shot hot loop against a struggling server.
+        // 6 x 25ms of request timeout + 90ms of summed backoff = 240ms at an
+        // absolute minimum; 200 leaves 40ms of slack DOWNWARD for timer
+        // granularity. Load can only push elapsed up, never down, which is what
+        // makes a lower bound safe where the old upper bound was not.
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "only {elapsed:?} elapsed against {}ms of recorded backoff — the \
+             delays were recorded without being slept",
+            delays.iter().sum::<u64>()
+        );
+        // And a runaway net, deliberately loose: the flake this replaced came
+        // from a 19 ms margin, not from having an upper bound at all.
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
         server.join().unwrap();
     }
 
