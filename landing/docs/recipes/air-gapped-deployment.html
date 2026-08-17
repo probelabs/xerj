@@ -51,7 +51,7 @@
   <h1>Run XERJ fully offline — air-gapped deployment</h1>
   <p><strong>Goal:</strong> follow this short Linux x86_64-musl procedure: stage one operator-approved release, install it as an unprivileged service, and keep the node on loopback. The base path is lexical and needs no model files; neural embedding is optional.</p>
 
-  <blockquote><p>This recipe is traced to the release workflow, installer, embedding loader, and configuration defaults. It is not a claim that an egress-disabled enclave run was live-tested. Execute the final firewall and operational checks in your own target environment.</p></blockquote>
+  <blockquote><p>This recipe is traced to the release workflow, embedding loader, and configuration defaults. It is not a claim that an egress-disabled enclave run was live-tested. Execute the final firewall and operational checks in your own target environment.</p></blockquote>
 
   <h2>Runtime boundary</h2>
   <ul>
@@ -69,55 +69,86 @@
     <tr><td>autoindex / MCP</td><td>Localhost defaults</td><td>Local clients; they do not create a public listener or silently upload corpus data.</td></tr>
     <tr><td>Runtime telemetry, updates, license activation</td><td>None</td><td>The running binary makes no calls for these purposes.</td></tr>
   </tbody></table>
-  <p>The bundled Console has three external Google Fonts link elements (two preconnects and one stylesheet; stylesheet may fetch additional font files). Blocked requests fall back to system fonts.</p>
+  <p>The bundled Console is three embedded documents &mdash; <code class="inline">index.html</code>, <code class="inline">login.html</code>, and <code class="inline">setup.html</code>, served under <code class="inline">/_xerj-console/</code> &mdash; and each carries the same three external Google Fonts link elements (two preconnects and one stylesheet; the stylesheet may fetch additional font files), so nine in total. Rewriting that HTML means patching all three. Blocked requests fall back to system fonts.</p>
   <p>This procedure does not claim that egress was measured here. If policy requires that boundary, apply an egress-deny rule and inspect firewall/log counters during acceptance.</p>
 
   <h2>1. Stage an approved release</h2>
   <p>Run this on a connected staging machine. Set <code class="inline">TAG</code> to the operator-approved <code class="inline">vX.Y.Z</code> release tag before running; there is no moving release alias here. This procedure stages the Linux x86_64 musl archive only. The matching <code class="inline">.sha256</code> is a separate per-archive asset.</p>
-<pre class="code">set -eu
+<pre class="code">(
+  set -eu
 
-: "${TAG:?set TAG to an operator-approved vX.Y.Z release tag}"
-if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-  echo "TAG must match vX.Y.Z with optional prerelease/build metadata: $TAG" &gt;&amp;2
-  exit 2
-fi
-VERSION="${TAG#v}"
-TARGET="x86_64-unknown-linux-musl"
-EXT="tar.gz"
-STAGE="xerj-${VERSION}-${TARGET}"
-ASSET="${STAGE}.${EXT}"
-BASE="https://github.com/xerj-org/xerj/releases/download/${TAG}"
-OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
+  : "${TAG:?set TAG to an operator-approved vX.Y.Z release tag}"
+  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    echo "TAG must match vX.Y.Z with optional prerelease/build metadata: $TAG" &gt;&amp;2
+    exit 2
+  fi
+  VERSION="${TAG#v}"
+  TARGET="x86_64-unknown-linux-musl"
+  EXT="tar.gz"
+  STAGE="xerj-${VERSION}-${TARGET}"
+  ASSET="${STAGE}.${EXT}"
+  BASE="https://github.com/xerj-org/xerj/releases/download/${TAG}"
+  OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
 
-mkdir -p "$OUT/release"
-curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
-curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
-(
+  mkdir -p "$OUT/release"
+  curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
+  curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
+
   cd "$OUT/release"
-  sha256sum -c "$ASSET.sha256"
+  trap 'rm -rf "$STAGE"' EXIT
+  want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute a digest for $ASSET" &gt;&amp;2
+    exit 1
+  fi
+  LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
+    &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
+
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
+  echo "staged $ASSET ($want) in $OUT"
 )</pre>
-  <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. After transfer, set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
-<pre class="code">: "${TAG:?set TAG to the same operator-approved release tag}"
-VERSION="${TAG#v}"
-ASSET="xerj-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
-cd /opt/xerj-staging/release
-sha256sum -c "$ASSET.sha256"
-tar -xzf "$ASSET"
-test -x "xerj-${VERSION}-x86_64-unknown-linux-musl/xerj"</pre>
+  <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. <code class="inline">"$STAGE/xerj" --version</code> executes the staged binary, so the staging host must match the target platform; drop that line, or stage a different target by changing <code class="inline">TARGET</code> here <strong>and</strong> the triple spelled out in the enclave block below. The extracted tree is removed by the <code class="inline">trap</code> whenever the subshell exits normally or under <code class="inline">set -e</code>, so that only the archive and its <code class="inline">.sha256</code> cross the airgap. An <code class="inline">EXIT</code> trap does not run on <code class="inline">SIGTERM</code>/<code class="inline">SIGHUP</code>, so a dropped session leaves the tree. The trap body is <code class="inline">"$STAGE"</code> — relative to the directory the block already entered — and is installed before <code class="inline">tar</code>: an earlier version derived it from <code class="inline">$OUT</code> after the <code class="inline">cd</code>, which silently cleaned nothing when <code class="inline">OUT</code> was a relative path.</p>
+  <p><strong>Transfer <code class="inline">$OUT</code> itself and land it in the enclave at <code class="inline">/opt/xerj-staging</code></strong>, so the archive sits at <code class="inline">/opt/xerj-staging/release/</code> &mdash; the fixed path the enclave blocks read. Then set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
+<pre class="code">(
+  set -eu
 
-  <h2>2. Install the base lexical node</h2>
-  <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
-<pre class="code">if ! getent passwd xerj &gt;/dev/null; then
-  sudo useradd --system --user-group --home-dir /var/lib/xerj --shell /sbin/nologin xerj
-fi
-sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
-sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
-sudo install -m 0755 \
-  "/opt/xerj-staging/release/xerj-${VERSION}-x86_64-unknown-linux-musl/xerj" \
-  /opt/xerj/bin/xerj</pre>
+  : "${TAG:?set TAG to the same operator-approved release tag}"
+  VERSION="${TAG#v}"
+  STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
+  ASSET="${STAGE}.tar.gz"
+
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
+  cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
+  cd "$work"
+
+  want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute a digest for $ASSET" &gt;&amp;2
+    exit 1
+  fi
+  LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
+    &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
+
+  tar -xzf "$ASSET"
+  test -x "$STAGE/xerj"
+
+  if ! getent passwd xerj &gt;/dev/null; then
+    sudo useradd --system --user-group --home-dir /var/lib/xerj \
+      --shell /sbin/nologin xerj
+  fi
+  sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
+  sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
+  sudo install -m 0755 "$STAGE/xerj" /opt/xerj/bin/xerj
+  echo "installed $ASSET ($want)"
+)</pre>
+  <p><strong>The archive is copied once, then hashed and extracted from that copy.</strong> Earlier versions opened it twice at the staging path &mdash; once by <code class="inline">sha256sum</code>, once by <code class="inline">tar</code> &mdash; and anyone who can write there swaps the file between the two opens. <strong>Everything runs inside the subshell under <code class="inline">set -eu</code>, including the <code class="inline">TAG</code> guard.</strong> Bash does not terminate an <em>interactive</em> shell when a <code class="inline">${var:?}</code> expansion fails, so with the guard outside the block a paste printed its message and carried on with an empty version &mdash; and an attacker who can write the staging directory need only leave a file of that name beside the approved one. A subshell is not interactive, so the guard ends the block. <strong>The work directory must be writable by you and renameable by nobody else.</strong> The default sticky <code class="inline">/tmp</code> is exactly right; if yours is not, <code class="inline">install -d -m 0700 "$HOME/xerj-verify"</code> and point <code class="inline">TMPDIR</code> there. This page once advised a <em>root-owned</em> directory: root ownership was never the problem (<code class="inline">/tmp</code> is root-owned), a directory you cannot write is &mdash; <code class="inline">mktemp</code> then fails, and with that failure unchecked the advice was itself the trigger.</p>
+
+  <h2>2. Configure the base lexical node</h2>
+  <p>The service account and directories were created by the block above, alongside the install; the ownership shown there is an example, so use the equivalent account-management command for your target image. No model directory is needed for lexical mode.</p>
   <p>Create <code class="inline">/etc/xerj/xerj.toml</code> with the complete base configuration. Explicit lexical mode and an empty endpoint keep this path model-free:</p>
 <pre class="code">[server]
 bind_address = "127.0.0.1"
@@ -132,23 +163,52 @@ mode = "lexical"
 default_endpoint = ""
 default_model = ""</pre>
 <pre class="code">sudo -u xerj /opt/xerj/bin/xerj --config /etc/xerj/xerj.toml</pre>
-  <p>Start it as <code class="inline">xerj</code>. On first start the authenticated admin key is written to <code class="inline">/var/lib/xerj/admin.key</code>. Keep the listener on loopback; a network-facing listener needs the production TLS/auth procedure.</p>
+  <p>Start it as <code class="inline">xerj</code>. On first start the authenticated admin key is written to <code class="inline">/var/lib/xerj/admin.key</code>. Keep the listener on loopback; a network-facing listener needs the production TLS/auth procedure. This command runs in the foreground and stops at logout, so it is a first-start check rather than a deployment &mdash; section 4 needs the node reachable from a shell, so use a second terminal or the unit file in <a href="/docs/operations.html">Operations</a> &mdash; pointing its <code class="inline">ExecStart</code> at <code class="inline">/opt/xerj/bin/xerj</code>, where the block above installs, since that unit is written for the one-line installer's <code class="inline">/usr/local/bin/xerj</code>.</p>
 
   <h2>3. Optional neural model</h2>
   <p>Only when neural semantics are needed, stage the three loader files on the connected machine:</p>
-<pre class="code">MODEL="$OUT/model/all-MiniLM-L6-v2"
-mkdir -p "$MODEL"
-for FILE in config.json tokenizer.json model.safetensors; do
-  curl -fL --retry 3 -o "$MODEL/$FILE" \
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
-done
-( cd "$MODEL" &amp;&amp; sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256 )</pre>
-  <p>Transfer and verify <code class="inline">model.sha256</code>, then install the files:</p>
-<pre class="code">sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
-sudo install -o xerj -g xerj -m 0640 \
-  /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
-  /opt/xerj/models/all-MiniLM-L6-v2/</pre>
-  <p>Replace only the embedding block with:</p>
+<pre class="code">(
+  set -eu
+
+  : "${OUT:?set OUT to the staging directory section 1 printed}"
+  MODEL="$OUT/model/all-MiniLM-L6-v2"
+  mkdir -p "$MODEL"
+  for FILE in config.json tokenizer.json model.safetensors; do
+    curl -fL --retry 3 -o "$MODEL/$FILE" \
+      "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
+  done
+  cd "$MODEL"
+  sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256
+  echo "staged all-MiniLM-L6-v2 in $MODEL"
+)</pre>
+  <p>Section 1 runs in a subshell, so <code class="inline">OUT</code> does not survive it &mdash; set it here to the path that block printed. Transfer <code class="inline">$OUT/model</code> with the release, in the same <code class="inline">/opt/xerj-staging</code> directory. Verify it inside the enclave before installing anything &mdash; the same fail-closed rule as section 1, and the reason the check is a command here rather than a sentence:</p>
+<pre class="code">(
+  set -eu
+
+  mwork="$(mktemp -d)"
+  trap 'rm -rf "$mwork"' EXIT
+  cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
+    "$mwork/"
+  cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
+  cd "$mwork"
+
+  for f in config.json tokenizer.json model.safetensors; do
+    want="$(sha256sum "$f" | cut -d ' ' -f 1)"
+    if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "could not compute a digest for $f" &gt;&amp;2
+      exit 1
+    fi
+    LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
+      &lt; &lt;(tr -d '\r' &lt; model.sha256)
+  done
+
+  sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
+  sudo install -o xerj -g xerj -m 0640 \
+    config.json tokenizer.json model.safetensors \
+    /opt/xerj/models/all-MiniLM-L6-v2/
+  echo "installed all-MiniLM-L6-v2"
+)</pre>
+  <p><code class="inline">model.sha256</code> names all three files, so a transfer that dropped or truncated one fails this check rather than installing a partial model. As in section 1, the block that verifies is the block that installs, so a failed check leaves nothing behind for a later paste to pick up. Replace only the embedding block with:</p>
 <pre class="code">[embedding]
 mode = "neural"
 local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"</pre>
@@ -159,17 +219,18 @@ local_model_dir = "/opt/xerj/models/all-MiniLM-L6-v2"</pre>
 DATA=/var/lib/xerj
 KEY="$(sudo cat "$DATA/admin.key")"
 export XERJ_API_KEY="$KEY"
+
 "$XERJ" --version
 curl -fsS -H "Authorization: ApiKey $KEY" \
   http://127.0.0.1:9200/_cluster/health</pre>
   <p>With the lexical node running, this semantic query uses the local lexical embedder and needs zero model files. Assert that it returns <code class="inline">_id</code> <code class="inline">1</code>:</p>
-<pre class="code">curl -fsS -X PUT http://127.0.0.1:9200/offline-demo \
+<pre class="code">curl -fsS -X PUT "http://127.0.0.1:9200/offline-demo" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"body":{"type":"semantic_text"}}}}'
-curl -fsS -X POST 'http://127.0.0.1:9200/offline-demo/_doc/1?refresh=true' \
+curl -fsS -X POST "http://127.0.0.1:9200/offline-demo/_doc/1?refresh=true" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"body":"A local lexical node can answer this without a network service."}'
-curl -fsS -X POST http://127.0.0.1:9200/offline-demo/_search \
+curl -fsS -X POST "http://127.0.0.1:9200/offline-demo/_search" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"query":{"semantic":{"field":"body","query":"local lexical"}}}'</pre>
   <p>Repeat health and query after restarting the same data directory. For the stronger boundary check, run the sequence with host egress disabled and inspect firewall/log counters; this recipe does not claim that test was run here.</p>
@@ -182,15 +243,17 @@ curl -fsS -X POST http://127.0.0.1:9200/offline-demo/_search \
 
   <h2>Existing data directories and local clients</h2>
   <p>WAL tap is disabled by default, but <code class="inline">PUT /_xerj/wal_tap</code> persists a runtime overlay and reapplies it over TOML on restart. Inspect and remove an old overlay before reusing a data directory:</p>
-<pre class="code">curl -fsS -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap
-curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" http://127.0.0.1:9200/_xerj/wal_tap</pre>
+<pre class="code">curl -fsS -H "Authorization: ApiKey $KEY" \
+  http://127.0.0.1:9200/_xerj/wal_tap
+curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" \
+  http://127.0.0.1:9200/_xerj/wal_tap</pre>
   <p>Cluster mode remains disabled unless explicitly enabled and supplied a shared <code class="inline">cluster.auth_secret</code>. <code class="inline">xerj mcp</code> is a local stdio client to <code class="inline">XERJ_URL</code>; <code class="inline">xerj autoindex</code> also defaults to the local ES-compatible endpoint. Neither creates an external listener or silently uploads corpus data.</p>
 
   <h2>What this recipe does not promise</h2>
   <ul>
     <li>Release <code class="inline">.sha256</code> files provide integrity, not signing or attestation.</li>
     <li>XERJ does not independently checksum the Hugging Face model files.</li>
-    <li>The Console falls back to system fonts, but its three external Google Fonts link elements remain browser egress attempts unless deployment removes or rewrites that HTML; stylesheet may fetch additional font files.</li>
+    <li>The Console falls back to system fonts, but its nine external Google Fonts link elements &mdash; three in each of <code class="inline">index.html</code>, <code class="inline">login.html</code>, and <code class="inline">setup.html</code> &mdash; remain browser egress attempts unless deployment removes or rewrites all three documents; the stylesheet may fetch additional font files.</li>
     <li>This is a traced procedure, not a live disconnected-firewall run or measured browser-egress claim.</li>
   </ul>
   <p>Related: <a href="/docs/operations.html">production operations</a>, <a href="/docs/config.html">configuration reference</a>, <a href="https://github.com/xerj-org/xerj/blob/main/docs/EXPERIMENTAL_ONNX.md">experimental ONNX backend</a>, and <a href="https://github.com/xerj-org/xerj/blob/main/metrics/README.md">metrics privacy posture</a>.</p>
