@@ -183,8 +183,9 @@ struct MemEntry {
 
 /// Reconstruct the (field_name → flattened text) map that pre-M4.9
 /// `MemEntry` used to cache eagerly at ingest time.  Called only by
-/// flush (`drain_with_sources`, `drain`) and by the rare
-/// `get_source` query path — neither is on the hot ingest loop.
+/// the legacy `drain_with_sources` / `drain` / `get_source` paths, which
+/// are NOT the segment-FTS input path — use
+/// [`extract_field_values_excluding`] for anything that will be indexed.
 pub fn extract_text_fields_from(source: &Value) -> HashMap<String, String> {
     extract_text_fields_from_excluding(source, &std::collections::HashSet::new())
 }
@@ -193,19 +194,112 @@ pub fn extract_text_fields_from_excluding(
     source: &Value,
     excluded: &std::collections::HashSet<String>,
 ) -> HashMap<String, String> {
+    extract_field_values_excluding(source, excluded)
+        .into_iter()
+        .map(|(k, v)| (k, v.iter().collect::<Vec<_>>().join(" ")))
+        .collect()
+}
+
+/// Extract the top-level source fields as the segment-FTS writer wants them:
+/// one [`FieldValues`] per field, with a JSON **array preserved as N separate
+/// values** rather than joined into one string.
+///
+/// This is the single walker feeding both segment-build paths — the flush path
+/// (`do_flush_shard` → `add_documents_parallel`) and the merge path
+/// (`run_merge_once`).  Before #332 each path had its own copy
+/// (`memtable::extract_text_value` and `index::extract_field_text`), and both
+/// copies did `arr.join(" ")`, so `{"tags":["red","blue"]}` was indexed by the
+/// keyword analyzer as the single term `"red blue"` — matching neither `red`
+/// nor `blue`.
+///
+/// It also carries #328's nested-exclusion pruning, which the merge path's own
+/// copy used to do inline: a field whose value is an OBJECT with an excluded
+/// descendant (a `dense_vector` mapped at `passages.vec`) is flattened from a
+/// PRUNED copy of that object, so the segment builder never resurrects the
+/// vector's decimal components as a term under the parent's name. Unifying the
+/// two paths onto this walker would otherwise have dropped that pruning on the
+/// merge path (`.passages.fst` back to ~398 KB); doing it here gives it to the
+/// flush path too, matching the live-insert path (`collect_text_fields`). It
+/// only fires for objects, so #332's array handling is untouched.
+pub fn extract_field_values_excluding(
+    source: &Value,
+    excluded: &std::collections::HashSet<String>,
+) -> HashMap<String, xerj_fts::index::FieldValues> {
+    use xerj_fts::index::FieldValues;
     let mut out = HashMap::new();
     if let Some(obj) = source.as_object() {
         for (key, val) in obj {
             if excluded.contains(key) {
                 continue;
             }
-            let text = extract_text_value(val);
-            if !text.is_empty() {
-                out.insert(key.clone(), text);
+            // #328 — object field with an excluded descendant: flatten a pruned
+            // copy so a nested `dense_vector` cannot leak into the parent
+            // object's term dictionary. Arrays never enter this arm, so the
+            // #332 split below still owns every multi-valued keyword field.
+            if val.is_object() && has_excluded_descendant(key, excluded) {
+                let text = extract_text_value_excluding(val, key, excluded);
+                if !text.is_empty() {
+                    out.insert(key.clone(), FieldValues::One(text));
+                }
+                continue;
+            }
+            if let Some(values) = extract_field_values(val) {
+                out.insert(key.clone(), values);
             }
         }
     }
     out
+}
+
+/// Convert one JSON value into the values the FTS writer should index for it.
+///
+/// * scalars → `One`
+/// * arrays → one entry per element, recursively flattened (a nested array is
+///   itself multi-valued in ES; an object element is JSON-encoded as before)
+/// * objects → `One(json)`, unchanged: the root-level JSON blob that
+///   flattened-style whole-object queries rely on
+/// * `null` / empty → `None`, i.e. the field is not indexed for this doc
+///
+/// Empty strings are dropped INSIDE an array too — the pre-#332 code produced
+/// them only as a by-product of `join(" ")` on `[null, "x"]`, and an empty
+/// keyword token would otherwise become a real, matchable term.
+fn extract_field_values(val: &Value) -> Option<xerj_fts::index::FieldValues> {
+    use xerj_fts::index::FieldValues;
+    match val {
+        Value::Array(arr) => {
+            let mut values: Vec<String> = Vec::with_capacity(arr.len());
+            collect_array_values(arr, &mut values);
+            if values.is_empty() {
+                None
+            } else {
+                Some(FieldValues::from_values(values))
+            }
+        }
+        _ => {
+            let text = extract_text_value(val);
+            if text.is_empty() {
+                None
+            } else {
+                Some(FieldValues::One(text))
+            }
+        }
+    }
+}
+
+fn collect_array_values(arr: &[Value], out: &mut Vec<String>) {
+    for element in arr {
+        match element {
+            // A nested array contributes its own elements as separate values —
+            // ES flattens arrays of arrays for indexing purposes.
+            Value::Array(inner) => collect_array_values(inner, out),
+            _ => {
+                let text = extract_text_value(element);
+                if !text.is_empty() {
+                    out.push(text);
+                }
+            }
+        }
+    }
 }
 
 /// Interned document identifier.
@@ -1422,7 +1516,12 @@ impl ShardedFtsMemtable {
     /// path. Newer writes must be filtered by the caller before restoration.
     pub(crate) fn restore_failed_flush(
         &self,
-        entries: Vec<(u64, String, HashMap<String, String>, Arc<Value>)>,
+        entries: Vec<(
+            u64,
+            String,
+            HashMap<String, xerj_fts::index::FieldValues>,
+            Arc<Value>,
+        )>,
         version_map: &xerj_storage::version_map::VersionMap,
     ) {
         for (seq_no, doc_id, fields, source) in entries {
@@ -1446,9 +1545,20 @@ impl ShardedFtsMemtable {
                 .get_analyzer("default")
                 .or_else(|| shard.registry.get_analyzer("standard"))
                 .expect("standard analyzer always present");
+            // Each value of a multi-valued field is analyzed on its own and the
+            // token streams concatenated (#332). The memtable's postings carry
+            // term frequencies only — no positions — so no position gap is
+            // needed here; the gap lives in the segment writer, which is where
+            // positions exist.
             let analyzed: Vec<(String, Vec<Token>)> = fields
                 .into_iter()
-                .map(|(field, text)| (field, analyzer.analyze(&text)))
+                .map(|(field, values)| {
+                    let tokens = values
+                        .iter()
+                        .flat_map(|value| analyzer.analyze(value))
+                        .collect();
+                    (field, tokens)
+                })
                 .collect();
             let size = (source.to_string().len() + doc_id.len()) * 3 + 64;
             shard.insert_analyzed(seq_no, doc_id, source, &analyzed, size);
@@ -1672,6 +1782,28 @@ impl ShardedFtsMemtable {
         Some((counts, missing))
     }
 
+    /// True when ANY shard's single-valued doc-values column for `field` is
+    /// lossy, so no shard's column may be trusted for whole-value matching.
+    ///
+    /// #332 — the per-shard `doc_values_term_query` / `doc_values_terms_query`
+    /// return `None` for two very different reasons: "this shard holds no
+    /// column for the field" (a true zero-match answer) and "this shard's
+    /// column cannot answer" (array-valued → first element only;
+    /// analyzed-text → whitespace values). The cross-shard wrappers below
+    /// could not tell them apart and folded a REFUSAL into "zero hits here",
+    /// so a two-shard memtable with `{"tags":["red","blue"]}` in shard A and
+    /// `{"tags":"red"}` in shard B answered `term tags:red` with shard B's
+    /// doc only. `doc_values_bool_query` already propagates a per-shard
+    /// refusal globally (`?` inside its loop); this makes the single-leaf
+    /// wrappers behave the same way.
+    fn dv_column_unusable(&self, field: &str) -> bool {
+        self.shards.iter().any(|s| {
+            let g = s.read();
+            g.doc_values.array_fields.contains(field)
+                || g.doc_values.keyword_has_whitespace.contains(field)
+        })
+    }
+
     /// DocValues term query — aggregates hits across all shards.
     /// Returns `Some(Vec<(doc_id, local_idx)>)` if any shard matched.
     /// The `local_idx` is shard-local; callers use the doc_id to
@@ -1682,6 +1814,9 @@ impl ShardedFtsMemtable {
         value: &str,
         limit: usize,
     ) -> Option<(Vec<(String, usize)>, u64)> {
+        if self.dv_column_unusable(field) {
+            return None;
+        }
         let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
@@ -1719,6 +1854,11 @@ impl ShardedFtsMemtable {
     ) -> Option<(Vec<(String, usize)>, u64)> {
         // #191 — per-shard bound + global `(seq_no, _id)` narrowing, as in
         // `doc_values_term_query`.
+        // #332 — one lossy shard poisons the whole field; see
+        // `dv_column_unusable`.
+        if self.dv_column_unusable(field) {
+            return None;
+        }
         let mut cands: Vec<(u64, String, usize)> = Vec::new();
         let mut total: u64 = 0;
         let mut any_hit = false;
@@ -3174,6 +3314,19 @@ impl FtsMemtable {
     /// a bool of term+range predicates matches the same doc set the
     /// per-child queries would intersect to — without intermediate
     /// per-child hit vectors.
+    ///
+    /// #332 — the array bailout is part of "mirror the standalone paths
+    /// exactly" and was MISSING here: `doc_values_term_query`,
+    /// `doc_values_terms_query` and `filtered_docs_arc` all refuse a field
+    /// that has ever carried an array, because `push_field` stores only the
+    /// array's FIRST element in these single-valued columns. This walk did
+    /// not, so it answered a bare `term` on a multi-valued keyword field
+    /// from the lossy column and silently dropped every doc whose match was
+    /// in a non-first element (`{"tags":["red","blue"]}` → `term tags:blue`
+    /// = 0 hits) for as long as the doc stayed memtable-resident. It is the
+    /// arm a plain `term` search actually takes (`is_doc_scan_query` →
+    /// fused columnar, ahead of `try_doc_values_query`), so the standalone
+    /// path's bailout never got a chance to fire.
     pub fn doc_values_bool_hits(
         &self,
         preds: &[MemBoolPred],
@@ -3194,6 +3347,12 @@ impl FtsMemtable {
         for p in preds {
             match p {
                 MemBoolPred::Term { field, value } => {
+                    // Array-valued field: the column is lossy (first element
+                    // only) → bail so a later matching element can't be
+                    // dropped (#332; mirrors `filtered_docs_arc`).
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
                     if let Some(col) = self.doc_values.keyword.get(field.as_str()) {
                         // Step 2: analyzed-text bailout via the insert-time
                         // cached flag instead of an O(N) per-query column
@@ -3221,6 +3380,9 @@ impl FtsMemtable {
                     lte,
                     lt,
                 } => {
+                    if self.doc_values.array_fields.contains(field.as_str()) {
+                        return None;
+                    }
                     let col = self.doc_values.numeric.get(field.as_str())?;
                     cols.push(Col::Num(col, *gte, *gt, *lte, *lt));
                 }
