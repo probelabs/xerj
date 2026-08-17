@@ -8910,12 +8910,33 @@ async fn search_impl(
             single => (knn_spec_to_query_json(single), knn_clause_k(single)),
         };
         let merged_query = if let Some(ref existing_q) = body.query {
-            // Hybrid: combine knn + query as a bool should.
+            // ES 8.x canonical hybrid: a top-level `knn` block beside a
+            // `query`. This used to fold to `{"bool":{"should":[query, knn]}}`
+            // — and the engine never dispatched it to the vector path, because
+            // `peel_knn_query` only peels a bool holding exactly ONE clause.
+            // Two clauses, so it fell through to the generic lexical path and
+            // the kNN half contributed NOTHING: the request answered 200 with
+            // the purely lexical result set, `_shards.failed: 0`, no warning
+            // (#395). Measured on a 3-document index: `query` alone returned
+            // documents 0 and 2, `knn` alone returned 0, 1 and 2, and the two
+            // together returned exactly 0 and 2 — the lexical answer wearing a
+            // hybrid request's clothes, which is a wire-compat divergence from
+            // ES 8.x and not merely an internal limitation.
+            //
+            // `hybrid` is the shape this engine actually combines: it fans each
+            // sub-query out as its own search and fuses the ranked lists, which
+            // is what ES does for `knn` beside `query`. Scores are RRF rather
+            // than a score sum, so absolute `_score` values differ from ES —
+            // that is a visible difference, and it is strictly better than
+            // returning the wrong documents in silence. The sibling branch
+            // above already refuses multi-knn-plus-query loudly rather than
+            // dropping it; this is the same principle applied to the case that
+            // was quietly wrong instead of loudly unsupported.
             json!({
-                "bool": {
-                    "should": [
-                        existing_q,
-                        knn_query_json
+                "hybrid": {
+                    "queries": [
+                        { "query": existing_q },
+                        { "query": knn_query_json }
                     ]
                 }
             })
