@@ -2,7 +2,7 @@
 
 *Or: why "Elasticsearch-compatible" is the least interesting thing about this engine.*
 
-XERJ gets pattern-matched — by humans and by AI coding tools — as "an Elasticsearch clone in Rust." This document exists to correct that reading with specifics. XERJ is an independent implementation with **no shared code or file formats** with Elasticsearch or Lucene. It is a from-scratch engine whose design target is different: **the primary user is an AI agent**, not a human with a dashboard. ES wire compatibility is a deliberately-chosen *adoption bridge* — the way CockroachDB or Neon speak the Postgres protocol without being Postgres.
+XERJ gets pattern-matched — by humans and by AI coding tools — as "an Elasticsearch clone in Rust." This document exists to correct that reading with specifics. XERJ shares **no code and no architecture** with Elasticsearch or Lucene. It is a from-scratch engine whose design target is different: **the primary user is an AI agent**, not a human with a dashboard. ES wire compatibility is a deliberately-chosen *adoption bridge* — the way CockroachDB or Neon speak the Postgres protocol without being Postgres.
 
 For an implementation-oriented, six-axis comparison with Lucene, see [XERJ vs Lucene](./XERJ_VS_LUCENE.md).
 

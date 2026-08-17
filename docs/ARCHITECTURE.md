@@ -9,8 +9,8 @@ build/run/test commands and the supported ES surface.
 XERJ is an AI-native search, vector, and log-analytics engine written from
 scratch in Rust and published under Apache-2.0 — designed for AI-agent workloads
 (zero-config `autoindex` onboarding, agent data map, `/_memory`), with an
-independent implementation and no shared code or file formats with Elasticsearch
-or Lucene. It additionally speaks the
+independent implementation that shares no code and no architecture with
+Elasticsearch or Lucene. It additionally speaks the
 Elasticsearch 8.x HTTP protocol as a zero-migration adoption bridge, so existing
 ES clients, dashboards, and ingest tooling talk to it unchanged (see
 [WHY_XERJ.md](./WHY_XERJ.md) for the design rationale). For a six-axis,
@@ -96,8 +96,8 @@ segments that are later merged:
 ```
 PUT /{index}/_doc/{id}   or   POST /_bulk
     → xerj-api → xerj-engine → xerj-storage (IndexStore)
-         ├─ WAL append          exact selected N Mutex<WalWriter>s; global AtomicU64 seq_no
-         ├─ storage memtable    max(N, 1).next_power_of_two() hash partitions
+         ├─ WAL append          sharded Mutex<WalWriter>s; global AtomicU64 seq_no
+         ├─ storage memtable    rounded power-of-two hash partitions
          ├─ FTS memtable        global engine.ingest_shards hash partitions
          ├─ flush               Index::flush() fans out per-shard do_flush_shard tasks;
          │                      each drains its shard and writes an immutable segment
@@ -107,22 +107,19 @@ PUT /{index}/_doc/{id}   or   POST /_bulk
 ```
 
 The global `engine.ingest_shards` value is validated as a non-zero power of two
-no greater than 256 ([global validation](../engine/crates/xerj-common/src/config.rs#L1512-L1570)).
-An index may instead select its WAL count with `index.xerj_ingest_shards`; that
-override accepts any integer in `1..=256`, not only powers of two, and an absent
-or invalid override falls back to the global value ([override parsing](../engine/crates/xerj-engine/src/index.rs#L28488-L28517)).
-`IndexStore` opens exactly that selected number `N` of WAL writers, all sharing
-one global `seq_counter: AtomicU64`, while its separate storage memtable rounds
-`N` up to the next power of two for hash-mask routing ([construction](../engine/crates/xerj-storage/src/index_store.rs#L660-L720),
-[routing](../engine/crates/xerj-storage/src/index_store.rs#L1607-L1643)). These
-counts are therefore not necessarily paired one-to-one. The engine-side FTS
-memtable is separate again: create and reopen pass the global
-`engine.ingest_shards`, not the per-index WAL override, into
-[`ShardedFtsMemtable`](../engine/crates/xerj-engine/src/memtable.rs#L628-L709)
-([create](../engine/crates/xerj-engine/src/index.rs#L6022-L6026),
-[reopen](../engine/crates/xerj-engine/src/index.rs#L6220-L6224)).
+no greater than 256 ([global validation](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-common/src/config.rs#L1512-L1570)).
+`IndexStore` keeps its WAL writers and storage memtable in separate shard
+domains; the storage memtable rounds its configured count up to the next power
+of two for hash-mask routing ([construction](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-storage/src/index_store.rs#L660-L720),
+[routing](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-storage/src/index_store.rs#L1607-L1643)). The WAL-writer
+and rounded storage-memtable counts are distinct domains, not a promised
+one-to-one pairing. The engine-side FTS memtable is separate again: create and
+reopen pass the global `engine.ingest_shards` into
+[`ShardedFtsMemtable`](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-engine/src/memtable.rs#L628-L709)
+([create](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-engine/src/index.rs#L6022-L6026),
+[reopen](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-engine/src/index.rs#L6220-L6224)).
 Query paths iterate its shards, and production flush drains each FTS shard
-through [`Index::flush`](../engine/crates/xerj-engine/src/index.rs#L18002-L18125)/[`do_flush_shard`](../engine/crates/xerj-engine/src/index.rs#L24433-L24920).
+through [`Index::flush`](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-engine/src/index.rs#L18012-L18147)/[`do_flush_shard`](https://github.com/xerj-org/xerj/blob/24711999dd866ceec2a6e7c91d934c2c27d7066c/engine/crates/xerj-engine/src/index.rs#L24433-L24920).
 
 ### Recovery
 

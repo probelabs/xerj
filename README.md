@@ -295,6 +295,8 @@ including the limits each one does not lift:
   subset of the snapshot API, and what restore replaces.
 - [Security model](./docs/SECURITY_MODEL.md) for authentication, the reserved
   `.xerj-memory-*` namespace, API keys and what is not enforced.
+- [XERJ vs Lucene 10.3.1](./docs/XERJ_VS_LUCENE.md) for a source-pinned,
+  six-axis comparison of their storage and search designs.
 
 ## Contributing
 
