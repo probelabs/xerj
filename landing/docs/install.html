@@ -143,19 +143,36 @@
 
   <h2>Manual download</h2>
   <p>Every release publishes eight targets, each with a <code class="inline">.sha256</code> alongside: <code class="inline">x86_64</code>/<code class="inline">aarch64</code> × <code class="inline">unknown-linux-musl</code> (static, any distro), <code class="inline">unknown-linux-gnu</code>, <code class="inline">apple-darwin</code>, and <code class="inline">pc-windows-msvc</code> (.zip).</p>
-<pre class="code">$ ver=$(curl -fsSL https://api.github.com/repos/xerj-org/xerj/releases/latest | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
-$ asset=xerj-${ver}-x86_64-unknown-linux-musl.tar.gz
-$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/${asset}
-$ curl -fsSLO https://github.com/xerj-org/xerj/releases/download/v${ver}/${asset}.sha256
-$ want=$(sha256sum "$asset" | cut -d ' ' -f 1)          # macOS: shasum -a 256 "$asset" | cut -d ' ' -f 1
-$ if tr -d '\r' &lt; "$asset.sha256" | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset"; then
-&gt;   tar xzf "$asset"
-&gt; else
-&gt;   echo "CHECKSUM MISMATCH for $asset — do not install it"
-&gt; fi
-$ sudo install -m 0755 xerj-${ver}-x86_64-unknown-linux-musl/xerj /usr/local/bin/xerj
-$ xerj --version</pre>
+  <p>Paste the whole block. It runs in a subshell, so a refusal ends the block and not your shell:</p>
+<pre class="code">(
+  set -eu
+
+  ver=$(curl -fsSL https://api.github.com/repos/xerj-org/xerj/releases/latest \
+    | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+  stage="xerj-${ver}-x86_64-unknown-linux-musl"
+  asset="${stage}.tar.gz"
+  base="https://github.com/xerj-org/xerj/releases/download/v${ver}"
+
+  curl -fsSLO "$base/$asset"
+  curl -fsSLO "$base/$asset.sha256"
+
+  want=$(sha256sum "$asset" | cut -d ' ' -f 1)   # macOS: shasum -a 256 "$asset" | cut -d ' ' -f 1
+  case "$want" in *[!0-9a-f]*|"") want="" ;; esac
+  if [ "${#want}" -ne 64 ]; then
+    echo "no working SHA-256 tool — refusing to install an unverified $asset" &gt;&amp;2
+    exit 1
+  fi
+
+  tr -d '\r' &lt; "$asset.sha256" \
+    | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
+    || { echo "CHECKSUM MISMATCH for $asset — do not install it" &gt;&amp;2; exit 1; }
+
+  tar xzf "$asset"
+  sudo install -m 0755 "$stage/xerj" /usr/local/bin/xerj
+  xerj --version
+)</pre>
   <p>The digest is computed here and the <code class="inline">.sha256</code> is searched for that exact line, rather than letting <code class="inline">sha256sum -c</code> read a filename out of a file that arrived from the same place as the archive. <code class="inline">sha256sum -c</code> skips <code class="inline">#</code> comment lines silently and exits <code class="inline">0</code> if any one line verified, so a <code class="inline">.sha256</code> carrying a valid digest for some other file passes while the archive is never hashed at all. Both patterns accept GNU text mode and <code class="inline">-b</code> binary mode, and <code class="inline">tr -d '\r'</code> accepts a checksum file written on Windows.</p>
+  <p>Three details carry the weight. <strong>The digest is length- and hex-checked before it is used.</strong> Without that, a host with no <code class="inline">sha256sum</code> — stock macOS, which is exactly who the comment above sends to <code class="inline">shasum</code> — leaves <code class="inline">want</code> empty, the two patterns collapse to <code class="inline">"  $asset"</code> and <code class="inline">" *$asset"</code>, and a <code class="inline">.sha256</code> containing that literal line satisfies the check with nothing hashed. <strong>Extraction and install are inside the guard</strong>, not after it: an earlier version of this page printed the mismatch and then ran <code class="inline">sudo install</code> on the next line, which installs whatever an older extraction left behind. <strong>A refusal exits non-zero</strong>, so a Dockerfile <code class="inline">RUN</code>, a CI step, or an agent sees the failure instead of a silent success.</p>
   <p>Deploying to a host with no runtime internet access? Follow the <a href="/docs/recipes/air-gapped-deployment.html">air-gapped deployment recipe</a> for release checksums, optional local neural model files, and the loopback/auth defaults.</p>
   <p><strong>macOS Gatekeeper:</strong> the release binaries are not code-signed or notarized. A tarball fetched with <code class="inline">curl</code> (both the one-liner and the commands above) is not quarantined and runs as-is. A tarball downloaded through a <em>browser</em> is: macOS attaches <code class="inline">com.apple.quarantine</code> and the first launch is blocked with <em>"cannot be opened because the developer cannot be verified"</em>. Clear it once, then run normally:</p>
 <pre class="code">$ xattr -d com.apple.quarantine ./xerj</pre>
