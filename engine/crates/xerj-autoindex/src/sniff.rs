@@ -578,13 +578,31 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // and the chain is not.
                         //
                         // Given that, a FULL buffer answers image. A SHORT one
-                        // means the file ended mid-chain, and there the canvas
-                        // rule from round 4 is asked — not as a discriminator
-                        // for GIFs in general, which is what it was refused
-                        // for, but for the one case it can settle: a complete
-                        // GIF terminates its comment, so a chain still running
-                        // at EOF is a truncated file, and the canvas says
-                        // whether it was an image before it was cut.
+                        // asks the canvas rule from round 4.
+                        //
+                        // Be exact about which files that rule sees, because an
+                        // earlier version of this comment was not. It said the
+                        // short-buffer arm only judges TRUNCATED files, on the
+                        // reasoning that a complete GIF terminates its comment.
+                        // The half about GIFs is true; the half about the
+                        // population is false, and the file says why thirty
+                        // lines up: the walk stops only on a NUL, and text has
+                        // none, so ANY text file that clears the header gate
+                        // runs its chain to EOF and lands here — at 3 KB as
+                        // readily as at 3 MB. It is then called an image
+                        // whenever `prefix[7]` or `prefix[9]` is a control byte
+                        // other than \t, \n or \r. Measured: the same prose
+                        // with 0x0B, 0x0C or 0x1B at offset 7 is Binary at
+                        // 3,000 / 20,000 / 600,000 bytes, and with 0x0A stays
+                        // TxtProse at all three.
+                        //
+                        // So there are two independent paths to "image" and
+                        // only one of them is size-gated. The cost stated below
+                        // as "10 corpus text files above the budget" is the
+                        // full-buffer path's cost alone; the canvas path adds
+                        // prose with a control byte in a canvas high slot, at
+                        // any size, and no corpus file exercises it because the
+                        // negatives were built with `\n` there.
                         //
                         // That composition is measured against the budget test
                         // alone, not assumed. Identical on every set that
@@ -600,7 +618,10 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // canvas fallback 11 of 13 truncated real images go to
                         // the prose extractor. A file mid-copy in a watched
                         // directory is that shape, and `sniff` runs on live
-                        // paths (lib.rs:1151, 4258).
+                        // paths (lib.rs:1151, 4258). That is a real gain, paid
+                        // for with a text cost that has no size floor — the
+                        // trade, stated whole rather than at its flattering
+                        // end.
                         //
                         // Answering image unconditionally on a short buffer
                         // instead (round 2's rejected `true`) junks 10 corpus
@@ -2349,9 +2370,62 @@ mod printable_magic_tests {
         }
     }
 
-    /// `GIF_PREFIX` is the whole rule, so pin it to a fixed byte count rather
-    /// than to itself. Both fixtures above are written in terms of the constant
+    /// `GIF_PREFIX` bounds the FULL-buffer path, so pin it to a fixed byte
+    /// count rather than to itself.
+    ///
+    /// It is not "the whole rule" — the comment here used to say that, and
+    /// `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`
+    /// above is why it is not. This fixture reaches the budget path only
+    /// because `\n` at offset 7 keeps it off the canvas path; that is an
+    /// accident of the fixture, not a property of the rule, and it is written
+    /// down here so the next person to widen the text cost does not read this
+    /// test as a safety net it is not. Both fixtures above are written in terms of the constant
     /// and track any change to it; without this, `>= 300_000` passes the suite.
+    /// The canvas path's cost, which has NO size floor — pinned because the
+    /// two tests below are green only by accident of their fixtures.
+    ///
+    /// Both use `\n` at offset 7, and `\n` is one of the three control bytes
+    /// `canvas_dimension_text_cannot_write` deliberately excludes, so neither
+    /// of them ever reaches the canvas path they were written to bound. Any
+    /// other control byte there makes the same prose an image at any size.
+    #[test]
+    fn the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it() {
+        let p = Path::new("notes.txt");
+        let build = |high: u8, size: usize| {
+            let mut v: Vec<u8> = b"GIF89ax".to_vec();
+            v.push(high);
+            v.extend_from_slice(b"yzest");
+            v.push(b'!');
+            v.push(0xfe);
+            v.push(b'L');
+            while v.len() < size {
+                v.extend_from_slice("Le format GIF reste partout sur le web. ".as_bytes());
+            }
+            v.truncate(size);
+            v
+        };
+        for size in [3_000usize, 20_000, 600_000] {
+            for high in [0x0bu8, 0x0c, 0x1b] {
+                assert_eq!(
+                    sniff_bytes(&build(high, size), p, p, false).unwrap().family,
+                    Family::Binary,
+                    "prose with control byte {high:#04x} at offset 7 is called an \
+                     image at {size} bytes — the canvas path is not size-gated, \
+                     and any statement of this rule's cost that says \"above the \
+                     budget\" is describing only the other half"
+                );
+            }
+            assert_eq!(
+                sniff_bytes(&build(b'\n', size), p, p, false)
+                    .unwrap()
+                    .family,
+                Family::TxtProse,
+                "\\n at offset 7 is excluded, which is the ONLY reason the two \
+                 tests below look like they bound anything"
+            );
+        }
+    }
+
     #[test]
     fn the_budget_is_the_threshold_it_claims() {
         let mut prose: Vec<u8> = b"GIF89ax".to_vec();
