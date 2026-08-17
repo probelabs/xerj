@@ -9180,15 +9180,23 @@ async fn search_impl(
     // filter. The combined filter is also handed to run_aggs via the
     // background corpus (covered by the query's filter path already).
     {
+        // Built from the names as WRITTEN, not from `index_names`. Expanding
+        // an alias to its concrete members (#433) removes the alias name from
+        // that list, and this lookup matches on the alias name — so reading it
+        // from the expanded list silently dropped every filtered alias's
+        // filter. `global_with_aliases.yml` caught exactly that.
         let mut alias_filters: Vec<Value> = Vec::new();
-        for name in &index_names {
+        for name in &resolved_names_owned {
             for entry in state.engine.aliases.iter() {
                 if entry.key() != name {
                     continue;
                 }
                 for backing in entry.value().iter() {
                     if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
-                        if let Some(filter) = meta.get(*name).and_then(|v| v.get("filter")).cloned()
+                        if let Some(filter) = meta
+                            .get(name.as_str())
+                            .and_then(|v| v.get("filter"))
+                            .cloned()
                         {
                             alias_filters.push(filter);
                         }
