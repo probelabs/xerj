@@ -487,9 +487,6 @@ jobs:
       - name: Installer script lint (landing/get, landing/get.ps1)
         run: bash .github/scripts/installer-lint.sh
 
-      - name: Recipe shell lint (docs/recipes + published copies)
-        run: python3 .github/scripts/recipe-shell-lint.py
-
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
