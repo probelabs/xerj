@@ -603,17 +603,30 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // as "10 corpus text files above the budget" is the
                         // full-buffer path's cost alone; the canvas path adds
                         // prose with a control byte in a canvas high slot, at
-                        // any size, and no corpus file exercises it — but not
-                        // for the reason an earlier version of this comment
-                        // gave. It said the negatives were built with `\n` in
-                        // that slot. They were not: of the 264 GIF-magic text
-                        // negatives, ZERO carry 0x0A at offset 7 or 9, and zero
-                        // carry any byte below 0x20 there at all. The canvas
-                        // high bytes are ordinary printable prose — 'b' x194,
-                        // 'e' x26 at offset 7; 'd' x180, 't' x26 at offset 9 —
-                        // so the corpus misses this path by having no control
-                        // byte anywhere near the canvas, which is a property of
-                        // English text and not of how the fixtures were built.
+                        // any size, and no corpus file exercises it. Two
+                        // explanations for that have now been wrong, so this
+                        // one states only what was counted and stops.
+                        //
+                        // Of the 264 GIF-magic text negatives, ZERO carry 0x0A
+                        // at offset 7 or 9, and zero carry any byte below 0x20
+                        // there. The distribution is 'b' x194 / 'e' x26 at
+                        // offset 7 and 'd' x180 / 't' x26 at offset 9, and 180
+                        // of the files carry the literal bytes `abcd` at 6..9 —
+                        // because the generator splices `filler = a,b,c,d,…`
+                        // straight after the magic (build_text.py:199). So the
+                        // frequencies are the builder's alphabet, NOT "ordinary
+                        // prose" as an earlier version of this comment claimed,
+                        // and certainly not a property of English: the corpus
+                        // deliberately includes Spanish, French, Russian,
+                        // Chinese, Greek, Hebrew and Arabic negatives.
+                        //
+                        // Every one of these files is synthetic — nothing in
+                        // real prose opens with GIF magic — and the builder
+                        // chose what follows it. No fixture family was ever
+                        // built to put a control byte at 7 or 9, so the corpus
+                        // has no power to see this path. That is a fact about
+                        // its construction, and there is no further mechanism
+                        // to infer.
                         //
                         // That composition is measured against the budget test
                         // alone, not assumed. Identical on every set that
@@ -2381,32 +2394,15 @@ mod printable_magic_tests {
         }
     }
 
-    /// `GIF_PREFIX` bounds the FULL-buffer path, so pin it to a fixed byte
-    /// count rather than to itself.
-    ///
-    /// This fixture reaches that path only because `\n` at offset 7 keeps it
-    /// off the canvas path — an accident of the fixture, not a property of the
-    /// rule. `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`
-    /// pins the path this one cannot see, and says so there rather than here.
-    ///
-    /// It is not "the whole rule" — the comment here used to say that, and
-    /// `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`
-    /// above is why it is not. This fixture reaches the budget path only
-    /// because `\n` at offset 7 keeps it off the canvas path; that is an
-    /// accident of the fixture, not a property of the rule, and it is written
-    /// down here so the next person to widen the text cost does not read this
-    /// test as a safety net it is not. Both fixtures above are written in terms of the constant
-    /// and track any change to it; without this, `>= 300_000` passes the suite.
     /// The canvas path's cost, which has NO size floor.
     ///
-    /// The two tests below bound only the FULL-buffer path. They reach it
-    /// because their fixtures put `\n` at offset 7 — one of the three bytes
-    /// `canvas_dimension_text_cannot_write` excludes — so the canvas path never
-    /// fires for them. That is an accident of those fixtures, not a property of
-    /// the rule, and without this test nothing would pin the other path at all.
+    /// Without this test nothing pins that path at all: the two budget tests
+    /// below put `\n` at offset 7, which `canvas_dimension_text_cannot_write`
+    /// excludes, so the canvas rule never fires for them. That is an accident
+    /// of those fixtures, not a property of the rule.
     ///
-    /// Both offsets are exercised: the rule is `prefix[7] || prefix[9]`, and a
-    /// test that varied only one would let a future edit drop the other half
+    /// Both slots are exercised. The rule is `prefix[7] || prefix[9]`, and a
+    /// test varying only one would let a future edit drop the other half
     /// without failing anything.
     #[test]
     fn the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it() {
@@ -2461,6 +2457,17 @@ mod printable_magic_tests {
         }
     }
 
+    /// `GIF_PREFIX` bounds the FULL-buffer path, so pin it to a fixed byte
+    /// count rather than to itself — without this, `>= 300_000` passes the
+    /// suite.
+    ///
+    /// It is not "the whole rule". `full || canvas` has two independent paths
+    /// to "image" and only this one is size-gated; the canvas path is pinned by
+    /// `the_canvas_path_junks_prose_at_any_size_and_the_budget_does_not_bound_it`.
+    /// This fixture reaches the budget path only because `\n` at offset 7 keeps
+    /// it off the canvas path, which is an accident of the fixture — written
+    /// down so the next person to widen the text cost does not read this test
+    /// as a safety net it is not.
     #[test]
     fn the_budget_is_the_threshold_it_claims() {
         let mut prose: Vec<u8> = b"GIF89ax".to_vec();
