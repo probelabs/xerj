@@ -44,7 +44,10 @@ async fn call(app: &axum::Router, method: &str, path: &str, body: Value) -> (Sta
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 const PER_INDEX: usize = 40;
@@ -163,7 +166,10 @@ async fn a_scroll_through_an_alias_walks_every_member_and_labels_each_hit() {
             hits.push((
                 h["_index"].as_str().unwrap_or_default().to_string(),
                 h["_id"].as_str().unwrap_or_default().to_string(),
-                h["_source"]["home"].as_str().unwrap_or_default().to_string(),
+                h["_source"]["home"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
             ));
         }
         let Some(id) = sid.clone() else { break };
