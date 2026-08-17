@@ -19,6 +19,9 @@
 //! tonic's own `tls` feature (a second crypto backend beside axum-server's
 //! ring) is the open follow-up; documented in `docs/SECURITY_MODEL.md`.
 
+// Only the test-only `serve_grpc` takes an address now; the server hands in
+// a listener it already bound (issue #465).
+#[cfg(test)]
 use std::net::SocketAddr;
 
 use anyhow::Context;
@@ -400,10 +403,41 @@ impl tonic::service::Interceptor for GrpcAuth {
 /// acceptable for `addr` is decided before this is called (`main.rs` step 5b);
 /// this function does not re-check, so do not call it on a new code path
 /// without carrying that decision with you.
+/// Bind `addr` and serve. Kept for tests, which want the convenience of `:0`
+/// and do not care about startup ordering; the server binds up front via
+/// [`serve_grpc_on`] instead (issue #465).
+#[cfg(test)]
 pub async fn serve_grpc<F>(addr: SocketAddr, state: AppState, shutdown: F) -> anyhow::Result<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    let listener =
+        std::net::TcpListener::bind(addr).with_context(|| format!("gRPC: bind {addr}"))?;
+    listener
+        .set_nonblocking(true)
+        .with_context(|| format!("gRPC: set the listener on {addr} non-blocking"))?;
+    serve_grpc_on(listener, state, shutdown).await
+}
+
+/// Serve gRPC on a listener the caller already bound.
+///
+/// The server binds every listener before it prints its banner, so that a
+/// taken port fails startup instead of being logged under a banner that
+/// already claimed the port (issue #465). That requires handing the bound
+/// listener in rather than letting tonic bind it here.
+pub async fn serve_grpc_on<F>(
+    listener: std::net::TcpListener,
+    state: AppState,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let addr = listener
+        .local_addr()
+        .context("gRPC: read the bound address")?;
+    let listener =
+        tokio::net::TcpListener::from_std(listener).context("gRPC: adopt the bound listener")?;
     let interceptor = GrpcAuth {
         state: state.clone(),
     };
@@ -411,7 +445,10 @@ where
     info!("gRPC XerjSearch listening on {addr}");
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_shutdown(addr, shutdown)
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            shutdown,
+        )
         .await
         .context("gRPC transport error")?;
     Ok(())
