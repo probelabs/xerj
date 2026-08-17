@@ -20,9 +20,10 @@ an optional, separately staged path.
 
 The running node makes no telemetry, update-check, or license-activation call.
 Release-download analytics are a property of the connected website/GitHub
-staging surface, not of a running XERJ process. The installer also downloads a
-release archive and its checksum from GitHub; an offline operator must stage
-those files before entering the enclave.
+staging surface, not of a running XERJ process. Getting the software at all
+means downloading a release archive and its checksum from GitHub, which is why
+section 1 below runs on a connected machine: an offline operator must stage
+those two files before entering the enclave.
 
 ## Defaults and boundaries
 
@@ -39,10 +40,13 @@ those files before entering the enclave.
 | Runtime telemetry/update/license activation | None | No outbound call is made by the running binary for these purposes |
 
 This is a statement of defaults, not a claim that every browser UI request is
-offline. **The bundled Console has three external Google Fonts link elements
-(two preconnects and one stylesheet; stylesheet may fetch additional font files).**
-Blocked requests fall back to system fonts. The engine and APIs
-continue to work.
+offline. **The bundled Console is three embedded documents — `index.html`,
+`login.html`, and `setup.html`, served under `/_xerj-console/` — and each one
+carries the same three external Google Fonts link elements (two preconnects and
+one stylesheet; the stylesheet may fetch additional font files), so nine in
+total.** An operator rewriting that HTML has to patch all three; `login.html`
+and `setup.html` are the two a browser reaches first. Blocked requests fall back
+to system fonts. The engine and APIs continue to work.
 
 This procedure does not claim that egress was measured here. If your policy
 requires that boundary, apply an egress-deny rule and inspect firewall/log
@@ -59,26 +63,26 @@ the version without the `v` prefix, target triple, and extension. The matching
 The following stages the Linux x86_64 musl archive only.
 
 ```bash
-set -eu
-
-: "${TAG:?set TAG to an operator-approved vX.Y.Z release tag}"
-if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-  echo "TAG must match vX.Y.Z with optional prerelease/build metadata: $TAG" >&2
-  exit 2
-fi
-VERSION="${TAG#v}"
-TARGET="x86_64-unknown-linux-musl"
-EXT="tar.gz"
-STAGE="xerj-${VERSION}-${TARGET}"
-ASSET="${STAGE}.${EXT}"
-BASE="https://github.com/xerj-org/xerj/releases/download/${TAG}"
-OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
-
-mkdir -p "$OUT/release"
-curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
-curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
-
 (
+  set -eu
+
+  : "${TAG:?set TAG to an operator-approved vX.Y.Z release tag}"
+  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+    echo "TAG must match vX.Y.Z with optional prerelease/build metadata: $TAG" >&2
+    exit 2
+  fi
+  VERSION="${TAG#v}"
+  TARGET="x86_64-unknown-linux-musl"
+  EXT="tar.gz"
+  STAGE="xerj-${VERSION}-${TARGET}"
+  ASSET="${STAGE}.${EXT}"
+  BASE="https://github.com/xerj-org/xerj/releases/download/${TAG}"
+  OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
+
+  mkdir -p "$OUT/release"
+  curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
+  curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
+
   cd "$OUT/release"
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
@@ -87,9 +91,12 @@ curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
   fi
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
+
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
+  rm -rf "$STAGE"
+  echo "staged $ASSET ($want) in $OUT"
 )
 ```
 
@@ -99,8 +106,20 @@ independent signature, provenance statement, or attestation. If your policy
 requires signed releases or an external attestation, obtain and verify that
 evidence separately; `.sha256` alone does not provide it.
 
-After transfer, set the same approved `TAG` in the enclave and verify before
-extracting:
+`"$STAGE/xerj" --version` executes the staged binary, so this block wants a
+staging host of the same platform as the target — Linux x86_64 for the archive
+above. On any other staging host that one line fails, the block stops, and
+nothing is staged; drop it, or set `TARGET` to the triple you are actually
+staging. The extracted tree is removed either way: only the archive and its
+`.sha256` should cross the airgap, so that no unverified binary travels beside
+the verified one.
+
+**Transfer `$OUT` itself, and land it in the enclave at `/opt/xerj-staging`**,
+so that the archive is at `/opt/xerj-staging/release/` — that is the path the
+enclave blocks below read, and they are written as fixed paths on purpose, so
+that a mistyped variable cannot silently point the install at somewhere else.
+
+Then set the same approved `TAG` in the enclave and verify before extracting:
 
 ```bash
 (
@@ -139,8 +158,10 @@ extracting:
 )
 ```
 
-Three details here are load-bearing, and each replaces something that looked
-right and was not.
+Seven details here are load-bearing, and each replaces something that looked
+right and was not. The count has been wrong before: rounds of review added
+paragraphs without touching the number above them, so if you add an eighth,
+change this sentence in the same commit.
 
 **The digest is computed here and the file is searched for it, not the other way
 round.** `sha256sum -c` reads the filename out of the `.sha256` — a file that
@@ -160,7 +181,14 @@ checksum file written on Windows.
 **`set -eu` is inside the subshell.** At the top of the block it kills the
 operator's login shell on a bad digest — actively harmful over a serial console,
 where the natural recovery is to re-paste without it, which is the fail-open
-form. Inside, a failure ends the subshell and the operator keeps their session.
+form: with errexit gone, a failed `grep -qxF` no longer stops `tar -xzf`, and
+the block extracts and runs the archive it just refused. Inside, a failure ends
+the subshell and the operator keeps their session, so that pressure never
+arises. Every block on this page that decides something now has its `set -eu`
+inside its own parentheses; the two that must leave variables behind for a later
+paste — the verification blocks in section 4 — carry no `set -eu` at all, and
+use `curl -fsS`, which reports its own failures without arming errexit in the
+operator's session.
 
 **The archive is copied once, then hashed and extracted from that copy.** This
 is the defect eight earlier versions of this recipe shared without noticing.
@@ -256,6 +284,12 @@ written to `/var/lib/xerj/admin.key` with restrictive permissions.
 sudo -u xerj /opt/xerj/bin/xerj --config /etc/xerj/xerj.toml
 ```
 
+This runs in the foreground and stops when you log out, so it is a first-start
+check rather than a deployment. Section 4 needs the node reachable while you
+type into a shell: use a second terminal, or supervise it. The unit file is in
+[Operations](../../landing/docs/operations.html); this page deliberately does
+not carry a second copy of it to drift out of date.
+
 Keep the listener on loopback. A network-facing listener requires the separate
 production TLS/auth procedure; this recipe does not teach a cleartext opt-out.
 
@@ -266,24 +300,28 @@ machine, download the three files consumed by the built-in loader and checksum
 them for the transfer:
 
 ```bash
-set -eu
-
-: "${OUT:?run section 1 in this shell first, or set OUT to the staging directory}"
-MODEL="$OUT/model/all-MiniLM-L6-v2"
-mkdir -p "$MODEL"
-for FILE in config.json tokenizer.json model.safetensors; do
-  curl -fL --retry 3 -o "$MODEL/$FILE" \
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
-done
 (
+  set -eu
+
+  : "${OUT:?set OUT to the staging directory section 1 printed}"
+  MODEL="$OUT/model/all-MiniLM-L6-v2"
+  mkdir -p "$MODEL"
+  for FILE in config.json tokenizer.json model.safetensors; do
+    curl -fL --retry 3 -o "$MODEL/$FILE" \
+      "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/$FILE"
+  done
   cd "$MODEL"
   sha256sum config.json tokenizer.json model.safetensors > ../model.sha256
+  echo "staged all-MiniLM-L6-v2 in $MODEL"
 )
 ```
 
-Transfer `OUT/model` with the release. Verify it inside the enclave before
-installing anything — the same fail-closed rule as section 1, and the reason
-the check is a command here rather than a sentence:
+Section 1 runs in a subshell, so `OUT` does not survive it — set `OUT` here to
+the path that block printed. Transfer `$OUT/model` with the release, in the same
+`/opt/xerj-staging` directory, so that the files land at
+`/opt/xerj-staging/model/`. Verify them inside the enclave before installing
+anything — the same fail-closed rule as section 1, and the reason the check is a
+command here rather than a sentence:
 
 ```bash
 (
@@ -340,8 +378,6 @@ documentation was live-tested against a disconnected firewall. They verify the
 actual binary and local files in your enclave.
 
 ```bash
-set -eu
-
 XERJ=/opt/xerj/bin/xerj
 DATA=/var/lib/xerj
 KEY="$(sudo cat "$DATA/admin.key")"
@@ -358,8 +394,6 @@ local lexical embedder and needs zero model files; assert that it returns
 `_id` `1`.
 
 ```bash
-set -eu
-
 curl -fsS -X PUT "http://127.0.0.1:9200/offline-demo" \
   -H "Authorization: ApiKey $KEY" -H 'Content-Type: application/json' \
   -d '{"mappings":{"properties":{"body":{"type":"semantic_text"}}}}'
@@ -400,8 +434,6 @@ data directory is reused. Inspect and remove that overlay before an offline run
 if the directory is not fresh:
 
 ```bash
-set -eu
-
 curl -fsS -H "Authorization: ApiKey $KEY" \
   http://127.0.0.1:9200/_xerj/wal_tap
 curl -fsS -X DELETE -H "Authorization: ApiKey $KEY" \
@@ -420,11 +452,13 @@ creates an external listener or silently uploads corpus data.
 - XERJ does not independently checksum the Hugging Face model files today.
   Stage and verify them according to your organization's model-supply-chain
   policy.
-- The bundled Console falls back to system fonts, but its three external Google
-  Fonts link elements remain browser egress attempts unless your deployment
-  removes or rewrites that HTML; stylesheet may fetch additional font files.
+- The bundled Console falls back to system fonts, but its nine external Google
+  Fonts link elements — three in each of `index.html`, `login.html`, and
+  `setup.html` — remain browser egress attempts unless your deployment removes
+  or rewrites all three documents; the stylesheet may fetch additional font
+  files.
 - This page does not claim a live disconnected-firewall run or measured browser
-  egress. The procedure is traced to the config, neural loader, installer, and
+  egress. The procedure is traced to the config, neural loader, and
   release workflow; execute those checks in your target environment.
 
 Related references:
