@@ -92,8 +92,8 @@ The following stages the Linux x86_64 musl archive only.
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
+  trap 'rm -rf "$STAGE"' EXIT
   tar -xzf "$ASSET"
-  trap 'rm -rf "$OUT/release/$STAGE"' EXIT
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
   echo "staged $ASSET ($want) in $OUT"
@@ -114,15 +114,32 @@ a different target, which means changing `TARGET` here **and** the triple
 written into `STAGE` in the enclave block below, because that one is spelled out
 rather than derived.
 
-The extracted tree is removed by the `trap`, on every exit path including those
-two failures — only the archive and its `.sha256` should cross the airgap, so
-that no unverified binary travels beside the verified one. The `trap` is what
-makes that true: an earlier version of this page ran `rm -rf` as the last line
-of the block and claimed the tree was "removed either way", which was false
-precisely on the wrong-platform path the sentence was written for — `set -e`
-ended the subshell at the failing line and never reached the `rm`. Measured at
-the time: exec-format failure `rc=126`, missing exec bit `rc=1`, non-zero exit
-`rc=7`, tree left behind in all three, removed only on success.
+The extracted tree is removed by the `trap` whenever the subshell exits
+normally or under `set -e`, including those two failures — only the archive and
+its `.sha256` should cross the airgap, so that no unverified binary travels
+beside the verified one. A signal is the exception: an `EXIT` trap does not run
+on `SIGTERM` or `SIGHUP`, so a dropped session leaves the tree, and the check
+below is worth a glance before transferring.
+
+Two earlier versions of this paragraph were wrong, in opposite directions, and
+both are worth knowing because the trap's placement is what fixes each:
+
+- One ran `rm -rf` as the **last line** of the block and claimed the tree was
+  "removed either way". False on exactly the wrong-platform path it was written
+  for: `set -e` ended the subshell at the failing line and never reached the
+  `rm`. Measured then: exec-format `rc=126`, missing exec bit `rc=1`, non-zero
+  exit `rc=7`, tree left behind in all three, removed only on success.
+- The next used `trap 'rm -rf "$OUT/release/$STAGE"' EXIT` set **after** the
+  `cd`. Trap bodies run at exit in the directory the subshell is in by then, so
+  an `OUT` given as a relative path — which the `OUT="${OUT:-…}"` hook above
+  invites — resolved to `$OUT/release/$OUT/release/$STAGE`, a path that never
+  exists. `rm -rf` returns 0 on a missing path, so it failed silently on
+  **every** path, including the successful one. Measured: with `OUT` absolute
+  the tree went; with `OUT=stagedir` it survived all four cases.
+
+Hence the form above: the body is `"$STAGE"`, relative to the directory the
+block already `cd`-ed into and never leaves, and the `trap` is installed
+**before** `tar` so that a `tar` which fails partway is covered too.
 
 **Transfer `$OUT` itself, and land it in the enclave at `/opt/xerj-staging`**,
 so that the archive is at `/opt/xerj-staging/release/` — that is the path the
@@ -176,9 +193,13 @@ change this sentence in the same commit.
 **The digest is computed here and the file is searched for it, not the other way
 round.** `sha256sum -c` reads the filename out of the `.sha256` — a file that
 crossed the airgap on the same medium as the archive — and reports success for
-whatever it happens to name. It skips `#` comments silently and exits `0` if any
-one line verified, so a `.sha256` carrying a valid digest for some other file
-plus a comment mentioning the archive passes while the archive is never hashed.
+whatever it happens to name. It skips `#` comment lines silently and exits `0`
+when at least one line verified and no *listed* line failed — so a `.sha256`
+carrying a valid digest for some other file plus a comment mentioning the
+archive passes at `0` while the archive is never hashed. (It does exit `1` if a
+line it does read fails; the attack does not need one. Measured: comment plus a
+valid line for an unrelated file, `rc=0`; one good line plus one failing line,
+`rc=1`.)
 Filtering that file first does not fix it either: `awk '$2 == asset'` compares
 one whitespace-delimited token, while `sha256sum` takes the whole rest of the
 line as the filename, so a line naming `$ASSET decoy` satisfies the filter and
@@ -197,10 +218,13 @@ the subshell and the operator keeps their session, so that pressure never
 arises. Every block on this page that decides something now has its `set -eu`
 inside its own parentheses. The blocks that must leave variables behind for a
 later paste — section 4's checks, which set `KEY` and `XERJ`, and the `wal_tap`
-block that reads `KEY` — carry no `set -eu` at all. Every command in them is a
-`curl -fsS` or an assignment, so each reports its own failure without arming
-errexit in the operator's session, and none of them decides whether anything
-gets installed.
+block that reads `KEY` — carry no `set -eu` at all. They are assignments,
+`curl -fsS` calls and `"$XERJ"` invocations, each of which reports its own
+failure and exits non-zero on its own, so nothing there needs errexit armed in
+the operator's session — and none of those blocks decides whether anything gets
+installed. That is the property that matters; two earlier attempts to state it
+described the blocks by counting them and then by listing command types, and
+both descriptions were wrong.
 
 **The archive is copied once, then hashed and extracted from that copy.** This
 is the defect eight earlier versions of this recipe shared without noticing.
