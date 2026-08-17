@@ -1,6 +1,6 @@
 //! xerj configuration system.
 //!
-//! Configuration is intentionally minimal: **115 settings** versus
+//! Configuration is intentionally minimal: **116 settings** versus
 //! Elasticsearch's 3000+. Every option is named, documented, and has a sensible
 //! production-ready default. The format is TOML, loaded from a single file.
 //!
@@ -97,7 +97,7 @@ pub struct Config {
     pub wal_tap: WalTapConfig,
 }
 
-// 21 sub-configs, 115 leaf settings in total. Do not maintain that sum by hand
+// 21 sub-configs, 116 leaf settings in total. Do not maintain that sum by hand
 // — `journey_zero_config` in xerj-engine/tests/product_experience.rs counts a
 // serialised `Config::default()` and fails if this comment and the module
 // header stop matching. `Default` is derived: every field is a sub-config that
@@ -436,7 +436,7 @@ impl Config {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Sub-configs  (115 user-facing settings total; counted by
+// Sub-configs  (116 user-facing settings total; counted by
 // `journey_zero_config`, not by hand)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -1441,6 +1441,27 @@ pub struct LimitsConfig {
     /// WAL. The block clears automatically once usage drops back below the
     /// threshold. Set to `0` to disable the disk watermark.
     pub disk_flood_stage_percent: u8,
+    /// Hard ceiling on the machine size every other memory budget is derived
+    /// FROM, in MiB (default: `8192` = 8 GiB; `0` disables the cap).
+    ///
+    /// Without this, XERJ sizes itself to the machine. Every budget in
+    /// `ResourceGovernor` derives from `effective_memory_limit_bytes()`, which
+    /// is min(cgroup limit, total system RAM) — so with no cgroup, which is the
+    /// normal laptop and macOS case, the derivation base is the whole machine:
+    ///
+    ///   64 GiB host   memtables 25% = 16 GiB, hydration 20% = 12.8 GiB,
+    ///                 RSS watermark 95% = 60.8 GiB
+    ///
+    /// A bigger machine therefore bought a hungrier XERJ rather than a faster
+    /// one, and users reported ~20 GiB resident for two indexed projects. This
+    /// caps the derivation base itself, so every dependent budget shrinks
+    /// coherently instead of each one growing its own ceiling.
+    ///
+    /// The cap only ever LOWERS the base: on a machine smaller than the cap, or
+    /// under a smaller cgroup limit, the smaller value still wins. Raise it if
+    /// you are running a dedicated box and want the old machine-proportional
+    /// behaviour, or set `0` to remove the ceiling entirely.
+    pub max_process_memory_mb: u64,
 }
 
 impl Default for LimitsConfig {
@@ -1459,6 +1480,7 @@ impl Default for LimitsConfig {
             max_segment_hydration_cache_mb: 0, // 0 = 20% effective memory, no floor
             memory_watermark_percent: 95,
             disk_flood_stage_percent: 95,
+            max_process_memory_mb: 8192, // 8 GiB; 0 = derive from the machine
         }
     }
 }
@@ -2310,7 +2332,7 @@ mod tests {
             drift.join("\n  ")
         );
 
-        // …and the file's own header quotes how many of the 115 it sets. That
+        // …and the file's own header quotes how many of the 116 it sets. That
         // number was 38, then 56, and never once the truth (#207), so count the
         // assignments instead of trusting the sentence.
         let set_here = toml_src
@@ -2806,7 +2828,7 @@ mod tests {
             "the section table must sum to the whole config"
         );
         assert_eq!(
-            total, 115,
+            total, 116,
             "the total settings count changed. It is quoted in this module's \
              header, in xerj-common/src/lib.rs, in engine/README.md, in \
              xerj.default.toml and in EXPECTED_SETTINGS in \
