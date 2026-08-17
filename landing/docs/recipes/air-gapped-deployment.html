@@ -107,13 +107,13 @@ curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
   "$STAGE/xerj" --version
 )</pre>
   <p>The checksum proves archive integrity against the digest published beside it in the same release; it is not a signature, provenance statement, or attestation. After transfer, set the same approved <code class="inline">TAG</code> and verify before extracting:</p>
-<pre class="code">: "${TAG:?set TAG to the same operator-approved release tag}"
-VERSION="${TAG#v}"
-STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
-ASSET="${STAGE}.tar.gz"
-
-(
+<pre class="code">(
   set -eu
+
+  : "${TAG:?set TAG to the same operator-approved release tag}"
+  VERSION="${TAG#v}"
+  STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
+  ASSET="${STAGE}.tar.gz"
 
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
@@ -141,7 +141,7 @@ ASSET="${STAGE}.tar.gz"
   sudo install -m 0755 "$STAGE/xerj" /opt/xerj/bin/xerj
   echo "installed $ASSET ($want)"
 )</pre>
-  <p><strong>The archive is copied once, then hashed and extracted from that copy.</strong> Earlier versions opened the archive twice at the staging path &mdash; once by <code class="inline">sha256sum</code>, once by <code class="inline">tar</code> &mdash; and anyone who can write that directory swaps the file between the two opens. Copying first collapses that to a single read. <strong><code class="inline">mktemp -d</code> runs inside the subshell, under <code class="inline">set -eu</code></strong>: outside it, a failed <code class="inline">mktemp</code> left <code class="inline">work</code> empty, <code class="inline">cd ""</code> returned 0 without moving, and the block silently hashed and extracted from whatever directory the operator was in &mdash; the double read again, at exit 0. <strong>The work directory must be writable by you and nobody else.</strong> The default sticky <code class="inline">/tmp</code> is fine; if yours is not, <code class="inline">install -d -m 0700 "$HOME/xerj-verify"</code> and point <code class="inline">TMPDIR</code> there. This page previously advised a <em>root-owned</em> directory, which an unprivileged operator cannot write &mdash; that advice was itself the trigger for the defect above.</p>
+  <p><strong>The archive is copied once, then hashed and extracted from that copy.</strong> Earlier versions opened it twice at the staging path &mdash; once by <code class="inline">sha256sum</code>, once by <code class="inline">tar</code> &mdash; and anyone who can write there swaps the file between the two opens. <strong>Everything runs inside the subshell under <code class="inline">set -eu</code>, including the <code class="inline">TAG</code> guard.</strong> Bash does not terminate an <em>interactive</em> shell when a <code class="inline">${var:?}</code> expansion fails, so with the guard outside the block a paste printed its message and carried on with an empty version &mdash; and an attacker who can write the staging directory need only leave a file of that name beside the approved one. A subshell is not interactive, so the guard ends the block. <strong>The work directory must be writable by you and renameable by nobody else.</strong> The default sticky <code class="inline">/tmp</code> is exactly right; if yours is not, <code class="inline">install -d -m 0700 "$HOME/xerj-verify"</code> and point <code class="inline">TMPDIR</code> there. This page once advised a <em>root-owned</em> directory: root ownership was never the problem (<code class="inline">/tmp</code> is root-owned), a directory you cannot write is &mdash; <code class="inline">mktemp</code> then fails, and with that failure unchecked the advice was itself the trigger.</p>
 
   <h2>2. Configure the base lexical node</h2>
   <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>

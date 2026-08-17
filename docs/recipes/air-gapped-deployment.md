@@ -103,13 +103,13 @@ After transfer, set the same approved `TAG` in the enclave and verify before
 extracting:
 
 ```bash
-: "${TAG:?set TAG to the same operator-approved release tag}"
-VERSION="${TAG#v}"
-STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
-ASSET="${STAGE}.tar.gz"
-
 (
   set -eu
+
+  : "${TAG:?set TAG to the same operator-approved release tag}"
+  VERSION="${TAG#v}"
+  STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
+  ASSET="${STAGE}.tar.gz"
 
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
@@ -179,7 +179,18 @@ one was broken through the handoff rather than through the digest. There is no
 handoff now, so nothing later has to be trusted and no exit status has to be
 checked.
 
-**`mktemp -d` runs INSIDE the subshell, under `set -eu`.** It was outside in an
+**Everything runs INSIDE the subshell, under `set -eu` — including the `TAG`
+guard.** Bash does not terminate an *interactive* shell when a `${var:?}`
+expansion fails, so with the guard above the `(` a pasted block printed its
+message and carried on: `VERSION` empty, `ASSET` becoming
+`xerj--x86_64-unknown-linux-musl.tar.gz`, and inside the subshell that variable
+IS set, so `set -u` never fired either. An attacker who can write the staging
+directory needs only to leave that name and a matching `.sha256` beside the
+approved pair, and the block verifies their file against their digest and
+installs it at exit 0. A subshell is not interactive, so the same guard inside
+it ends the block.
+
+**`mktemp -d` runs inside it too.** It was outside in an
 earlier version, where a failure was not fatal and its status was never checked:
 `work` became the empty string, both `cp` lines failed, and `cd ""` returns 0 in
 bash without changing directory — so the block hashed and extracted `$ASSET`
@@ -201,9 +212,12 @@ export TMPDIR="$HOME/xerj-verify"
 ```
 
 An earlier version of this page said "set `TMPDIR` to a root-owned directory",
-which is worse than no advice: a root-owned directory the attacker cannot write
-is one you cannot write either, so `mktemp` fails — and with the failure
-unchecked, that sentence was itself the trigger for the defect above.
+which is worse than no advice. Root ownership was never the problem — the
+default `/tmp` is root-owned and is exactly right, because the sticky bit stops
+anyone else renaming your work directory. The problem is a directory YOU cannot
+write: `mktemp` then fails, and with that failure unchecked the sentence was
+itself the trigger for the defect above. The property to aim for is writable by
+you and renameable by nobody else.
 
 An attacker who rewrites the archive AND recomputes its `.sha256` still passes,
 and always will: that is the one case a checksum cannot answer, and the prose
