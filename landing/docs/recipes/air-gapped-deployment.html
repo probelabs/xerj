@@ -92,9 +92,16 @@ OUT="${OUT:-$PWD/xerj-airgap-${VERSION}-${TARGET}}"
 mkdir -p "$OUT/release"
 curl -fL --retry 3 -o "$OUT/release/$ASSET" "$BASE/$ASSET"
 curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
+
 (
   cd "$OUT/release"
-  sha256sum -c "$ASSET.sha256"
+  want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute a digest for $ASSET" &gt;&amp;2
+    exit 1
+  fi
+  LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
+    &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
@@ -117,7 +124,7 @@ ASSET="${STAGE}.tar.gz"
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
 
-  work="$(mktemp -d ./.xerj-verify.XXXXXX)"
+  work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   tar -xzf "$ASSET" -C "$work"
   test -x "$work/$STAGE/xerj"
@@ -180,14 +187,14 @@ done
     LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
       &lt; &lt;(tr -d '\r' &lt; ../model.sha256)
   done
+
+  sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
+  sudo install -o xerj -g xerj -m 0640 \
+    config.json tokenizer.json model.safetensors \
+    /opt/xerj/models/all-MiniLM-L6-v2/
+  echo "installed all-MiniLM-L6-v2"
 )</pre>
   <p><code class="inline">model.sha256</code> names all three files, so a transfer that dropped or truncated one fails this check rather than installing a partial model. Then install the files:</p>
-<pre class="code">set -eu
-
-sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
-sudo install -o xerj -g xerj -m 0640 \
-  /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
-  /opt/xerj/models/all-MiniLM-L6-v2/</pre>
   <p>Replace only the embedding block with:</p>
 <pre class="code">[embedding]
 mode = "neural"

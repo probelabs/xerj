@@ -80,7 +80,13 @@ curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
 
 (
   cd "$OUT/release"
-  sha256sum -c "$ASSET.sha256"
+  want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute a digest for $ASSET" >&2
+    exit 1
+  fi
+  LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
+    < <(tr -d '\r' < "$ASSET.sha256")
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
@@ -114,7 +120,7 @@ ASSET="${STAGE}.tar.gz"
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
-  work="$(mktemp -d ./.xerj-verify.XXXXXX)"
+  work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
   tar -xzf "$ASSET" -C "$work"
   test -x "$work/$STAGE/xerj"
@@ -153,19 +159,21 @@ operator's login shell on a bad digest — actively harmful over a serial consol
 where the natural recovery is to re-paste without it, which is the fail-open
 form. Inside, a failure ends the subshell and the operator keeps their session.
 
-**Section 2 installs from `$STAGE.verified`, which `mv` creates only after the
-digest, the extraction and `test -x` have all succeeded.** That is what makes
-the block safe when its exit status is ignored — by a wrapping script, an agent,
-or a reader who pastes the next section anyway. Nothing needs to check a return
-code, because on any failure there is nothing at the install path.
+**The block that verifies is the block that installs.** Six earlier versions of
+this recipe handed the verified tree to a later section through a path on disk,
+and every one was broken through that handoff rather than through the digest:
+a directory planted at the agreed name, a `mv` that nested onto it, an attacker
+who computed the digest-named path themselves and swapped the tree before the
+install ran. There is no handoff now — the binary is installed out of the
+private work directory it was extracted into, inside the same subshell — so
+there is nothing for a later step to trust and no exit status that has to be
+checked.
 
-That last sentence is only true because `rm -rf` runs FIRST. An earlier version
-placed it after the digest check, where it is unreachable on exactly the failure
-that matters: a bad digest exits the subshell before it, so a `$STAGE.verified`
-left by an earlier run — or planted by anyone who can write to the staging
-directory — survived and was installed. Clearing the install path before
-anything else is what makes "nothing to install" the default rather than a
-consequence.
+`mktemp -d` with no argument puts that directory under `TMPDIR`, deliberately
+NOT under the staging directory: renaming or removing a directory entry needs
+write permission on its PARENT, so a work directory inside an attacker-writable
+staging area can be moved aside and replaced however restrictive its own mode
+is.
 
 ## 2. Configure the base lexical node
 
@@ -243,6 +251,12 @@ the check is a command here rather than a sentence:
     LC_ALL=C grep -qxF -e "$want  $f" -e "$want *$f" \
       < <(tr -d '\r' < ../model.sha256)
   done
+
+  sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
+  sudo install -o xerj -g xerj -m 0640 \
+    config.json tokenizer.json model.safetensors \
+    /opt/xerj/models/all-MiniLM-L6-v2/
+  echo "installed all-MiniLM-L6-v2"
 )
 ```
 
@@ -251,17 +265,9 @@ airgap on the same medium as the files it describes, so `sha256sum -c` reading
 filenames out of it would verify whatever it happened to name. Each digest is
 computed here and the file is searched for that exact line, and every one of the
 three must be found — a transfer that dropped or truncated one fails rather than
-installing a partial model. Then install the
-files and change only the embedding block:
-
-```bash
-set -eu
-
-sudo install -d -o xerj -g xerj -m 0750 /opt/xerj/models/all-MiniLM-L6-v2
-sudo install -o xerj -g xerj -m 0640 \
-  /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
-  /opt/xerj/models/all-MiniLM-L6-v2/
-```
+installing a partial model — and, as in section 1, the block that verifies is
+the block that installs, so a failed check leaves nothing behind for a later
+paste to install. Then change only the embedding block:
 
 ```toml
 [embedding]
