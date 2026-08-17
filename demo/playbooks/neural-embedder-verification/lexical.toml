@@ -1,0 +1,14 @@
+[server]
+rest_port = 9540
+grpc_port = 9541
+es_compat_port = 9542
+data_dir = "/tmp/xerj-lex-data"
+
+[tls]
+enabled = false
+
+[auth]
+enabled = false
+
+[embedding]
+mode = "lexical"

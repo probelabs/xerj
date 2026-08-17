@@ -1,0 +1,16 @@
+[server]
+rest_port = 9530
+grpc_port = 9531
+es_compat_port = 9532
+data_dir = "/tmp/xerj-neural-data"
+
+[tls]
+enabled = false
+
+[auth]
+enabled = false
+
+[embedding]
+mode = "neural"
+neural_model = "sentence-transformers/all-MiniLM-L6-v2"
+model_cache_dir = "/tmp/xerj-neural-model-cache"
