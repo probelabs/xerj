@@ -291,3 +291,76 @@ fn the_opt_in_does_not_admit_a_dotted_path_outside_the_root() {
         "an ordinary out-of-root target is what the opt-in exists for: {rels:?}"
     );
 }
+
+/// Two properties the escape hatch got wrong, both found by verification.
+///
+/// 1. An entry the waiver ADMITS must carry the resolved path. The arm was
+///    empty, so `FileEntry::path` stayed the walk path and every later `open()`
+///    re-followed the link — the decision made about one file, the bytes read
+///    from another, for everything the flag ingests.
+/// 2. An out-of-root target refused for a dotted component must be reported as
+///    what it is. It was recorded under `hidden:dotfile`, so an operator was
+///    told to look for a dotfile inside their own folder and
+///    `symlink:outside-root` vanished from the report — on the DEFAULT path,
+///    not just under the flag.
+#[test]
+fn out_of_root_entries_carry_the_resolved_path_and_are_reported_as_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    fs::create_dir_all(&base).unwrap();
+    let root = base.join("root");
+    let outside = base.join("outside");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::create_dir_all(outside.join("pkg")).unwrap();
+    fs::create_dir_all(outside.join(".ssh")).unwrap();
+    fs::write(root.join("README.md"), "readme\n").unwrap();
+    fs::write(outside.join("pkg/lib.rs"), "pub fn f() {}\n").unwrap();
+    fs::write(outside.join(".ssh/id_rsa"), "PRIVATE KEY\n").unwrap();
+
+    symlink(outside.join("pkg"), root.join("shared-lib")).unwrap();
+    symlink(outside.join(".ssh/id_rsa"), root.join("keys.txt")).unwrap();
+
+    // (1) admitted out-of-root entries store the resolution.
+    let (files, _) = xerj_autoindex::walk::walk_reporting_opts(
+        &root,
+        true,
+        true,
+        xerj_autoindex::ignore_rules::IgnoreOptions::default(),
+    )
+    .expect("walk succeeds");
+    let lib = files
+        .iter()
+        .find(|f| f.rel == "shared-lib/lib.rs")
+        .expect("the opt-in must follow an ordinary out-of-root link");
+    assert_eq!(
+        lib.path,
+        outside.join("pkg/lib.rs").canonicalize().unwrap(),
+        "the stored path must be the resolved one, or the read re-follows the link"
+    );
+
+    // (2) the dotted out-of-root refusal is an escape, not a dotfile — and it
+    // is the DEFAULT path that has to say so.
+    let (_, report) = xerj_autoindex::walk::walk_reporting_opts(
+        &root,
+        true,
+        false,
+        xerj_autoindex::ignore_rules::IgnoreOptions::default(),
+    )
+    .expect("walk succeeds");
+    assert!(
+        !report.by_rule.contains_key(HIDDEN_RULE),
+        "there is no dotfile in the operator's folder to blame: {report:?}"
+    );
+    let escaped = report
+        .by_rule
+        .get(ESCAPED_ROOT_RULE)
+        .copied()
+        .unwrap_or_default();
+    // `keys.txt` is a file link and `shared-lib` a directory link, so they land
+    // in different counters — one each, not two files.
+    assert_eq!(
+        (escaped.files, escaped.dirs),
+        (1, 1),
+        "both links left the root: {report:?}"
+    );
+}

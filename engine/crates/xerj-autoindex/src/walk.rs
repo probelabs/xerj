@@ -73,8 +73,17 @@ fn marker_generated_dir(path: &Path) -> Option<&'static str> {
 
 /// Why a followed symlink was refused. See the call site in `walk_reporting`.
 enum SymlinkVerdict {
-    /// The resolved target is not under the indexed root.
-    OutsideRoot,
+    /// The resolved target is not under the indexed root. Carries the
+    /// resolution so the waiver arm can store it: an admitted entry must read
+    /// from the path that was judged rather than from the link it arrived by,
+    /// and out-of-root entries are the only ones that arm ever admits.
+    OutsideRoot(PathBuf),
+    /// Outside the root AND through a dotted component. Separate from
+    /// `OutsideRoot` because `--follow-symlinks-outside-root` must not reach
+    /// it, and separate from `HiddenTarget` because the operator has no dotfile
+    /// in their own folder to go looking for — the actionable fact is that a
+    /// link left it.
+    HiddenOutsideRoot,
     /// The resolved target is under the root but its real path runs through a
     /// hidden component — the link's visible name was hiding a dotfile.
     HiddenTarget,
@@ -145,9 +154,9 @@ fn escaped_or_hidden_target(
             .skip(shared)
             .any(|c| is_hidden_name(c.as_os_str()))
         {
-            return Err(SymlinkVerdict::HiddenTarget);
+            return Err(SymlinkVerdict::HiddenOutsideRoot);
         }
-        return Err(SymlinkVerdict::OutsideRoot);
+        return Err(SymlinkVerdict::OutsideRoot(real));
     };
     // In-root: judge only the part below the root. A brain over a dot-named
     // folder still works — that exemption is the same one the walker gives the
@@ -304,8 +313,21 @@ pub fn walk_reporting_opts(
         if follow_symlinks && entry.depth() > 0 && through_link {
             match escaped_or_hidden_target(&root_canon, entry.path()) {
                 Ok(real) => resolved = real,
-                Err(SymlinkVerdict::OutsideRoot) if allow_outside_root => {}
-                Err(SymlinkVerdict::OutsideRoot) => {
+                // Admitted by the waiver — but with the RESOLVED path, so the
+                // bytes read later are the bytes that were judged. This arm was
+                // empty, which stored the walk path and re-followed the link at
+                // read time for everything the flag ingests.
+                Err(SymlinkVerdict::OutsideRoot(real)) if allow_outside_root => {
+                    resolved = Some(real);
+                }
+                Err(SymlinkVerdict::HiddenOutsideRoot) => {
+                    stack.record_symlink_escape(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                Err(SymlinkVerdict::OutsideRoot(_)) => {
                     stack.record_symlink_escape(is_dir);
                     if is_dir {
                         it.skip_current_dir();
