@@ -29,7 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first run after upgrading drops what it previously indexed through such a
   link. If following links outward is why you turned the flag on — a vendored
   sibling checkout, a monorepo package link, a mounted volume — pass
-  `--follow-symlinks-outside-root` to restore it. That waives the root boundary
+  `--follow-symlinks-outside-root` to restore it (it requires
+  `--follow-symlinks`, and is refused on its own rather than accepted as a
+  silent no-op). That waives the root boundary
   and nothing else: the hidden-file rule still applies to the resolved path,
   judged from the point where the target diverges from the folder you pointed
   at — so `notes -> ../sibling/pkg` is followed and `keys -> ../sibling/.ssh/id_rsa`

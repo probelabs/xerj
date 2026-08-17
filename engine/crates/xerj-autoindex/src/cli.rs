@@ -161,10 +161,14 @@ pub fn help_text_with(feedback: bool) -> String {
                                   dotfile, whatever the link itself is called\n\
              --follow-symlinks-outside-root\n\
                                   also follow links that resolve OUTSIDE the\n\
-                                  folder. Off by default; pointing at a folder\n\
-                                  is not consent to index whatever it links to.\n\
-                                  The\n\
-                                  hidden-file rule still applies to the target\n\
+                                  folder. Requires --follow-symlinks. Off by\n\
+                                  default; pointing at a folder is not consent\n\
+                                  to index whatever it links to. The hidden-file\n\
+                                  rule still applies to the target, judged from\n\
+                                  where it diverges from your folder — so a\n\
+                                  dotted directory the two paths SHARE does not\n\
+                                  refuse anything, because your folder is\n\
+                                  already inside it\n\
              --stub <GLOB>        index matching files as ONE existence-only name\n\
                                   card (title + provenance); contents are never\n\
                                   opened. Repeatable. A pattern without '/'\n\
@@ -755,6 +759,16 @@ pub fn parse(args: Vec<String>) -> Result<Cmd, String> {
             state_dir,
         })),
         (None, Some(root)) => {
+            // A flag that is accepted and does nothing is the shape this repo
+            // refuses on purpose (#204, #279): the operator believes they asked
+            // for out-of-root targets and gets a run that silently did not.
+            if follow_symlinks_outside_root && !follow_symlinks {
+                return Err(
+                    "--follow-symlinks-outside-root has no effect without --follow-symlinks: \
+                     links are not followed at all unless that flag is given"
+                        .into(),
+                );
+            }
             let plan = crate::resources::plan(workers, pdf_workers, bulk_mb);
             Ok(Cmd::Index(Box::new(IndexCfg {
                 root,
@@ -866,6 +880,32 @@ fn discover_local_admin_key() -> Option<(String, PathBuf)> {
 mod tests {
     use super::{parse, Approval, Cmd, Duration, ProgressMode, DEFAULT_MAX_MINUTES};
     use std::path::PathBuf;
+
+    /// A flag that is accepted and silently does nothing is refused, because
+    /// the operator who passed it believes the run did something it did not.
+    #[test]
+    fn outside_root_without_follow_symlinks_is_refused() {
+        let err = parse(
+            ["data", "--follow-symlinks-outside-root"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        )
+        .expect_err("must not be accepted as a silent no-op");
+        let text = err.to_string();
+        assert!(
+            text.contains("--follow-symlinks-outside-root") && text.contains("no effect"),
+            "the message must name the flag and say why: {text}"
+        );
+
+        // Both together is the supported combination and must still parse.
+        let cfg = index(&[
+            "data",
+            "--follow-symlinks",
+            "--follow-symlinks-outside-root",
+        ]);
+        assert!(cfg.follow_symlinks && cfg.follow_symlinks_outside_root);
+    }
 
     fn index(args: &[&str]) -> super::IndexCfg {
         match parse(args.iter().map(|s| s.to_string()).collect()).unwrap() {
