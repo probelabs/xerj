@@ -540,21 +540,37 @@ impl Es {
         Err(last_err.unwrap_or_else(|| anyhow!("{what}: retries exhausted")))
     }
 
-    /// Sleep between attempts, recording what was slept for.
+    /// Sleep between attempts, recording how long was actually slept.
     ///
-    /// One function so that recording and sleeping cannot come apart. An
-    /// earlier version incremented a counter next to a bare
-    /// `std::thread::sleep`, and moving only the sleep out of its guard then
-    /// produced a sixth backoff that the counter still reported as five — the
-    /// exact regression the test is named for, invisible to it. Bypassing this
-    /// now means writing a second sleep call rather than moving a line.
+    /// One function so that moving the CALL SITE cannot separate recording from
+    /// sleeping: an earlier version incremented a counter next to a bare
+    /// `std::thread::sleep`, and moving only the sleep out of its guard produced
+    /// a sixth backoff the counter still reported as five.
+    ///
+    /// What this does NOT defend against, stated because the previous version of
+    /// this comment overclaimed it: a sleep that never routes through here is
+    /// invisible to the recorded sequence. Mutation testing found three —
+    /// a bare `thread::sleep` after the loop, the sleep moved out of `backoff`
+    /// itself while the push stays, and a second sleep alongside the recorded
+    /// one. Each adds 20-90 ms of real sleeping that no assertion over recorded
+    /// data can see. Only a tight wall-clock upper bound catches them, and a
+    /// tight upper bound is precisely what failed one run in five under load
+    /// (#436). That is a trade, not an oversight: the assertions pin the shape
+    /// of the sleeping that goes through here, and wall time pins that some
+    /// sleeping happened at all.
+    ///
+    /// The recorded value is the OBSERVED duration rather than the requested
+    /// one, so a `Duration` that is computed correctly and then not honoured
+    /// shows up as a short entry instead of a correct-looking one.
     fn backoff(&self, delay: Duration) {
+        #[cfg(test)]
+        let started = Instant::now();
+        std::thread::sleep(delay);
         #[cfg(test)]
         self.backoff_delays
             .lock()
             .expect("backoff_delays poisoned")
-            .push(delay);
-        std::thread::sleep(delay);
+            .push(started.elapsed());
     }
 
     /// PUT index with explicit mapping; tolerates already-exists.
@@ -1189,6 +1205,8 @@ mod tests {
         // on `main`, so it reddened pull requests that had not touched it
         // (#436). A sixth sleep is what the old bound was really looking for,
         // and it is visible here directly.
+        // Observed durations, so they round UP off the requested value; compare
+        // the floor at millisecond granularity rather than the exact number.
         let delays: Vec<u64> = es
             .backoff_delays
             .lock()
@@ -1197,10 +1215,20 @@ mod tests {
             .map(|d| d.as_millis() as u64)
             .collect();
         assert_eq!(
-            delays,
-            vec![10, 20, 20, 20, 20],
-            "the backoff sequence pins arity, ordering, doubling and the \
-             retry_max_delay cap together; a count alone pins only the arity"
+            delays.len(),
+            5,
+            "six attempts must back off five times, never after the final \
+             failure: {delays:?}"
+        );
+        let requested = [10u64, 20, 20, 20, 20];
+        assert!(
+            delays
+                .iter()
+                .zip(requested)
+                .all(|(observed, want)| *observed >= want && *observed < want + 50),
+            "each backoff must sleep for the delay it was given — arity, \
+             ordering, the doubling and the retry_max_delay cap all live in \
+             this sequence: got {delays:?}, wanted {requested:?}"
         );
         // Timing, but only in the direction that is safe to assert. A sleep
         // can overrun and cannot underrun, so a LOWER bound on the summed
