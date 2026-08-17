@@ -2363,17 +2363,32 @@ mod printable_magic_tests {
     /// is a recorded trade and not a later surprise.
     ///
     /// A file that outruns `GIF_PREFIX` with its chain intact is called an
-    /// image. Prose can reach that state, but only by opening with the whole
-    /// GIF header: `GIF89a`, eight bytes forming a Logical Screen Descriptor
-    /// the earlier checks accept, `!` at 13, and — the part ordinary text does
-    /// not have — a `0xFE` at offset 14, which is `þ` in windows-1252 and not
-    /// ASCII at all. It must then run for a megabyte without a NUL.
+    /// image, and text reaches that state easily — it has no NUL, so the walk
+    /// cannot terminate in it. The entry cost is the header alone: `GIF89a`,
+    /// eight bytes forming a Logical Screen Descriptor the earlier checks
+    /// accept, then `0x21 0xFE`. `0xFE` is `þ` in windows-1252 and not ASCII,
+    /// which is the only part ordinary text lacks — and NOT at a fixed offset:
+    /// when the packed byte at 10 has bit 7 set (any accented letter does it)
+    /// the Global Colour Table shifts `block` to 19, 25, 37, 61, 109, 205, 397
+    /// or 781. An earlier version of this comment said "offset 14" and was
+    /// wrong by a factor of nine.
     ///
-    /// The alternative was the round-4 canvas rule, and its cost is unbounded
-    /// in the other direction: it junks any real image whose canvas high bytes
-    /// are printable, which is 18 decodable GIFs on `main` today and grows with
-    /// canvas size. Measured over the 265-file text corpus, this rule changes
-    /// nothing — 257 stay text, the same 8 reach `Binary` by other arms.
+    /// So this is a measured trade against merged `main`, not a free win, and
+    /// both sides are pinned here:
+    ///
+    ///   * `main` keeps 8 corpus text negatives (`gctflag_ext_fe_p*`) and junks
+    ///     18 decodable GIFs whose canvas high bytes happen to be printable.
+    ///   * this rule keeps all 18 GIFs and junks those same 8 text files — but
+    ///     only above the budget. At their real 8,960 bytes every build keeps
+    ///     them as text; it is file LENGTH that flips them, which is exactly
+    ///     the blind spot the corpus could not show.
+    ///
+    /// Chosen because the 18 are real artifacts that giflib and Pillow both
+    /// decode, while the 8 are fixtures that only reach this state when
+    /// inflated 117x. A sweep of 403,716 real files found 66 opening with GIF
+    /// magic and none carrying the comment shape at all, so neither class has a
+    /// measured natural base rate — which is the honest reason to write the
+    /// trade down rather than claim the rule is safe.
     #[test]
     fn prose_past_the_budget_is_called_an_image_and_prose_under_it_is_not() {
         let mut prose: Vec<u8> = b"GIF89ax".to_vec();
@@ -2403,6 +2418,37 @@ mod printable_magic_tests {
             "a chain intact across the whole budget is called an image — if this \
              ever needs to change, change the budget or find evidence the chain \
              can carry, do not go back to guessing from a fixed offset"
+        );
+
+        // The concrete cost, from the corpus itself: the #379 negatives built
+        // to represent this exact shape are kept only by being short. This
+        // reproduces `gctflag_ext_fe_p80.txt` — packed byte 0x80, so the GCT
+        // moves `block` to 19 — and asserts both sides of the length boundary.
+        let mut gct: Vec<u8> = b"GIF89a".to_vec();
+        gct.extend_from_slice(b"pros"); // 6..10: canvas, four printable bytes
+        gct.push(0x80); // 10: packed, GCT flag set by an accented letter
+        gct.extend_from_slice(b"st"); // 11, 12
+        gct.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]); // 13..19: the GCT
+        gct.push(0x21); // 19: extension introducer, shifted by the GCT
+        gct.push(0xfe); // 20: comment label
+        gct.push(b' '); // 21: first sub-block size
+        while gct.len() < GIF_PREFIX + 4096 {
+            gct.extend_from_slice("Le format GIF reste partout sur le web. ".as_bytes());
+        }
+        let short: Vec<u8> = gct.iter().copied().take(8_960).collect();
+        assert_eq!(
+            sniff_bytes(&short, p, p, false).unwrap().family,
+            Family::TxtProse,
+            "at the corpus's own size this file is text on every build"
+        );
+        let long: Vec<u8> = gct.iter().copied().take(GIF_PREFIX).collect();
+        assert_eq!(
+            sniff_bytes(&long, p, p, false).unwrap().family,
+            Family::Binary,
+            "the same bytes past the budget are junked as an image — this is the \
+             cost of the rule, and merged main does NOT pay it. Keeping this \
+             assertion honest matters more than keeping it green: if a future \
+             change makes it text, re-measure the 18 GIFs on the other side"
         );
     }
 
