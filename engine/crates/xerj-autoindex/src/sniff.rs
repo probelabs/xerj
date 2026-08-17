@@ -577,28 +577,41 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // admitted, which is why the budget is the whole rule
                         // and the chain is not.
                         //
-                        // Given that, a FULL buffer answers image and a SHORT
-                        // one answers text. That is a choice between two harms,
-                        // both measured, not a discovered truth:
+                        // Given that, a FULL buffer answers image. A SHORT one
+                        // means the file ended mid-chain, and there the canvas
+                        // rule from round 4 is asked — not as a discriminator
+                        // for GIFs in general, which is what it was refused
+                        // for, but for the one case it can settle: a complete
+                        // GIF terminates its comment, so a chain still running
+                        // at EOF is a truncated file, and the canvas says
+                        // whether it was an image before it was cut.
                         //
-                        //   * answering image unconditionally (round 2's
-                        //     rejected `true`) junks 10 corpus text files —
-                        //     windows-1252 prose carrying `þ` in that slot.
-                        //   * answering text on a short buffer sends a
-                        //     TRUNCATED real GIF to the prose extractor: 7 of 7
-                        //     cuts of real corpus GIFs at 300 KB..1,048,575 B go
-                        //     binary/gif here to TxtProse, as does a GIF-magic
-                        //     file of exactly 8192 bytes, and two 51-byte nmap
-                        //     pixels demote from binary/gif to binary/unknown.
-                        //     `sniff` runs on live paths (lib.rs:1151, 4258), so
-                        //     a file mid-copy in a watched directory reaches it.
+                        // That composition is measured against the budget test
+                        // alone, not assumed. Identical on every set that
+                        // matters and strictly better on one:
                         //
-                        // The second is preferred deliberately: a truncated GIF
-                        // is a broken file no decoder accepts, while a text file
-                        // called binary is a good file silently dropped, which
-                        // is the whole of #379. Pinned by
-                        // `a_truncated_gif_is_called_text_and_that_is_the_trade`.
-                        None => return prefix.len() >= GIF_PREFIX,
+                        //   71 round-5 GIFs           71 Binary   both
+                        //   674 corpus images        674 Binary   both
+                        //   265 text negatives       257 text     both
+                        //   265 inflated past budget  18 Binary   both
+                        //   13 corpus GIFs cut @8192  13 Binary   vs 2
+                        //
+                        // The last row is the reason to keep it: without the
+                        // canvas fallback 11 of 13 truncated real images go to
+                        // the prose extractor. A file mid-copy in a watched
+                        // directory is that shape, and `sniff` runs on live
+                        // paths (lib.rs:1151, 4258).
+                        //
+                        // Answering image unconditionally on a short buffer
+                        // instead (round 2's rejected `true`) junks 10 corpus
+                        // text files — windows-1252 prose carrying `þ` in that
+                        // slot — so the full-buffer half stays as it is. Pinned
+                        // by `a_truncated_gif_is_called_text_and_that_is_the_trade`,
+                        // which now asserts Binary.
+                        None => {
+                            return prefix.len() >= GIF_PREFIX
+                                || canvas_dimension_text_cannot_write(prefix)
+                        }
                     }
                 }
             }
@@ -696,6 +709,12 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
 // that was false — 7 of 7 plain truncated corpus GIFs flip too — and it is
 // recorded here because narrowing a known cost until it sounds acceptable is
 // the same failure as inventing a discriminator, one document later.
+
+fn canvas_dimension_text_cannot_write(prefix: &[u8]) -> bool {
+    // `prefix[..13]` is guaranteed by the length check in the only caller.
+    let high_byte_is_binary = |hi: u8| hi < 0x20 && !matches!(hi, b'\t' | b'\n' | b'\r');
+    high_byte_is_binary(prefix[7]) || high_byte_is_binary(prefix[9])
+}
 
 /// Windows bitmap: `BM`, then a 14-byte BITMAPFILEHEADER, then a DIB header
 /// that opens with its own size.
@@ -2282,7 +2301,7 @@ mod printable_magic_tests {
         }
     }
 
-    /// The other side of the same trade: a truncated GIF is called text.
+    /// A truncated GIF is still called an image, by the canvas fallback.
     ///
     /// Deliberate, and the reasoning is not that this is harmless. A cut real
     /// GIF goes to the prose extractor and is sectioned into junk records —
@@ -2321,10 +2340,11 @@ mod printable_magic_tests {
             let sn = sniff_bytes(&commented_gif(cut), p, p, false).unwrap();
             assert_eq!(
                 sn.family,
-                Family::TxtProse,
-                "a GIF cut to {cut} B is expected to read as text — if this \
-                 assertion is what broke, the trade above was changed, and the \
-                 10 text files on the other side of it must be re-measured"
+                Family::Binary,
+                "a GIF cut to {cut} B must still read as an image: the chain ran \
+                 past EOF, which a complete GIF cannot do, and the canvas then \
+                 settles it. This asserted TxtProse for one commit, which sent \
+                 11 of 13 truncated corpus images to the prose extractor"
             );
         }
     }
