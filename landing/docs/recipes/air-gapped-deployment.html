@@ -95,6 +95,7 @@
   curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
 
   cd "$OUT/release"
+  trap 'rm -rf "$STAGE"' EXIT
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
     echo "could not compute a digest for $ASSET" &gt;&amp;2
@@ -103,7 +104,6 @@
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     &lt; &lt;(tr -d '\r' &lt; "$ASSET.sha256")
 
-  trap 'rm -rf "$STAGE"' EXIT
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version

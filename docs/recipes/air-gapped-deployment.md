@@ -84,6 +84,7 @@ The following stages the Linux x86_64 musl archive only.
   curl -fL --retry 3 -o "$OUT/release/$ASSET.sha256" "$BASE/$ASSET.sha256"
 
   cd "$OUT/release"
+  trap 'rm -rf "$STAGE"' EXIT
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
   if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
     echo "could not compute a digest for $ASSET" >&2
@@ -92,7 +93,6 @@ The following stages the Linux x86_64 musl archive only.
   LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
     < <(tr -d '\r' < "$ASSET.sha256")
 
-  trap 'rm -rf "$STAGE"' EXIT
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
   "$STAGE/xerj" --version
@@ -114,15 +114,18 @@ a different target, which means changing `TARGET` here **and** the triple
 written into `STAGE` in the enclave block below, because that one is spelled out
 rather than derived.
 
-The extracted tree is removed by the `trap` whenever the subshell exits
-normally or under `set -e`, including those two failures — only the archive and
-its `.sha256` should cross the airgap, so that no unverified binary travels
-beside the verified one. A signal is the exception: an `EXIT` trap does not run
-on `SIGTERM` or `SIGHUP`, so a dropped session leaves the tree, and the check
-below is worth a glance before transferring.
+The extracted tree is removed by the `trap` on every exit this block can take
+after the `cd` — success, `set -e`, a failed digest, and a hangup, `SIGTERM` or
+Ctrl-C, because bash runs an `EXIT` trap when a non-interactive shell is killed
+by a fatal signal. Only the archive and its `.sha256` should cross the airgap,
+so that no unverified binary travels beside the verified one. What genuinely
+survives is `SIGKILL`, an OOM kill and power loss, and what survives then is a
+*half-extracted* tree — so if the block did not print its `staged …` line, look
+before transferring.
 
-Two earlier versions of this paragraph were wrong, in opposite directions, and
-both are worth knowing because the trap's placement is what fixes each:
+Three earlier versions of this paragraph were wrong, and each is worth knowing
+because two of them are about where the trap sits and the third is about how
+this was measured:
 
 - One ran `rm -rf` as the **last line** of the block and claimed the tree was
   "removed either way". False on exactly the wrong-platform path it was written
@@ -137,9 +140,22 @@ both are worth knowing because the trap's placement is what fixes each:
   **every** path, including the successful one. Measured: with `OUT` absolute
   the tree went; with `OUT=stagedir` it survived all four cases.
 
+- The third claimed an `EXIT` trap "does not run on `SIGTERM` or `SIGHUP`, so a
+  dropped session leaves the tree". Also false, and the interesting part is how:
+  the measurement behind it signalled the wrapping `bash script.sh` process
+  instead of the forked subshell that actually owns the trap, so the trap was
+  never asked to run. Signal the subshell and it runs — `SIGTERM`, `SIGHUP` and
+  `SIGINT` all clean, verified in a real pty with the signal landing provably
+  mid-`tar`. Three of this page's wrong sentences now trace to a harness that
+  measured the wrong thing rather than to the shell behaving unexpectedly.
+
 Hence the form above: the body is `"$STAGE"`, relative to the directory the
 block already `cd`-ed into and never leaves, and the `trap` is installed
-**before** `tar` so that a `tar` which fails partway is covered too.
+immediately after that `cd` — before the digest check, not just before `tar`.
+That ordering matters, because the digest-mismatch exit is the one this section
+exists for: with the trap installed after the check, a stale `$STAGE` left by an
+earlier interrupted run survived exactly there, and the next instruction on this
+page is to transfer `$OUT`.
 
 **Transfer `$OUT` itself, and land it in the enclave at `/opt/xerj-staging`**,
 so that the archive is at `/opt/xerj-staging/release/` — that is the path the
@@ -218,13 +234,16 @@ the subshell and the operator keeps their session, so that pressure never
 arises. Every block on this page that decides something now has its `set -eu`
 inside its own parentheses. The blocks that must leave variables behind for a
 later paste — section 4's checks, which set `KEY` and `XERJ`, and the `wal_tap`
-block that reads `KEY` — carry no `set -eu` at all. They are assignments,
-`curl -fsS` calls and `"$XERJ"` invocations, each of which reports its own
-failure and exits non-zero on its own, so nothing there needs errexit armed in
-the operator's session — and none of those blocks decides whether anything gets
-installed. That is the property that matters; two earlier attempts to state it
-described the blocks by counting them and then by listing command types, and
-both descriptions were wrong.
+block that reads `KEY` — carry no `set -eu` at all. Nothing in them decides
+whether anything gets installed, and every command reports its own failure, so
+none of them needs errexit armed in the operator's session.
+
+That is the property that matters, and it is the only one stated here on
+purpose. Three earlier attempts described these blocks by counting them, then by
+listing two command types, then by listing three — each enumeration was wrong in
+a new way, the last of them missing a single `export`. A property that has to be
+re-derived every time the blocks change is a worse thing to write down than the
+invariant they are chosen to satisfy.
 
 **The archive is copied once, then hashed and extracted from that copy.** This
 is the defect eight earlier versions of this recipe shared without noticing.
