@@ -112,19 +112,45 @@ Provenance rules, not optional: **state in the first line of the PR body that an
 - Linux / macOS: `curl -fsSL https://xerj.org/get | sh`
 - Windows PowerShell: `irm https://xerj.org/get.ps1 | iex`
 
-The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm64, Windows x64/ARM64), downloads the latest GitHub release, verifies its SHA-256 (fail-closed: a missing or mismatched checksum aborts, and the `sh` installer tries `sha256sum`, `shasum`, `openssl`, `sha256`, `busybox` and `cksum` in turn and **refuses to install** if none exists — installing unverified is opt-in only, with `XERJ_INSECURE_SKIP_CHECKSUM=1`), and installs one `xerj` binary — default `~/.local/bin` on Unix (it prints the path and a PATH hint; it does not edit your shell profile), `%LOCALAPPDATA%\Programs\xerj` on Windows (added to user PATH; opt out with `XERJ_NO_PATH=1`). Pin with `XERJ_VERSION=vX.Y.Z`; both honour `XERJ_INSTALL_DIR`. Current release: **v1.0.0-rc.16** (2026-08-13).
+The installer detects OS/CPU (Linux x86_64/aarch64 static musl, macOS x86_64/arm64, Windows x64/ARM64), downloads the latest GitHub release, verifies its SHA-256 (fail-closed: a missing or mismatched checksum aborts, and the `sh` installer tries `sha256sum`, `shasum`, `openssl`, `sha256`, `busybox` and `cksum` in turn and **refuses to install** if none exists — installing unverified is opt-in only, with `XERJ_INSECURE_SKIP_CHECKSUM=1`), and installs one `xerj` binary — default `~/.local/bin` on Unix (it prints the path and a PATH hint; it does not edit your shell profile), `%LOCALAPPDATA%\Programs\xerj` on Windows (added to user PATH; opt out with `XERJ_NO_PATH=1`). Pin with `XERJ_VERSION=vX.Y.Z`; both honour `XERJ_INSTALL_DIR`. Current release: **v1.0.0-rc.17** (2026-08-15).
 
 **PATH consequence — read this before the next command.** Because the installer does not edit your shell profile, in a fresh shell `~/.local/bin` is often not on `PATH` and a bare `xerj …` fails with `command not found`. Either call it by full path (`$HOME/.local/bin/xerj …`) or `export PATH="$HOME/.local/bin:$PATH"` first. Every `xerj` below assumes you did one of those.
 
 **Manual, verifiable install (no `curl | sh`).** If policy forbids piping a script to a shell, install from the release assets — the installer does nothing you cannot do by hand. Every release publishes one archive per target plus a matching per-asset `.sha256` (there is no combined checksums manifest):
 
 ```
-base=https://github.com/xerj-org/xerj/releases/download/<tag>       # e.g. tag v1.0.0-rc.16
-asset=xerj-<version-without-the-v>-<target>.tar.gz                  # .zip on pc-windows-msvc
-curl -fL -O "$base/$asset" && curl -fL -O "$base/$asset.sha256"
-sha256sum -c "$asset.sha256"     # macOS: shasum -a 256 -c — do not proceed if this fails
-tar -xzf "$asset"                # unpacks xerj-<version>-<target>/xerj
-install -m 755 xerj-*/xerj ~/.local/bin/xerj
+(
+  set -eu
+  # Set these two. They are real values, not placeholders: the block is pasteable as-is.
+  tag=v1.0.0-rc.17                                  # the release you approved
+  target=x86_64-unknown-linux-musl                  # your platform's triple
+
+  base="https://github.com/xerj-org/xerj/releases/download/$tag"
+  stage="xerj-${tag#v}-$target"                     # the archive's top-level directory
+  asset="$stage.tar.gz"                             # .zip on pc-windows-msvc
+  curl -fL -O "$base/$asset"
+  curl -fL -O "$base/$asset.sha256"
+
+  # Compute the digest and demand the .sha256 contain that exact line. Do NOT use
+  # `sha256sum -c`: it skips `#` comment lines silently, so a .sha256 carrying a
+  # comment naming $asset plus a valid line for some OTHER file exits 0 with
+  # $asset never hashed. (It does exit 1 on a listed line that fails - the attack
+  # simply does not need one.)
+  want=$( { sha256sum "$asset" 2>/dev/null || shasum -a 256 "$asset"; } | cut -d ' ' -f 1 )
+  # Assert it IS a digest first. With no SHA-256 tool $want is empty, the patterns
+  # below collapse to "  $asset" / " *$asset", and a .sha256 carrying that literal
+  # line verifies with nothing hashed.
+  printf %s "$want" | LC_ALL=C grep -qE '^[0-9a-f]{64}$' \
+    || { echo "no working SHA-256 tool - refusing $asset" >&2; exit 1; }
+
+  tr -d '\r' < "$asset.sha256" \
+    | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
+    || { echo "CHECKSUM MISMATCH for $asset - do not install it" >&2; exit 1; }
+
+  tar -xzf "$asset"                # unpacks $stage/xerj
+  mkdir -p ~/.local/bin
+  install -m 755 "$stage/xerj" ~/.local/bin/xerj
+)
 ```
 
 `<target>` is `{x86_64,aarch64}-{unknown-linux-musl,unknown-linux-gnu,apple-darwin,pc-windows-msvc}` — e.g. `xerj-1.0.0-rc.16-x86_64-unknown-linux-musl.tar.gz`. Resolve `<tag>` from `https://api.github.com/repos/xerj-org/xerj/releases/latest`. Note what the checksum does and does not prove: it verifies the archive against the digest published beside it in the same release — integrity, not independent provenance.
