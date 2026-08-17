@@ -543,6 +543,7 @@ fn begin_non_graph_generation(
             url: cfg.url.clone(),
             prefix: cfg.prefix.clone(),
             follow_symlinks: cfg.follow_symlinks,
+            follow_symlinks_outside_root: cfg.follow_symlinks_outside_root,
             chunker_identity,
             embedding_identity_sha256: identity.identity_sha256,
             embedding_backend: identity.backend,
@@ -1441,6 +1442,7 @@ mod phase_a_grouping_tests {
             state_dir: None,
             fresh: true,
             follow_symlinks: false,
+            follow_symlinks_outside_root: false,
             ignore: crate::ignore_rules::IgnoreOptions::default(),
             max_file_gb: 2,
             sample: 500,
@@ -3030,8 +3032,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // Totals are unknown until the walk returns, so this phase honestly
     // reports `pct=unknown` and proves liveness with the clock alone.
     pr.phase("walk", 0, 0);
-    let (discovered_files, ignore_report) =
-        walk::walk_reporting(&cfg.root, cfg.follow_symlinks, cfg.ignore)?;
+    let (discovered_files, ignore_report) = walk::walk_reporting_opts(
+        &cfg.root,
+        cfg.follow_symlinks,
+        cfg.follow_symlinks_outside_root,
+        cfg.ignore,
+    )?;
     let discovered_bytes: u64 = discovered_files.iter().map(|f| f.size).sum();
     pr.note(&format!(
         "autoindex: {} files ({} MB) under {}",
@@ -3149,6 +3155,8 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                         && expected.url == cfg.url
                         && expected.prefix == cfg.prefix
                         && expected.follow_symlinks == cfg.follow_symlinks
+                        && expected.follow_symlinks_outside_root
+                            == cfg.follow_symlinks_outside_root
                         && expected.chunker_identity == prepared_records_identity(&cfg)?
                         && !expected.graph_enabled
                         && expected.brain == "disabled"
@@ -3239,6 +3247,9 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         }
         if cfg.follow_symlinks {
             rebuild_argv.push("--follow-symlinks".to_owned());
+        }
+        if cfg.follow_symlinks_outside_root {
+            rebuild_argv.push("--follow-symlinks-outside-root".to_owned());
         }
         anyhow::bail!(
             "this state directory contains a legacy nonempty plan that cannot become generation \

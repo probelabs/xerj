@@ -196,3 +196,49 @@ fn a_broken_link_is_not_an_escape() {
         "a dangling link is not an escape: {report:?}"
     );
 }
+
+/// The escape hatch. Refusing every out-of-root target is right by default and
+/// wrong as the only option: for a vendored sibling checkout or a mounted
+/// volume, following the link outward IS the reason the flag was turned on.
+/// `--follow-symlinks-outside-root` waives the root boundary — and nothing
+/// else. The hidden-name rule still applies to whatever the link resolves to,
+/// which is the half that keeps `.ssh` out.
+#[test]
+fn the_outside_root_opt_in_waives_the_boundary_and_nothing_else() {
+    let dir = fixture();
+    let root = dir.path().join("root");
+
+    let (refused, _) = xerj_autoindex::walk::walk_reporting_opts(
+        &root,
+        true,
+        false,
+        xerj_autoindex::ignore_rules::IgnoreOptions::default(),
+    )
+    .expect("walk succeeds");
+    assert!(
+        !refused.iter().any(|f| f.rel.starts_with("shared")),
+        "default must still refuse the out-of-root link"
+    );
+
+    let (allowed, report) = xerj_autoindex::walk::walk_reporting_opts(
+        &root,
+        true,
+        true,
+        xerj_autoindex::ignore_rules::IgnoreOptions::default(),
+    )
+    .expect("walk succeeds");
+    let rels: Vec<&str> = allowed.iter().map(|f| f.rel.as_str()).collect();
+    assert!(
+        rels.iter().any(|r| r.starts_with("shared")),
+        "the opt-in must actually follow the link outward: {rels:?}"
+    );
+
+    // The half that must NOT be waived.
+    for leaked in ["notes.txt", "hop.txt", "chain.txt"] {
+        assert!(
+            !rels.contains(&leaked),
+            "`{leaked}` resolves into .secretdir — the hidden rule is not part \
+             of the opt-in: {rels:?} {report:?}"
+        );
+    }
+}

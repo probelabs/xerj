@@ -145,6 +145,24 @@ pub fn walk_reporting(
     follow_symlinks: bool,
     ignore: IgnoreOptions,
 ) -> Result<(Vec<FileEntry>, IgnoreReport)> {
+    walk_reporting_opts(root, follow_symlinks, false, ignore)
+}
+
+/// As [`walk_reporting`], with the out-of-root escape hatch.
+///
+/// `allow_outside_root` restores the pre-#438 behaviour of following a link
+/// wherever it points. It exists because refusing every out-of-root target is
+/// not a narrowing of `--follow-symlinks` — for a vendored sibling checkout, a
+/// monorepo package link or a mounted notes volume it IS the flag, and without
+/// an opt-in those runs silently index what they would index with the flag off.
+/// The hidden-name rule still applies to the resolved path either way; only the
+/// root boundary is waived, and only when the operator says so.
+pub fn walk_reporting_opts(
+    root: &Path,
+    follow_symlinks: bool,
+    allow_outside_root: bool,
+    ignore: IgnoreOptions,
+) -> Result<(Vec<FileEntry>, IgnoreReport)> {
     let root_canon = root
         .canonicalize()
         .with_context(|| format!("resolve root folder {}", root.display()))?;
@@ -257,6 +275,7 @@ pub fn walk_reporting(
         if follow_symlinks && entry.depth() > 0 && through_link {
             match escaped_or_hidden_target(&root_canon, entry.path()) {
                 Ok(real) => resolved = real,
+                Err(SymlinkVerdict::OutsideRoot) if allow_outside_root => {}
                 Err(SymlinkVerdict::OutsideRoot) => {
                     stack.record_symlink_escape(is_dir);
                     if is_dir {

@@ -115,6 +115,11 @@ pub struct ExecutionIdentity {
     pub url: String,
     pub prefix: String,
     pub follow_symlinks: bool,
+    /// `--follow-symlinks-outside-root`. Defaulted for journals written before
+    /// the flag existed: those runs refused out-of-root targets, which is what
+    /// `false` means, so an old journal reads back as the run it actually was.
+    #[serde(default)]
+    pub follow_symlinks_outside_root: bool,
     pub chunker_identity: String,
     /// Opaque, server-authenticated identity of the exact embedding execution
     /// space. Autoindex must never synthesize model/tokenizer labels.
