@@ -97,31 +97,58 @@ After transfer, set the same approved `TAG` in the enclave and verify before
 extracting:
 
 ```bash
-set -eu
-
 : "${TAG:?set TAG to the same operator-approved release tag}"
 VERSION="${TAG#v}"
 STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
 ASSET="${STAGE}.tar.gz"
 
 (
+  set -eu
   cd /opt/xerj-staging/release
-  grep -qF "  $ASSET" "$ASSET.sha256"
-  sha256sum -c "$ASSET.sha256"
-  rm -rf "$STAGE"
+
+  want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
+  if [[ ! "$want" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "could not compute a digest for $ASSET" >&2
+    exit 1
+  fi
+  LC_ALL=C grep -qxF -e "$want  $ASSET" -e "$want *$ASSET" \
+    < <(tr -d '\r' < "$ASSET.sha256")
+
+  rm -rf "$STAGE" "$STAGE.verified"
   tar -xzf "$ASSET"
   test -x "$STAGE/xerj"
+  mv "$STAGE" "$STAGE.verified"
 )
 ```
 
-Each step is on its own line for a reason. `set -e` does not stop a command
-that is part of an `&&` list unless it is the last one, so writing the same
-sequence as `sha256sum -c … && tar -xzf …` leaves the block exiting `0` after a
-failed digest and lets a wrapping script continue into section 2. The `grep`
-line is what makes the digest apply to this asset: `sha256sum -c` reports
-success for whatever filenames the `.sha256` happens to list, including a file
-that is not the archive you are about to extract. `rm -rf "$STAGE"` removes any
-tree left behind by an earlier run, so `test -x` cannot pass on a stale binary.
+Three details here are load-bearing, and each replaces something that looked
+right and was not.
+
+**The digest is computed here and the file is searched for it, not the other way
+round.** `sha256sum -c` reads the filename out of the `.sha256` — a file that
+crossed the airgap on the same medium as the archive — and reports success for
+whatever it happens to name. It skips `#` comments silently and exits `0` if any
+one line verified, so a `.sha256` carrying a valid digest for some other file
+plus a comment mentioning the archive passes while the archive is never hashed.
+Filtering that file first does not fix it either: `awk '$2 == asset'` compares
+one whitespace-delimited token, while `sha256sum` takes the whole rest of the
+line as the filename, so a line naming `$ASSET decoy` satisfies the filter and
+hashes a decoy. Building the expected line in the shell and demanding it with
+`grep -qxF` removes the disagreement — there is no field-splitting left for the
+two programs to differ about, and the asset name is never interpreted. The two
+patterns accept GNU text mode and `-b` binary mode; `tr -d '\r'` accepts a
+checksum file written on Windows.
+
+**`set -eu` is inside the subshell.** At the top of the block it kills the
+operator's login shell on a bad digest — actively harmful over a serial console,
+where the natural recovery is to re-paste without it, which is the fail-open
+form. Inside, a failure ends the subshell and the operator keeps their session.
+
+**Section 2 installs from `$STAGE.verified`, which `mv` creates only after the
+digest, the extraction and `test -x` have all succeeded.** That is what makes
+the block safe when its exit status is ignored — by a wrapping script, an agent,
+or a reader who pastes the next section anyway. Nothing needs to check a return
+code, because on any failure there is simply nothing at the install path.
 
 ## 2. Install the base lexical node
 
@@ -139,7 +166,7 @@ fi
 sudo install -d -m 0755 /opt/xerj/bin /etc/xerj
 sudo install -d -o xerj -g xerj -m 0750 /var/lib/xerj
 sudo install -m 0755 \
-  "/opt/xerj-staging/release/xerj-${VERSION}-x86_64-unknown-linux-musl/xerj" \
+  "/opt/xerj-staging/release/xerj-${VERSION}-x86_64-unknown-linux-musl.verified/xerj" \
   /opt/xerj/bin/xerj
 ```
 
