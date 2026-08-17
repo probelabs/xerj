@@ -32,10 +32,15 @@ use xerj_autoindex::walk::walk_reporting;
 ///   shared             ->  ../outside              (escapes the root)
 ///   sub/deep.md            visible, ordinary, below a directory
 /// outside/etc/shadow       must never appear
-fn fixture() -> tempfile::TempDir {
+fn fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().join("root");
-    let outside = dir.path().join("outside");
+    // `tempfile` names its directories `.tmpXXXXXX`, a hidden component. Every
+    // fixture is anchored one level below it so the harness's own name does not
+    // trip the dotfile rule the tests are about.
+    let base = dir.path().join("base");
+    std::fs::create_dir_all(&base).expect("base");
+    let root = base.join("root");
+    let outside = base.join("outside");
 
     fs::create_dir_all(root.join(".secretdir")).unwrap();
     fs::create_dir_all(root.join("sub")).unwrap();
@@ -52,7 +57,7 @@ fn fixture() -> tempfile::TempDir {
     symlink("README.md", root.join("plain-link.txt")).unwrap();
     symlink(&outside, root.join("shared")).unwrap();
 
-    dir
+    (dir, root)
 }
 
 fn walk_rels(
@@ -69,8 +74,7 @@ fn walk_rels(
 /// The whole point: with links followed, no secret and nothing from outside.
 #[test]
 fn following_links_indexes_neither_the_secret_nor_anything_outside_the_root() {
-    let dir = fixture();
-    let root = dir.path().join("root");
+    let (_dir, root) = fixture();
 
     let (rels, report) = walk_rels(&root, true);
 
@@ -123,8 +127,7 @@ fn following_links_indexes_neither_the_secret_nor_anything_outside_the_root() {
 /// the link files themselves are the entries and nothing resolves.
 #[test]
 fn not_following_links_is_unchanged() {
-    let dir = fixture();
-    let root = dir.path().join("root");
+    let (_dir, root) = fixture();
 
     let (rels, report) = walk_rels(&root, false);
 
@@ -144,7 +147,7 @@ fn not_following_links_is_unchanged() {
 #[test]
 fn a_link_to_a_visible_file_inside_the_root_is_still_indexed() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("root");
+    let root = dir.path().join("base").join("root");
     fs::create_dir_all(root.join("docs")).unwrap();
     fs::write(root.join("docs/real.md"), "real\n").unwrap();
     symlink("docs/real.md", root.join("alias.md")).unwrap();
@@ -162,7 +165,7 @@ fn a_link_to_a_visible_file_inside_the_root_is_still_indexed() {
 #[test]
 fn a_link_to_a_directory_inside_the_root_is_walked_and_still_hides_dotfiles() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("root");
+    let root = dir.path().join("base").join("root");
     fs::create_dir_all(root.join("real/.hidden")).unwrap();
     fs::write(root.join("real/open.md"), "open\n").unwrap();
     fs::write(root.join("real/.hidden/secret.md"), "secret\n").unwrap();
@@ -184,7 +187,7 @@ fn a_link_to_a_directory_inside_the_root_is_walked_and_still_hides_dotfiles() {
 #[test]
 fn a_broken_link_is_not_an_escape() {
     let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("root");
+    let root = dir.path().join("base").join("root");
     fs::create_dir_all(&root).unwrap();
     fs::write(root.join("real.md"), "real\n").unwrap();
     symlink("nowhere-at-all", root.join("dangling.md")).unwrap();
@@ -205,8 +208,7 @@ fn a_broken_link_is_not_an_escape() {
 /// which is the half that keeps `.ssh` out.
 #[test]
 fn the_outside_root_opt_in_waives_the_boundary_and_nothing_else() {
-    let dir = fixture();
-    let root = dir.path().join("root");
+    let (_dir, root) = fixture();
 
     let (refused, _) = xerj_autoindex::walk::walk_reporting_opts(
         &root,
@@ -233,7 +235,7 @@ fn the_outside_root_opt_in_waives_the_boundary_and_nothing_else() {
         "the opt-in must actually follow the link outward: {rels:?}"
     );
 
-    // The half that must NOT be waived.
+    // The half that must NOT be waived, in-root.
     for leaked in ["notes.txt", "hop.txt", "chain.txt"] {
         assert!(
             !rels.contains(&leaked),
@@ -241,4 +243,51 @@ fn the_outside_root_opt_in_waives_the_boundary_and_nothing_else() {
              of the opt-in: {rels:?} {report:?}"
         );
     }
+}
+
+/// The same half, OUTSIDE the root — which is the only place the opt-in
+/// actually changes anything, and where the first version of it failed.
+///
+/// `escaped_or_hidden_target` answered `OutsideRoot` before it looked for a
+/// hidden component, so the opt-in admitted the entry unexamined and
+/// `keys.txt -> ../outside/.ssh/id_rsa` was indexed with the key as its body.
+/// That is #438 reopened through the escape hatch built to be safe, and the
+/// test above did not catch it because every one of its links points inward.
+#[test]
+fn the_opt_in_does_not_admit_a_dotted_path_outside_the_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base");
+    fs::create_dir_all(&base).unwrap();
+    let root = base.join("root");
+    let outside = base.join("outside");
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::create_dir_all(outside.join(".ssh")).unwrap();
+    fs::create_dir_all(outside.join("pkg")).unwrap();
+    fs::write(root.join("README.md"), "readme\n").unwrap();
+    fs::write(outside.join(".ssh/id_rsa"), "PRIVATE KEY\n").unwrap();
+    fs::write(outside.join("pkg/lib.rs"), "pub fn f() {}\n").unwrap();
+
+    symlink(outside.join(".ssh/id_rsa"), root.join("keys.txt")).unwrap();
+    symlink(outside.join(".ssh"), root.join("conf")).unwrap();
+    symlink(outside.join("pkg"), root.join("shared-lib")).unwrap();
+
+    let (files, report) = xerj_autoindex::walk::walk_reporting_opts(
+        &root,
+        true,
+        true,
+        xerj_autoindex::ignore_rules::IgnoreOptions::default(),
+    )
+    .expect("walk succeeds");
+    let rels: Vec<&str> = files.iter().map(|f| f.rel.as_str()).collect();
+
+    assert!(
+        !rels
+            .iter()
+            .any(|r| r.starts_with("keys.txt") || r.starts_with("conf")),
+        "the opt-in must not admit a target under a dotted directory: {rels:?} {report:?}"
+    );
+    assert!(
+        rels.iter().any(|r| r.starts_with("shared-lib")),
+        "an ordinary out-of-root target is what the opt-in exists for: {rels:?}"
+    );
 }

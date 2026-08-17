@@ -121,8 +121,37 @@ fn escaped_or_hidden_target(
         Err(_) => return Err(SymlinkVerdict::Unresolvable),
     };
     let Some(rel) = real.strip_prefix(root_canon).ok() else {
+        // Outside the root — but the hidden-name question is asked FIRST and
+        // against the whole resolved path, because `OutsideRoot` is the only
+        // verdict `--follow-symlinks-outside-root` waives. Returning it before
+        // looking for a dotted component let that flag admit
+        // `keys.txt -> ../outside/.ssh/id_rsa` unexamined, which is #438
+        // reopened through the escape hatch built to be safe.
+        //
+        // Judged from where the target DIVERGES from the root, not from `/`.
+        // Checking every component would refuse any target whose absolute path
+        // passes through a dotted ancestor — `/home/u/.cache/...`, and every
+        // path under a `tempfile` directory, which is named `.tmpXXXXXX`. Those
+        // ancestors are shared with the root the operator pointed at, so they
+        // are as consented-to as the root itself; the components BELOW the
+        // divergence are the ones nobody asked for.
+        let shared = root_canon
+            .components()
+            .zip(real.components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if real
+            .components()
+            .skip(shared)
+            .any(|c| is_hidden_name(c.as_os_str()))
+        {
+            return Err(SymlinkVerdict::HiddenTarget);
+        }
         return Err(SymlinkVerdict::OutsideRoot);
     };
+    // In-root: judge only the part below the root. A brain over a dot-named
+    // folder still works — that exemption is the same one the walker gives the
+    // root itself at depth 0.
     if rel.components().any(|c| is_hidden_name(c.as_os_str())) {
         return Err(SymlinkVerdict::HiddenTarget);
     }

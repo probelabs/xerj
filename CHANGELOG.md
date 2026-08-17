@@ -27,7 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   link. If following links outward is why you turned the flag on — a vendored
   sibling checkout, a monorepo package link, a mounted volume — pass
   `--follow-symlinks-outside-root` to restore it. That waives the root boundary
-  and nothing else: the hidden-file rule still applies to the resolved path.
+  and nothing else: the hidden-file rule still applies to the resolved path,
+  judged from the point where the target diverges from the folder you pointed
+  at — so `notes -> ../sibling/pkg` is followed and `keys -> ../sibling/.ssh/id_rsa`
+  is not, while a dotted directory the two paths SHARE (a `/tmp/.tmpXXXX`, a
+  checkout under `~/.local`) does not refuse anything, because your own folder
+  is already inside it.
 
   Known limit, stated rather than implied: this is a rule about names and about
   where a link resolves. A **hard** link has neither, so a visible name hard-
