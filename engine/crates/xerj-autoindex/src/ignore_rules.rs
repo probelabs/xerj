@@ -97,9 +97,14 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 ];
 
 /// Rule label used for the pre-existing dotfile skip. It is not one of the
-/// ignore rules and `--no-ignore` does not disable it (it is what keeps `.env`
-/// and `.ssh` out of a queryable brain), but a user whose file vanished still
-/// needs it named, so it shares the reporting.
+/// ignore rules and `--no-ignore` does not disable it (it is the main thing
+/// keeping `.env` and `.ssh` out of a queryable brain), but a user whose file
+/// vanished still needs it named, so it shares the reporting.
+///
+/// It is a rule about names, and under `--follow-symlinks` about where a link
+/// resolves. A HARD link has neither, so a visible name hard-linked to a file
+/// inside a hidden directory is still indexed — see the note in
+/// [`crate::walk`].
 pub const HIDDEN_RULE: &str = "hidden:dotfile";
 
 /// A symlink whose resolved target lies outside the folder the operator

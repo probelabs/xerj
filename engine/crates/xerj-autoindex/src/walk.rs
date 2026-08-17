@@ -90,8 +90,10 @@ enum SymlinkVerdict {
 /// in it at once, which is what makes a chain of links (`a -> b -> .secret/c`)
 /// and a link partway up a directory path behave the same as a direct one.
 ///
-/// `None` means the entry is where it appears to be and the ordinary rules
-/// govern it.
+/// `Ok(Some(real))` is the resolved path, which the caller stores on the
+/// `FileEntry` so every later `open()` reads the file that was judged.
+/// `Ok(None)` means there is nothing to resolve and the ordinary rules govern
+/// the entry.
 ///
 /// A resolution FAILURE is not `None`. An earlier version of this function
 /// wrote `path.canonicalize().ok()?`, which collapsed every error into "the
@@ -109,19 +111,22 @@ enum SymlinkVerdict {
 /// reports a dangling link through its error arm. Everything else is refused
 /// and named in the report, because an answer that could not be computed is not
 /// an answer of "yes".
-fn escaped_or_hidden_target(root_canon: &Path, path: &Path) -> Option<SymlinkVerdict> {
+fn escaped_or_hidden_target(
+    root_canon: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, SymlinkVerdict> {
     let real = match path.canonicalize() {
         Ok(real) => real,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return Some(SymlinkVerdict::Unresolvable),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SymlinkVerdict::Unresolvable),
     };
-    let rel = real.strip_prefix(root_canon).ok();
-    let Some(rel) = rel else {
-        return Some(SymlinkVerdict::OutsideRoot);
+    let Some(rel) = real.strip_prefix(root_canon).ok() else {
+        return Err(SymlinkVerdict::OutsideRoot);
     };
-    rel.components()
-        .any(|c| is_hidden_name(c.as_os_str()))
-        .then_some(SymlinkVerdict::HiddenTarget)
+    if rel.components().any(|c| is_hidden_name(c.as_os_str())) {
+        return Err(SymlinkVerdict::HiddenTarget);
+    }
+    Ok(Some(real))
 }
 
 /// Walk with the default ignore rules on and the report discarded.
@@ -147,6 +152,8 @@ pub fn walk_reporting(
         anyhow::bail!("{} is not a directory", root_canon.display());
     }
     let mut out = Vec::new();
+    // Shallowest depth from which the walk is inside a symlink; see the guard.
+    let mut link_depth: Option<usize> = None;
     let marker_defaults = ignore.enabled && ignore.defaults;
     let mut stack = IgnoreStack::new(&root_canon, ignore);
     // Manual iteration rather than `filter_entry`, because the ignore stack has
@@ -183,7 +190,7 @@ pub fn walk_reporting(
         // `IgnoreStack::truncate_to` for why every entry needs it, not just
         // directories.
         stack.truncate_to(entry.depth());
-        // SECURITY / hygiene: never index hidden files or descend into hidden
+        // SECURITY / hygiene: do not index hidden files or descend into hidden
         // directories. Without this the walker happily indexed `.env` (secrets,
         // API tokens), `.git`, `.ssh`, `.aws`, and other dotfiles into a
         // queryable brain with no per-brain authorization — a real exposure for
@@ -191,7 +198,17 @@ pub fn walk_reporting(
         // pruned before descending, so `.git/` is skipped whole. The root
         // itself (depth 0) is exempt so a brain over a dot-named folder still
         // works. `--no-ignore` does NOT turn this off: it is not one of the
-        // ignore rules, it is the reason secrets stay out.
+        // ignore rules, it is the main reason secrets stay out.
+        //
+        // The limit of that claim, stated because the rest of this file used to
+        // assert it without one: this is a rule about NAMES and, under
+        // `--follow-symlinks`, about where a link RESOLVES. A hard link has
+        // neither — it is a second directory entry for the same inode, so
+        // `ln .secretdir/k.txt notes.txt` reads the secret under a visible name
+        // and nothing here can tell. Defending that needs `(dev, ino)` of every
+        // hidden-rule exclusion, which a walk that prunes hidden directories
+        // without descending does not have. `cp -al`, `rsync --link-dest` and
+        // hard-linked package stores all produce that shape without an attacker.
         if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
             stack.record_hidden(is_dir);
             if is_dir {
@@ -213,30 +230,54 @@ pub fn walk_reporting(
         // So under the flag the same two questions are asked of the RESOLVED
         // path instead of the name. Loop-safety is walkdir's and unrelated;
         // this is the secret rule and the root boundary.
-        if follow_symlinks && entry.depth() > 0 {
+        // Resolving is only necessary once the walk has actually gone through a
+        // link. `canonicalize` is `realpath(3)` and issues one `readlinkat` per
+        // path component, so doing it for every entry costs 8-14 failing
+        // syscalls per file on an ordinary tree and made the walk 4.2x slower
+        // with 7.6x the syscalls — all of it wasted on paths where no link
+        // exists. `link_depth` is the shallowest depth at or below which some
+        // ancestor (or the entry itself) is a symlink; below that the walk path
+        // and the real path cannot differ.
+        if entry.path_is_symlink() {
+            link_depth = Some(link_depth.map_or(entry.depth(), |d: usize| d.min(entry.depth())));
+        } else if is_dir && link_depth.is_some_and(|d| entry.depth() <= d) {
+            link_depth = None;
+        }
+        let through_link = entry.path_is_symlink() || link_depth.is_some_and(|d| entry.depth() > d);
+        // The path every later stage should open. The guard resolves the entry
+        // to decide on it; keeping that resolution is what stops the decision
+        // being made about one file and the bytes being read from another.
+        // `content.rs` hashes and `lib.rs` extracts from `FileEntry::path`
+        // minutes after the walk on a large corpus, each a fresh `open()` that
+        // re-follows the link — so a link re-pointed in between handed the
+        // refused content straight into a document body. `rel` still comes from
+        // the walk path: that is the name the operator pointed at and the
+        // identity the index is keyed on.
+        let mut resolved: Option<PathBuf> = None;
+        if follow_symlinks && entry.depth() > 0 && through_link {
             match escaped_or_hidden_target(&root_canon, entry.path()) {
-                Some(SymlinkVerdict::OutsideRoot) => {
+                Ok(real) => resolved = real,
+                Err(SymlinkVerdict::OutsideRoot) => {
                     stack.record_symlink_escape(is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
-                Some(SymlinkVerdict::HiddenTarget) => {
+                Err(SymlinkVerdict::HiddenTarget) => {
                     stack.record_hidden(is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
-                Some(SymlinkVerdict::Unresolvable) => {
+                Err(SymlinkVerdict::Unresolvable) => {
                     stack.record_symlink_unresolved(is_dir);
                     if is_dir {
                         it.skip_current_dir();
                     }
                     continue;
                 }
-                None => {}
             }
         }
         if is_dir {
@@ -280,7 +321,7 @@ pub fn walk_reporting(
             .replace('\\', "/");
         let rel_id = stable_path_id(p.strip_prefix(&root_canon).unwrap_or(&p));
         out.push(FileEntry {
-            path: p,
+            path: resolved.unwrap_or(p),
             rel,
             rel_id,
             is_symlink: entry
@@ -347,13 +388,19 @@ mod hidden_skip_tests {
         // Exists and resolves inside the root: admitted.
         std::fs::write(root.join("plain.txt"), "x").unwrap();
         assert!(
-            escaped_or_hidden_target(&root, &root.join("plain.txt")).is_none(),
-            "an ordinary in-root file must be governed by the ordinary rules"
+            matches!(
+                escaped_or_hidden_target(&root, &root.join("plain.txt")),
+                Ok(Some(_))
+            ),
+            "an ordinary in-root file must resolve and be governed by the ordinary rules"
         );
 
         // Does not exist: nothing to leak, so also admitted — walkdir reports it.
         assert!(
-            escaped_or_hidden_target(&root, &root.join("gone.txt")).is_none(),
+            matches!(
+                escaped_or_hidden_target(&root, &root.join("gone.txt")),
+                Ok(None)
+            ),
             "a dangling link has no target and must not be reported as a refusal"
         );
 
@@ -362,7 +409,7 @@ mod hidden_skip_tests {
         assert!(
             matches!(
                 escaped_or_hidden_target(&root, &bad),
-                Some(SymlinkVerdict::Unresolvable)
+                Err(SymlinkVerdict::Unresolvable)
             ),
             "an unresolvable path must be refused — `could not compute` is not `yes`"
         );
