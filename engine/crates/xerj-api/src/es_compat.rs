@@ -18023,11 +18023,35 @@ pub async fn count_docs(
             }
             out
         };
-        let has_query = body
-            .as_ref()
-            .and_then(|b| b.get("query"))
-            .map(|q| !q.is_null())
-            .unwrap_or(false);
+        // Alias filters, collected from the selector AS WRITTEN. Expanding an
+        // alias to its members and summing their raw document counts answers
+        // the unfiltered corpus — for a filtered alias that is not a smaller
+        // wrong answer than before, it is a LARGER one, and it made `_count`
+        // disagree with `_search` in the opposite direction. A filtered alias
+        // is the usual poor-man's document boundary, so the count has to be of
+        // what the alias exposes.
+        let mut alias_filters: Vec<Value> = Vec::new();
+        for part in index.split(',').map(str::trim) {
+            for entry in state.engine.aliases.iter() {
+                if entry.key() != part {
+                    continue;
+                }
+                for backing in entry.value().iter() {
+                    if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                        if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned()
+                        {
+                            alias_filters.push(filter);
+                        }
+                    }
+                }
+            }
+        }
+        let has_query = !alias_filters.is_empty()
+            || body
+                .as_ref()
+                .and_then(|b| b.get("query"))
+                .map(|q| !q.is_null())
+                .unwrap_or(false);
         // A refused query is not a zero. This loop used to run the search under
         // `if let Ok(..)` with no else, so an index whose mapping refuses the
         // query — a `match` on an `"index": false` field, say — contributed
@@ -18060,6 +18084,14 @@ pub async fn count_docs(
                     .and_then(|b| b.get("query"))
                     .cloned()
                     .unwrap_or(json!({ "match_all": {} }));
+                if !alias_filters.is_empty() {
+                    query_val = json!({
+                        "bool": {
+                            "must": [query_val],
+                            "filter": alias_filters.clone(),
+                        }
+                    });
+                }
                 // Resolve `terms` lookups exactly as `_search` does — without
                 // this, `_count` silently returned 0 for a filter that
                 // `_search` counts correctly (the parser sees the raw lookup
