@@ -1,0 +1,15 @@
+[server]
+rest_port = 9550
+grpc_port = 9551
+es_compat_port = 9552
+data_dir = "/tmp/xerj-rc10-neural-data"
+
+[tls]
+enabled = false
+
+[auth]
+enabled = false
+
+[embedding]
+mode = "neural"
+model_cache_dir = "/tmp/xerj-neural-model-cache"
