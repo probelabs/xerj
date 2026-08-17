@@ -102,9 +102,12 @@ const PREFIX: usize = 8192;
 
 /// Bytes read when the file already carries GIF magic. A Comment Extension is
 /// unbounded by the format, so this is a budget rather than a guarantee: it
-/// covers every commented GIF in the measured corpus with room to spare, and
-/// when a chain still outruns it the qualifier declines rather than inventing
-/// a discriminator — which is what the previous four rounds did wrong.
+/// covers every commented GIF in the measured corpus with room to spare, and a
+/// chain that is still well-formed after a megabyte is itself the evidence that
+/// the file is an image — see the `None` arm of the comment walk. The size is
+/// load-bearing in one direction only: raising it costs a larger read on GIF
+/// candidates, lowering it moves files from "walked a megabyte" to "ran out of
+/// file", which is the answer text gets.
 const GIF_PREFIX: usize = 1 << 20;
 
 fn read_prefix(path: &Path, gzip: bool, n: usize) -> Result<Vec<u8>> {
@@ -446,9 +449,10 @@ fn accept(_prefix: &[u8]) -> bool {
 ///   * after `0x21`, the extension label. The spec defines four — Plain Text
 ///     `0x01`, Graphic Control `0xF9`, Comment `0xFE`, Application `0xFF` —
 ///     three unprintable and the fourth a control character. Three of them also
-///     pin the first sub-block size; Comment does not, so its chain is walked,
-///     and a chain that outruns the 8 KiB buffer is settled on the canvas
-///     instead — see `canvas_dimension_text_cannot_write`.
+///     pin the first sub-block size; Comment does not, so its chain is walked.
+///     A chain that outruns the read budget is settled on how it ran out:
+///     a full buffer means a megabyte of chain held together, a short one means
+///     the file ended mid-chain.
 ///   * after `0x2C`, a 9-byte Image Descriptor. The frame must be non-empty and
 ///     must fit inside the canvas declared two fields earlier, which four
 ///     little-endian u16s of prose do not.
@@ -538,10 +542,30 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                             return matches!(prefix.get(at + 1), None | Some(0x21 | 0x2c | 0x3b));
                         }
                         Some(&len) => at += 1 + usize::from(len),
-                        // Ran past the prefix — undecidable HERE, so decide on
-                        // the Logical Screen Descriptor instead. See
-                        // `canvas_dimension_text_cannot_write`.
-                        None => return canvas_dimension_text_cannot_write(prefix),
+                        // Ran out of bytes. Two different situations arrive
+                        // here and conflating them is what four rounds of this
+                        // fix got wrong:
+                        //
+                        //   * The buffer is FULL. The chain has been walked
+                        //     across a megabyte of sub-blocks without hitting a
+                        //     byte that breaks it. Text cannot do that: prose
+                        //     carries no NUL to terminate on and no structure to
+                        //     keep landing on, so a megabyte of "still
+                        //     consistent" is the evidence, not the absence of
+                        //     it. Image.
+                        //   * The buffer is SHORT, i.e. the file ended. A real
+                        //     GIF terminates its comment and follows it with
+                        //     image data and a trailer, so a chain still running
+                        //     at EOF is not one. This is the case a text file
+                        //     under the budget lands in, which is what keeps
+                        //     #379 fixed.
+                        //
+                        // This asks the chain a question the chain can answer.
+                        // The rule it replaces asked the canvas instead, which
+                        // is a guess dressed as a discriminator: it refuses any
+                        // image whose canvas high bytes happen to be printable,
+                        // and 18 real GIFs on main are junked into prose by it.
+                        None => return prefix.len() >= GIF_PREFIX,
                     }
                 }
             }
@@ -599,79 +623,47 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
     }
 }
 
-/// The tie-break for a Comment sub-block chain that runs past the 8 KiB
-/// `read_prefix` buffer, decided on the Logical Screen Descriptor because it
-/// CANNOT be decided on the chain.
-///
-/// The chain carries no evidence at that point, and this is the whole reason
-/// the arm above is written the way it is: every sub-block size in `1..=255` is
-/// legal, so "the sizes we managed to see" says nothing about whether the file
-/// is an image. Round 3 shipped `seen > 1 && every size seen is 0xFF`, on the
-/// reasoning that encoders pack long comments maximally. They do not. Measured
-/// against a 939-file ground-truth corpus (674 images / 265 text files, every
-/// image decode-checked twice — Pillow `open`+`load` and giflib
-/// `DGifOpenFileName`+`DGifSlurp`):
-///
-///   * 92 corpus images open on a Comment whose chain outruns the buffer. The
-///     0xFF rule refuses 37 of them: 33 land in `TxtProse` and are sectioned
-///     into 2,519 junk records, 4 reach `binary`/`unknown` on the control-char
-///     ratio alone. giflib's streaming API (`EGifPutExtensionBlock`) writes ONE
-///     sub-block per call at whatever length the caller passed, so chains of 1,
-///     2, 16, 32, 64, 100, 120, 127, 128, 192, 200 and 250..=254 bytes are all
-///     ordinary encoder output; ImageMagick writes 200/199/199… and
-///     Pillow-then-spliced files mix 255 with 10.
-///   * The eight real commented GIFs on the build machine carry sub-blocks of
-///     17, 26, 45 and 49 bytes and not a single 255 (GIMP, ezgif.com and
-///     ajaxload.info output, in Lucene, Supabase and pdfjs-dist checkouts).
-///     They terminate inside the prefix so they never reach here — but they are
-///     what the 0xFF premise was measured against, and it is false.
-///
-/// So the decision moves to a field prose cannot forge. The canvas dimensions
-/// are two little-endian u16 at fixed offsets 6..10, always inside the prefix,
-/// which puts their HIGH bytes at 7 and 9. Every printable ASCII byte is
-/// `>= 0x20`, so all-printable text can only ever declare a dimension
-/// `>= 0x2000` (8192); a windows-1252 accent or a UTF-8 lead/continuation byte
-/// is `>= 0x80`, i.e. `>= 32768`. A dimension BELOW 8192 therefore requires a
-/// control byte at 7 or 9 — and the three control bytes text does legitimately
-/// carry (`\t`, `\n`, `\r`) are excluded, because they are exactly the ones it
-/// can. That exclusion is not theoretical: `"GIF89ax\ny…"` + `!` + 0xFE + French
-/// prose is junked as an image by a bare `< 8192` test and stays `TxtProse`
-/// with the exclusion — measured, and pinned by
-/// `prose_with_a_newline_in_the_canvas_is_not_a_gif`.
-///
-/// Cost on real images, measured over the same corpus: 673 of 674 declare a
-/// dimension under 8192, the exception being a JPEG someone had named `.gif`
-/// (17994x17993 read out of JFIF bytes, and it fails the `GIF8` magic anyway).
-/// The largest genuine canvas here is 2000x2000, so the rule has ~4x of margin,
-/// and no corpus image carries `\t`/`\n`/`\r` as a canvas high byte at all
-/// (high bytes observed: 0, 1, 2, 3, 4, 5, 7). The confusion matrix through
-/// `sniff()` for this rule is 666 images binary/gif, 6 binary/other, 2 text,
-/// against 257 of 265 text files still text — the 8 exceptions and the 2
-/// images being decided by OTHER arms, unchanged by this one.
-///
-/// What was tried and refused, with the measurement that refused it:
-///
-///   * `true` ("inconclusive means image"): keeps all 92, but junks 10 corpus
-///     text files as `binary (gif)` — prose only has to land `!`, a
-///     windows-1252 0xFE and one non-zero byte, which is #379 all over again.
-///   * `false` (round 2): refuses all 92; 88 of them become 3,063 prose records.
-///   * not matching `0xFE` at all: refuses every comment-first GIF, terminated
-///     or not — 420 of the 674 images still classify `gif` against 666 here,
-///     177 land in the text path — and it saves not one text file over `false`.
-///   * the Global Colour Table flag (`packed & 0x80`), the other LSD field that
-///     looks unforgeable: it is NOT. A windows-1252 accented letter at offset
-///     10 sets it, which is how the corpus's own `gctflag_*` fixtures were
-///     built — 8 of them are junked as images by that rule.
-///   * "the prefix is short, so the chain ran past EOF, so the file is
-///     truncated": true for the two corpus files it fires on (nmap's
-///     `pixel.gif`, which no decoder accepts), but `read_prefix` swallows the
-///     error on a gzip member (`read_to_end(..).ok()`), so a short buffer does
-///     not mean EOF for a `.gif.gz` and the rule would refuse it.
-fn canvas_dimension_text_cannot_write(prefix: &[u8]) -> bool {
-    // `prefix[..13]` is guaranteed by the length check in the only caller.
-    let high_byte_is_binary = |hi: u8| hi < 0x20 && !matches!(hi, b'\t' | b'\n' | b'\r');
-    high_byte_is_binary(prefix[7]) || high_byte_is_binary(prefix[9])
-}
+// A Comment sub-block chain that outruns the read budget is decided by the
+// chain itself: see the `None` arm above. This is the fifth attempt at that
+// decision and the first that does not invent a discriminator, so the four
+// refused rules are recorded here to stop a sixth from re-deriving one.
+// Measurements are against a 939-file ground-truth corpus (674 images / 265
+// text files, every image decode-checked twice — Pillow `open`+`load` and
+// giflib `DGifOpenFileName`+`DGifSlurp`), plus 138 later counterexamples built
+// specifically to break whichever rule was current.
+//
+//   * `false` ("inconclusive means text", round 2): refuses all 92 corpus
+//     images that open on an outrunning comment; 88 become 3,063 prose records.
+//   * `seen > 1 && every size seen is 0xFF` (round 3), on the reasoning that
+//     encoders pack long comments maximally. They do not. giflib's streaming
+//     `EGifPutExtensionBlock` writes ONE sub-block per call at whatever length
+//     the caller passed, so chains of 1, 2, 16, 32, 64, 100, 120, 127, 128,
+//     192, 200 and 250..=254 are ordinary encoder output; ImageMagick writes
+//     200/199/199…, and the eight real commented GIFs on the build machine
+//     (GIMP, ezgif.com, ajaxload.info) carry 17, 26, 45 and 49 and not one 255.
+//     Refuses 37 of the 92.
+//   * the canvas high bytes at offsets 7 and 9 (round 4), on the reasoning
+//     that printable text can only declare a dimension >= 0x2000. True, and
+//     still a guess about the file rather than a reading of it: it refuses any
+//     real image whose canvas high byte is printable. 30 decodable GIFs
+//     regress to `TxtProse` and 37,450 junk records, and the corpus could not
+//     see it because its canvas high bytes are all 0..8 and 11.
+//   * the Global Colour Table flag (`packed & 0x80`), the other LSD field that
+//     looks unforgeable: it is not. A windows-1252 accented letter at offset 10
+//     sets it, which is how the corpus's own `gctflag_*` fixtures were built —
+//     8 of them are junked as images by that rule.
+//
+// The lesson each of those shares is that a property of the files at hand was
+// written down as a property of the format. The budget test is not that: a
+// full buffer means a megabyte of sub-block chain was actually traversed.
+//
+// One asymmetry is deliberate. `read_prefix` swallows a decompression error on
+// a gzip member (`read_to_end(..).ok()`), so a SHORT buffer does not strictly
+// prove EOF for a `.gif.gz`. A short buffer therefore decides text, which can
+// only mislabel a `.gif.gz` whose comment chain was still running when the
+// stream broke — a file no decoder accepts either. A FULL buffer is
+// unambiguous in both cases, and that is the only direction that answers
+// "image".
 
 /// Windows bitmap: `BM`, then a 14-byte BITMAPFILEHEADER, then a DIB header
 /// that opens with its own size.
@@ -2066,10 +2058,23 @@ mod printable_magic_tests {
             g
         }
 
-        for len in [13usize, 255, 300, 4000, 8_192, 20_000, 60_000] {
+        // The last entry outruns `GIF_PREFIX`, so it exercises the arm that
+        // decides on how the buffer ran out rather than on the terminator.
+        for len in [
+            13usize,
+            255,
+            300,
+            4000,
+            8_192,
+            20_000,
+            60_000,
+            GIF_PREFIX + 4096,
+        ] {
             let g = comment_gif(len);
-            // What `sniff` actually gets to see.
-            let prefix: Vec<u8> = g.iter().copied().take(8192).collect();
+            // What `sniff` actually gets to see: `sniff_with_name` re-reads a
+            // GIF candidate to `GIF_PREFIX`, so this is the whole file or a
+            // megabyte of it, never 8 KiB.
+            let prefix: Vec<u8> = g.iter().copied().take(GIF_PREFIX).collect();
             let p = Path::new("frame.gif");
             let sn = sniff_bytes(&prefix, p, p, false).unwrap();
             assert_eq!(
@@ -2083,9 +2088,9 @@ mod printable_magic_tests {
     }
 
     /// GIF89a, `canvas` px square, 2-entry global colour table, then a Comment
-    /// Extension whose sub-blocks are `sizes` cycled until the chain is longer
-    /// than the 8 KiB `sniff` prefix. Returns exactly what `read_prefix` would
-    /// hand `sniff_bytes` — the first 8192 bytes and no more.
+    /// Extension whose sub-blocks are `sizes` cycled until the chain outruns
+    /// the GIF read budget. Returns exactly what `read_prefix` would hand
+    /// `sniff_bytes` for such a file — `GIF_PREFIX` bytes and no more.
     fn streamed_comment_prefix(canvas: u16, sizes: &[u8]) -> Vec<u8> {
         let mut g: Vec<u8> = b"GIF89a".to_vec();
         g.extend_from_slice(&canvas.to_le_bytes());
@@ -2096,13 +2101,13 @@ mod printable_magic_tests {
         g.extend_from_slice(&[0, 0, 0, 0xff, 0xff, 0xff]); // GCT
         g.extend_from_slice(&[0x21, 0xfe]); // Comment Extension
         for &n in sizes.iter().cycle() {
-            if g.len() > 9000 {
+            if g.len() > GIF_PREFIX + 512 {
                 break;
             }
             g.push(n);
             g.extend(std::iter::repeat_n(b'D', usize::from(n)));
         }
-        g.truncate(8192);
+        g.truncate(GIF_PREFIX);
         g
     }
 
@@ -2146,7 +2151,11 @@ mod printable_magic_tests {
             ("spliced-20-then-255", &[20, 255, 255, 255][..]),
         ] {
             let prefix = streamed_comment_prefix(48, sizes);
-            assert_eq!(prefix.len(), 8192, "{label}: fixture must fill the prefix");
+            assert_eq!(
+                prefix.len(),
+                GIF_PREFIX,
+                "{label}: fixture must fill the GIF read budget"
+            );
             let p = Path::new("frame.gif");
             let sn = sniff_bytes(&prefix, p, p, false).unwrap();
             assert_eq!(
@@ -2234,11 +2243,58 @@ mod printable_magic_tests {
             assert_eq!(
                 sn.family,
                 Family::TxtProse,
-                "{label}: prose was junked as {:?} — a canvas rule that admits \
-                 the control characters text actually carries is not a rule",
+                "{label}: prose was junked as {:?} — this file ends mid-chain, \
+                 which is what a text file does and a GIF does not",
                 sn.binary_kind
             );
         }
+    }
+
+    /// The cost of deciding a budget-exhausted chain as an image, pinned so it
+    /// is a recorded trade and not a later surprise.
+    ///
+    /// A file that outruns `GIF_PREFIX` with its chain intact is called an
+    /// image. Prose can reach that state, but only by opening with the whole
+    /// GIF header: `GIF89a`, eight bytes forming a Logical Screen Descriptor
+    /// the earlier checks accept, `!` at 13, and — the part ordinary text does
+    /// not have — a `0xFE` at offset 14, which is `þ` in windows-1252 and not
+    /// ASCII at all. It must then run for a megabyte without a NUL.
+    ///
+    /// The alternative was the round-4 canvas rule, and its cost is unbounded
+    /// in the other direction: it junks any real image whose canvas high bytes
+    /// are printable, which is 18 decodable GIFs on `main` today and grows with
+    /// canvas size. Measured over the 265-file text corpus, this rule changes
+    /// nothing — 257 stay text, the same 8 reach `Binary` by other arms.
+    #[test]
+    fn prose_past_the_budget_is_called_an_image_and_prose_under_it_is_not() {
+        let mut prose: Vec<u8> = b"GIF89ax".to_vec();
+        prose.push(b'\n'); // 7: the canvas high byte round 4 keyed on
+        prose.extend_from_slice(b"yzest");
+        prose.push(b'!'); // 13
+        prose.push(0xfe); // 14: windows-1252 `þ`, the shape's real cost of entry
+        prose.push(b'L'); // 15: first sub-block size
+        while prose.len() < GIF_PREFIX + 4096 {
+            prose.extend_from_slice(
+                "Le format GIF est tres ancien et reste partout sur le web. ".as_bytes(),
+            );
+        }
+        let p = Path::new("notes.txt");
+
+        let under: Vec<u8> = prose.iter().copied().take(200_000).collect();
+        assert_eq!(
+            sniff_bytes(&under, p, p, false).unwrap().family,
+            Family::TxtProse,
+            "prose that ends before the budget must stay text"
+        );
+
+        let over: Vec<u8> = prose.iter().copied().take(GIF_PREFIX).collect();
+        assert_eq!(
+            sniff_bytes(&over, p, p, false).unwrap().family,
+            Family::Binary,
+            "a chain intact across the whole budget is called an image — if this \
+             ever needs to change, change the budget or find evidence the chain \
+             can carry, do not go back to guessing from a fixed offset"
+        );
     }
 
     /// The other half of the same arm: prose must not reach it. `0xFE` is not
