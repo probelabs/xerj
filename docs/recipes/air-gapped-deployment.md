@@ -108,13 +108,13 @@ VERSION="${TAG#v}"
 STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
 ASSET="${STAGE}.tar.gz"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
-cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
-
 (
   set -eu
+
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
+  cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
   cd "$work"
 
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
@@ -179,14 +179,31 @@ one was broken through the handoff rather than through the digest. There is no
 handoff now, so nothing later has to be trusted and no exit status has to be
 checked.
 
-**`mktemp -d` puts the work directory under `TMPDIR`, and that is an
-assumption.** It is safe when `TMPDIR` is sticky and not attacker-writable —
-the default `/tmp` on any normal system. It is NOT safe if `/tmp` has been made
-world-writable without the sticky bit, or if `TMPDIR` points into a directory
-the attacker controls: renaming a directory entry needs write on the parent, so
-the work directory can then be swapped however restrictive its own mode is. If
-your enclave is unusual here, set `TMPDIR` to a root-owned directory before
-running these blocks.
+**`mktemp -d` runs INSIDE the subshell, under `set -eu`.** It was outside in an
+earlier version, where a failure was not fatal and its status was never checked:
+`work` became the empty string, both `cp` lines failed, and `cd ""` returns 0 in
+bash without changing directory — so the block hashed and extracted `$ASSET`
+from whatever directory the operator happened to be in. If that was the staging
+directory, it silently became the double read again, printed the genuine digest
+and installed attacker bytes at exit 0.
+
+**The work directory must be writable by you and by nobody else.** `mktemp -d`
+uses `TMPDIR`, which is safe when that is sticky and not attacker-writable — the
+default `/tmp` on any normal system. It is not safe if `/tmp` has been made
+world-writable without the sticky bit, or if `TMPDIR` points somewhere the
+attacker can write: renaming a directory entry needs write on the parent, so the
+work directory can be swapped however restrictive its own mode is. If your
+enclave is unusual here, make a private directory and point `TMPDIR` at it:
+
+```bash
+install -d -m 0700 "$HOME/xerj-verify"
+export TMPDIR="$HOME/xerj-verify"
+```
+
+An earlier version of this page said "set `TMPDIR` to a root-owned directory",
+which is worse than no advice: a root-owned directory the attacker cannot write
+is one you cannot write either, so `mktemp` fails — and with the failure
+unchecked, that sentence was itself the trigger for the defect above.
 
 An attacker who rewrites the archive AND recomputes its `.sha256` still passes,
 and always will: that is the one case a checksum cannot answer, and the prose
@@ -255,14 +272,14 @@ installing anything — the same fail-closed rule as section 1, and the reason
 the check is a command here rather than a sentence:
 
 ```bash
-mwork="$(mktemp -d)"
-trap 'rm -rf "$mwork"' EXIT
-cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
-  "$mwork/"
-cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
-
 (
   set -eu
+
+  mwork="$(mktemp -d)"
+  trap 'rm -rf "$mwork"' EXIT
+  cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
+    "$mwork/"
+  cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
   cd "$mwork"
 
   for f in config.json tokenizer.json model.safetensors; do

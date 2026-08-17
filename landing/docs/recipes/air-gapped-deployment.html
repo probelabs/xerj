@@ -112,13 +112,13 @@ VERSION="${TAG#v}"
 STAGE="xerj-${VERSION}-x86_64-unknown-linux-musl"
 ASSET="${STAGE}.tar.gz"
 
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
-cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
-cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
-
 (
   set -eu
+
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  cp "/opt/xerj-staging/release/$ASSET" "$work/$ASSET"
+  cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
   cd "$work"
 
   want="$(sha256sum "$ASSET" | cut -d ' ' -f 1)"
@@ -141,7 +141,7 @@ cp "/opt/xerj-staging/release/$ASSET.sha256" "$work/$ASSET.sha256"
   sudo install -m 0755 "$STAGE/xerj" /opt/xerj/bin/xerj
   echo "installed $ASSET ($want)"
 )</pre>
-  <p><strong>The archive is copied once, then hashed and extracted from that copy.</strong> Eight earlier versions of this recipe opened the archive twice at the staging path &mdash; once by <code class="inline">sha256sum</code>, once by <code class="inline">tar</code> &mdash; and anyone who can write that directory swaps the file between the two opens: the genuine <code class="inline">.sha256</code> verifies, the block prints the genuine digest and exits 0, and a backdoor is installed. Copying first collapses that to a single read, because the bytes hashed and the bytes extracted are the same file, in a directory the attacker cannot reach. <strong>The digest is computed here and the file is searched for it</strong>, not the other way round: <code class="inline">sha256sum -c</code> reads filenames out of the <code class="inline">.sha256</code> and exits 0 if any one line verified. <strong>The block that verifies is the block that installs</strong>, so nothing later has to be trusted and no exit status has to be checked. <strong><code class="inline">mktemp -d</code> puts the work directory under <code class="inline">TMPDIR</code></strong>, which is safe when that is sticky and not attacker-writable (the default <code class="inline">/tmp</code>); if yours is not, point <code class="inline">TMPDIR</code> at a root-owned directory first.</p>
+  <p><strong>The archive is copied once, then hashed and extracted from that copy.</strong> Earlier versions opened the archive twice at the staging path &mdash; once by <code class="inline">sha256sum</code>, once by <code class="inline">tar</code> &mdash; and anyone who can write that directory swaps the file between the two opens. Copying first collapses that to a single read. <strong><code class="inline">mktemp -d</code> runs inside the subshell, under <code class="inline">set -eu</code></strong>: outside it, a failed <code class="inline">mktemp</code> left <code class="inline">work</code> empty, <code class="inline">cd ""</code> returned 0 without moving, and the block silently hashed and extracted from whatever directory the operator was in &mdash; the double read again, at exit 0. <strong>The work directory must be writable by you and nobody else.</strong> The default sticky <code class="inline">/tmp</code> is fine; if yours is not, <code class="inline">install -d -m 0700 "$HOME/xerj-verify"</code> and point <code class="inline">TMPDIR</code> there. This page previously advised a <em>root-owned</em> directory, which an unprivileged operator cannot write &mdash; that advice was itself the trigger for the defect above.</p>
 
   <h2>2. Configure the base lexical node</h2>
   <p>Create the service account first, then install only the staged binary. No model directory is needed for lexical mode:</p>
@@ -177,14 +177,14 @@ done
   sha256sum config.json tokenizer.json model.safetensors &gt; ../model.sha256
 )</pre>
   <p>Transfer <code class="inline">OUT/model</code> with the release. Verify it inside the enclave before installing anything &mdash; the same fail-closed rule as section 1, and the reason the check is a command here rather than a sentence:</p>
-<pre class="code">mwork="$(mktemp -d)"
-trap 'rm -rf "$mwork"' EXIT
-cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
-  "$mwork/"
-cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
-
-(
+<pre class="code">(
   set -eu
+
+  mwork="$(mktemp -d)"
+  trap 'rm -rf "$mwork"' EXIT
+  cp /opt/xerj-staging/model/all-MiniLM-L6-v2/{config.json,tokenizer.json,model.safetensors} \
+    "$mwork/"
+  cp /opt/xerj-staging/model/model.sha256 "$mwork/model.sha256"
   cd "$mwork"
 
   for f in config.json tokenizer.json model.safetensors; do
