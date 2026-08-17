@@ -580,8 +580,15 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // at `block + 1`, where `block = 13 + gct` and `gct` is
                         // 0 without a Global Colour Table — so the pair sits at
                         // one of 13, 19, 25, 37, 61, 109, 205, 397 or 781, NOT
-                        // at a fixed offset. 0xFE is neither ASCII nor valid
-                        // UTF-8, which is the part ordinary text lacks.
+                        // at a fixed offset. What the gate rests on is not that
+                        // text lacks 0xFE — 43 of the 265 corpus text negatives
+                        // contain one somewhere — but that text does not carry
+                        // 0x21 followed by 0xFE at one of those nine computed
+                        // offsets. An earlier version of this sentence said
+                        // "0xFE is neither ASCII nor valid UTF-8, which is the
+                        // part ordinary text lacks", which is the kind of
+                        // unmeasured universal this comment block exists to
+                        // stop, written into the sentence explaining the gate.
                         // Verified on disk — the same 1 MiB French-prose file
                         // with 0x7E in that slot stays TxtProse and with 0xFE
                         // becomes binary/gif. All this arm decides is how much
@@ -777,12 +784,31 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
 // and gzipped alike, going to the prose extractor — 7 of 7 plain cuts, after an
 // earlier draft had wrongly narrowed it to `.gif.gz` only. All true then.
 //
-// It stopped being true when the canvas fallback came back: with it, 13 of 13
-// curated cuts and 60 of 60 real-corpus cuts at 300 KB / 700 KB / 1,048,575 B
-// are Binary, and the arm now says so. The paragraph nonetheless survived four
-// commits and six reviews still asserting the opposite of the code twenty lines
-// above it — which is the very failure it was written to warn about, one
-// document later, in the document doing the warning.
+// It stopped being true when the canvas fallback came back, and the arm now
+// says so. The paragraph nonetheless survived four commits and six reviews
+// still asserting the opposite of the code twenty lines above it — which is
+// the very failure it was written to warn about, one document later, in the
+// document doing the warning.
+//
+// A previous version of THIS paragraph then made the same class of mistake
+// while correcting it. It offered "13 of 13 curated cuts and 60 of 60
+// real-corpus cuts at 300 KB / 700 KB / 1,048,575 B are Binary" as proof that
+// the canvas fallback is what obsoleted the old rule. The cuts are Binary, but
+// the canvas fallback decides NONE of them: at those three sizes the comment
+// chain still terminates inside the buffer, so the walk never reaches the
+// `None` arm at all and an earlier arm answers. Measured over the 674-image
+// corpus, counting how many cuts reach the `None` arm and how many of those
+// the canvas disjunct then decides:
+//
+//     cut        files >= cut   reach `None` arm   canvas-decided
+//     8,192               249                 90               90
+//     300,000              83                  0                0
+//     700,000              61                  0                0
+//     1,048,575            53                  0                0
+//
+// So the real "13 of 13" figure is an 8 KiB measurement, quoted against three
+// sizes where the mechanism it names is inert. The canvas disjunct is
+// load-bearing — at 8,192 it decides all 90 — but not there.
 
 fn canvas_dimension_text_cannot_write(prefix: &[u8]) -> bool {
     // `prefix[..13]` is guaranteed by the length check in the only caller.
