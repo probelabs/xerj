@@ -274,6 +274,7 @@ fn cfg(root: &Path, state_dir: &Path, url: &str) -> IndexCfg {
         state_dir: Some(state_dir.to_owned()),
         fresh: false,
         follow_symlinks: false,
+        follow_symlinks_outside_root: false,
         stub_globs: Vec::new(),
         ignore: crate::ignore_rules::IgnoreOptions::default(),
         max_file_gb: 1,

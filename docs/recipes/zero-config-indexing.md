@@ -268,7 +268,12 @@ disagreement is printed, not applied; bounds both the scan and the indexing
 phase), `--prefix` to namespace the indices (default `ax`),
 `--no-semantic` for pure BM25+keyword without vector fields, `--dry-run` to
 print the inferred plan without indexing anything, `--follow-symlinks`
-(loop-safe), `--sample N` records per file for inference (default 500).
+(loop-safe — and a followed link is judged by what it resolves to: a target
+outside the indexed folder is refused, and one inside a hidden directory is
+skipped like any dotfile, however visible the link's own name;
+`--follow-symlinks-outside-root` waives the folder boundary and nothing else),
+`--sample N`
+records per file for inference (default 500).
 
 Build output never reaches the index in the first place. The walk honours
 `.xerjignore`, `.gitignore` (nested files and `!negation` included) and

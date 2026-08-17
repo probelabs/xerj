@@ -97,10 +97,45 @@ pub const DEFAULT_IGNORE_PATTERNS: &[&str] = &[
 ];
 
 /// Rule label used for the pre-existing dotfile skip. It is not one of the
-/// ignore rules and `--no-ignore` does not disable it (it is what keeps `.env`
-/// and `.ssh` out of a queryable brain), but a user whose file vanished still
-/// needs it named, so it shares the reporting.
+/// ignore rules and `--no-ignore` does not disable it (it is the main thing
+/// keeping `.env` and `.ssh` out of a queryable brain), but a user whose file
+/// vanished still needs it named, so it shares the reporting.
+///
+/// It is a rule about names, and under `--follow-symlinks` about where a link
+/// resolves. A HARD link has neither, so a visible name hard-linked to a file
+/// inside a hidden directory is still indexed — see the note in
+/// [`crate::walk`].
 pub const HIDDEN_RULE: &str = "hidden:dotfile";
+
+/// A symlink whose resolved target lies outside the folder the operator
+/// pointed at. Only reachable with `--follow-symlinks`, and refused there:
+/// "index this folder" is not consent to index whatever else the filesystem
+/// links to, and `shared -> /etc` would otherwise put `/etc/shadow` in a
+/// queryable brain under the rel path `shared/shadow`.
+///
+/// Reported like a hidden directory — pruned, never deep-counted. The contents
+/// are outside the root, so they were never candidates and counting them would
+/// inflate [`IgnoreReport::files_inside_pruned_dirs`] with work no run was
+/// going to do.
+pub const ESCAPED_ROOT_RULE: &str = "symlink:outside-root";
+
+/// A followed entry whose path could not be resolved for a reason other than
+/// "it does not exist" — `realpath(3)` is bounded by `PATH_MAX` where the
+/// kernel is not, so a canonical path over that limit fails here while `open`
+/// on the walk path still succeeds; `ELOOP` and `EACCES` behave the same.
+///
+/// Refused, because the hidden-name and root-boundary questions could not be
+/// answered and "could not compute" is not "yes". Reported so that a file the
+/// operator expected is named rather than silently missing.
+pub const UNRESOLVED_LINK_RULE: &str = "symlink:unresolved";
+
+/// A followed link that left the folder AND resolved through a dotted
+/// component. Refused whatever `--follow-symlinks-outside-root` says, so it
+/// needs its own label: reporting it as [`ESCAPED_ROOT_RULE`] tells an operator
+/// who already passed that flag to pass it again, and reporting it as
+/// [`HIDDEN_RULE`] sends them looking for a dotfile in a folder that has none.
+/// Both were tried; this names the two facts that are actually true.
+pub const HIDDEN_OUTSIDE_ROOT_RULE: &str = "symlink:outside-root+hidden";
 
 const MAX_WARNINGS: usize = 20;
 /// Directory entries the `--dry-run` deep count may examine in total. A
@@ -673,6 +708,51 @@ impl IgnoreStack {
                 .dirs += 1;
         } else {
             self.record_file(HIDDEN_RULE);
+        }
+    }
+
+    /// A symlink target outside the indexed root, also decided by the walker
+    /// (it needs the canonical root, which this stack does not carry) and
+    /// reported through the same accounting. See [`ESCAPED_ROOT_RULE`].
+    pub fn record_symlink_escape(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(ESCAPED_ROOT_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(ESCAPED_ROOT_RULE);
+        }
+    }
+
+    /// A followed link that left the root through a dotted component.
+    /// See [`HIDDEN_OUTSIDE_ROOT_RULE`].
+    pub fn record_symlink_hidden_escape(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(HIDDEN_OUTSIDE_ROOT_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(HIDDEN_OUTSIDE_ROOT_RULE);
+        }
+    }
+
+    /// A followed entry that could not be resolved. See [`UNRESOLVED_LINK_RULE`].
+    pub fn record_symlink_unresolved(&mut self, is_dir: bool) {
+        if is_dir {
+            self.report.dirs_pruned += 1;
+            self.report
+                .by_rule
+                .entry(UNRESOLVED_LINK_RULE.to_string())
+                .or_default()
+                .dirs += 1;
+        } else {
+            self.record_file(UNRESOLVED_LINK_RULE);
         }
     }
 

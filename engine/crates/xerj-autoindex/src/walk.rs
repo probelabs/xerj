@@ -71,6 +71,102 @@ fn marker_generated_dir(path: &Path) -> Option<&'static str> {
     None
 }
 
+/// Why a followed symlink was refused. See the call site in `walk_reporting`.
+enum SymlinkVerdict {
+    /// The resolved target is not under the indexed root. Carries the
+    /// resolution so the waiver arm can store it: an admitted entry must read
+    /// from the path that was judged rather than from the link it arrived by,
+    /// and out-of-root entries are the only ones that arm ever admits.
+    OutsideRoot(PathBuf),
+    /// Outside the root AND through a dotted component. Separate from
+    /// `OutsideRoot` because `--follow-symlinks-outside-root` must not reach
+    /// it, and separate from `HiddenTarget` because the operator has no dotfile
+    /// in their own folder to go looking for — the actionable fact is that a
+    /// link left it.
+    HiddenOutsideRoot,
+    /// The resolved target is under the root but its real path runs through a
+    /// hidden component — the link's visible name was hiding a dotfile.
+    HiddenTarget,
+    /// The path could not be resolved at all, so neither question could be
+    /// answered. Refused rather than admitted; see `escaped_or_hidden_target`.
+    Unresolvable,
+}
+
+/// Judge a followed entry by where it actually resolves.
+///
+/// `path` is the path the walk arrived by, so under `--follow-symlinks` it can
+/// name a link anywhere along its length. Canonicalising collapses every link
+/// in it at once, which is what makes a chain of links (`a -> b -> .secret/c`)
+/// and a link partway up a directory path behave the same as a direct one.
+///
+/// `Ok(Some(real))` is the resolved path, which the caller stores on the
+/// `FileEntry` so every later `open()` reads the file that was judged.
+/// `Ok(None)` means there is nothing to resolve and the ordinary rules govern
+/// the entry.
+///
+/// A resolution FAILURE is not `None`. An earlier version of this function
+/// wrote `path.canonicalize().ok()?`, which collapsed every error into "the
+/// entry is where it appears" and justified it with "a broken link has no
+/// target to leak". That is true of `NotFound` and of nothing else, and the
+/// difference is a bypass rather than a nicety: `canonicalize` is `realpath(3)`
+/// and is bounded by `PATH_MAX`, while the kernel's own resolution is not, so an
+/// entry can be unresolvable HERE and perfectly readable by every later stage —
+/// `stat`, `open`, hashing, extraction. The guard was then skipped for exactly
+/// the entries it could not vet, which is the wrong direction for a rule whose
+/// job is to keep `.ssh` out of a queryable index. `ELOOP` and `EACCES` land in
+/// the same arm.
+///
+/// So only `NotFound` is treated as "nothing here to leak" — walkdir already
+/// reports a dangling link through its error arm. Everything else is refused
+/// and named in the report, because an answer that could not be computed is not
+/// an answer of "yes".
+fn escaped_or_hidden_target(
+    root_canon: &Path,
+    path: &Path,
+) -> Result<Option<PathBuf>, SymlinkVerdict> {
+    let real = match path.canonicalize() {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(SymlinkVerdict::Unresolvable),
+    };
+    let Some(rel) = real.strip_prefix(root_canon).ok() else {
+        // Outside the root — but the hidden-name question is asked FIRST and
+        // against the whole resolved path, because `OutsideRoot` is the only
+        // verdict `--follow-symlinks-outside-root` waives. Returning it before
+        // looking for a dotted component let that flag admit
+        // `keys.txt -> ../outside/.ssh/id_rsa` unexamined, which is #438
+        // reopened through the escape hatch built to be safe.
+        //
+        // Judged from where the target DIVERGES from the root, not from `/`.
+        // Checking every component would refuse any target whose absolute path
+        // passes through a dotted ancestor — `/home/u/.cache/...`, and every
+        // path under a `tempfile` directory, which is named `.tmpXXXXXX`. Those
+        // ancestors are shared with the root the operator pointed at, so they
+        // are as consented-to as the root itself; the components BELOW the
+        // divergence are the ones nobody asked for.
+        let shared = root_canon
+            .components()
+            .zip(real.components())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if real
+            .components()
+            .skip(shared)
+            .any(|c| is_hidden_name(c.as_os_str()))
+        {
+            return Err(SymlinkVerdict::HiddenOutsideRoot);
+        }
+        return Err(SymlinkVerdict::OutsideRoot(real));
+    };
+    // In-root: judge only the part below the root. A brain over a dot-named
+    // folder still works — that exemption is the same one the walker gives the
+    // root itself at depth 0.
+    if rel.components().any(|c| is_hidden_name(c.as_os_str())) {
+        return Err(SymlinkVerdict::HiddenTarget);
+    }
+    Ok(Some(real))
+}
+
 /// Walk with the default ignore rules on and the report discarded.
 pub fn walk(root: &Path, follow_symlinks: bool) -> Result<Vec<FileEntry>> {
     walk_reporting(root, follow_symlinks, IgnoreOptions::default()).map(|(files, _)| files)
@@ -87,6 +183,24 @@ pub fn walk_reporting(
     follow_symlinks: bool,
     ignore: IgnoreOptions,
 ) -> Result<(Vec<FileEntry>, IgnoreReport)> {
+    walk_reporting_opts(root, follow_symlinks, false, ignore)
+}
+
+/// As [`walk_reporting`], with the out-of-root escape hatch.
+///
+/// `allow_outside_root` restores the pre-#438 behaviour of following a link
+/// wherever it points. It exists because refusing every out-of-root target is
+/// not a narrowing of `--follow-symlinks` — for a vendored sibling checkout, a
+/// monorepo package link or a mounted notes volume it IS the flag, and without
+/// an opt-in those runs silently index what they would index with the flag off.
+/// The hidden-name rule still applies to the resolved path either way; only the
+/// root boundary is waived, and only when the operator says so.
+pub fn walk_reporting_opts(
+    root: &Path,
+    follow_symlinks: bool,
+    allow_outside_root: bool,
+    ignore: IgnoreOptions,
+) -> Result<(Vec<FileEntry>, IgnoreReport)> {
     let root_canon = root
         .canonicalize()
         .with_context(|| format!("resolve root folder {}", root.display()))?;
@@ -94,6 +208,8 @@ pub fn walk_reporting(
         anyhow::bail!("{} is not a directory", root_canon.display());
     }
     let mut out = Vec::new();
+    // Shallowest depth from which the walk is inside a symlink; see the guard.
+    let mut link_depth: Option<usize> = None;
     let marker_defaults = ignore.enabled && ignore.defaults;
     let mut stack = IgnoreStack::new(&root_canon, ignore);
     // Manual iteration rather than `filter_entry`, because the ignore stack has
@@ -130,7 +246,7 @@ pub fn walk_reporting(
         // `IgnoreStack::truncate_to` for why every entry needs it, not just
         // directories.
         stack.truncate_to(entry.depth());
-        // SECURITY / hygiene: never index hidden files or descend into hidden
+        // SECURITY / hygiene: do not index hidden files or descend into hidden
         // directories. Without this the walker happily indexed `.env` (secrets,
         // API tokens), `.git`, `.ssh`, `.aws`, and other dotfiles into a
         // queryable brain with no per-brain authorization — a real exposure for
@@ -138,13 +254,101 @@ pub fn walk_reporting(
         // pruned before descending, so `.git/` is skipped whole. The root
         // itself (depth 0) is exempt so a brain over a dot-named folder still
         // works. `--no-ignore` does NOT turn this off: it is not one of the
-        // ignore rules, it is the reason secrets stay out.
+        // ignore rules, it is the main reason secrets stay out.
+        //
+        // The limit of that claim, stated because the rest of this file used to
+        // assert it without one: this is a rule about NAMES and, under
+        // `--follow-symlinks`, about where a link RESOLVES. A hard link has
+        // neither — it is a second directory entry for the same inode, so
+        // `ln .secretdir/k.txt notes.txt` reads the secret under a visible name
+        // and nothing here can tell. Defending that needs `(dev, ino)` of every
+        // hidden-rule exclusion, which a walk that prunes hidden directories
+        // without descending does not have. `cp -al`, `rsync --link-dest` and
+        // hard-linked package stores all produce that shape without an attacker.
         if entry.depth() > 0 && is_hidden_name(entry.file_name()) {
             stack.record_hidden(is_dir);
             if is_dir {
                 it.skip_current_dir();
             }
             continue;
+        }
+        // The rule above judges the NAME the walk arrived by, which is the
+        // whole rule when links are not followed. Under `--follow-symlinks` it
+        // is not: a link is free to be called `notes.txt` and point at
+        // `.secretdir/k.txt`, and walkdir then yields the target's contents
+        // under the link's visible name. Both halves of the guarantee above
+        // fail that way — the secret is indexed, and a link to a directory
+        // outside the root drags in a tree the operator never pointed at
+        // (`shared -> /etc` indexes `/etc/shadow` as `shared/shadow`). The
+        // report made it worse by still saying the hidden directories were
+        // pruned, which was true of the traversal and false of the outcome.
+        //
+        // So under the flag the same two questions are asked of the RESOLVED
+        // path instead of the name. Loop-safety is walkdir's and unrelated;
+        // this is the secret rule and the root boundary.
+        // Resolving is only necessary once the walk has actually gone through a
+        // link. `canonicalize` is `realpath(3)` and issues one `readlinkat` per
+        // path component, so doing it for every entry costs 8-14 failing
+        // syscalls per file on an ordinary tree and made the walk 4.2x slower
+        // with 7.6x the syscalls — all of it wasted on paths where no link
+        // exists. `link_depth` is the shallowest depth at or below which some
+        // ancestor (or the entry itself) is a symlink; below that the walk path
+        // and the real path cannot differ.
+        if entry.path_is_symlink() {
+            link_depth = Some(link_depth.map_or(entry.depth(), |d: usize| d.min(entry.depth())));
+        } else if is_dir && link_depth.is_some_and(|d| entry.depth() <= d) {
+            link_depth = None;
+        }
+        let through_link = entry.path_is_symlink() || link_depth.is_some_and(|d| entry.depth() > d);
+        // The path every later stage should open. The guard resolves the entry
+        // to decide on it; keeping that resolution is what stops the decision
+        // being made about one file and the bytes being read from another.
+        // `content.rs` hashes and `lib.rs` extracts from `FileEntry::path`
+        // minutes after the walk on a large corpus, each a fresh `open()` that
+        // re-follows the link — so a link re-pointed in between handed the
+        // refused content straight into a document body. `rel` still comes from
+        // the walk path: that is the name the operator pointed at and the
+        // identity the index is keyed on.
+        let mut resolved: Option<PathBuf> = None;
+        if follow_symlinks && entry.depth() > 0 && through_link {
+            match escaped_or_hidden_target(&root_canon, entry.path()) {
+                Ok(real) => resolved = real,
+                // Admitted by the waiver — but with the RESOLVED path, so the
+                // bytes read later are the bytes that were judged. This arm was
+                // empty, which stored the walk path and re-followed the link at
+                // read time for everything the flag ingests.
+                Err(SymlinkVerdict::OutsideRoot(real)) if allow_outside_root => {
+                    resolved = Some(real);
+                }
+                Err(SymlinkVerdict::HiddenOutsideRoot) => {
+                    stack.record_symlink_hidden_escape(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                Err(SymlinkVerdict::OutsideRoot(_)) => {
+                    stack.record_symlink_escape(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                Err(SymlinkVerdict::HiddenTarget) => {
+                    stack.record_hidden(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+                Err(SymlinkVerdict::Unresolvable) => {
+                    stack.record_symlink_unresolved(is_dir);
+                    if is_dir {
+                        it.skip_current_dir();
+                    }
+                    continue;
+                }
+            }
         }
         if is_dir {
             // The root is never judged by the rules below it: pointing
@@ -187,7 +391,7 @@ pub fn walk_reporting(
             .replace('\\', "/");
         let rel_id = stable_path_id(p.strip_prefix(&root_canon).unwrap_or(&p));
         out.push(FileEntry {
-            path: p,
+            path: resolved.unwrap_or(p),
             rel,
             rel_id,
             is_symlink: entry
@@ -231,6 +435,56 @@ fn stable_path_id(path: &Path) -> String {
 
 #[cfg(test)]
 mod hidden_skip_tests {
+    use super::{escaped_or_hidden_target, SymlinkVerdict};
+
+    /// The dispatch this file was refuted for. `canonicalize` failing is not
+    /// evidence that the entry is where it appears; only `NotFound` is.
+    ///
+    /// A path with an interior NUL cannot be canonicalised and reports
+    /// `InvalidInput`, which stands in here for the errno that actually
+    /// motivates the arm: `realpath(3)` is `PATH_MAX`-bounded while the kernel
+    /// is not, so a canonical path over that limit gives `ENAMETOOLONG` here
+    /// while `open` on the walk path still succeeds. That asymmetry is what
+    /// made `.ok()?` a bypass — the guard was skipped for precisely the entries
+    /// it could not vet.
+    #[test]
+    fn an_unresolvable_entry_is_refused_not_admitted() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical root");
+
+        // Exists and resolves inside the root: admitted.
+        std::fs::write(root.join("plain.txt"), "x").unwrap();
+        assert!(
+            matches!(
+                escaped_or_hidden_target(&root, &root.join("plain.txt")),
+                Ok(Some(_))
+            ),
+            "an ordinary in-root file must resolve and be governed by the ordinary rules"
+        );
+
+        // Does not exist: nothing to leak, so also admitted — walkdir reports it.
+        assert!(
+            matches!(
+                escaped_or_hidden_target(&root, &root.join("gone.txt")),
+                Ok(None)
+            ),
+            "a dangling link has no target and must not be reported as a refusal"
+        );
+
+        // Cannot be resolved for any OTHER reason: refused.
+        let bad = root.join(OsStr::from_bytes(b"nul\0inside"));
+        assert!(
+            matches!(
+                escaped_or_hidden_target(&root, &bad),
+                Err(SymlinkVerdict::Unresolvable)
+            ),
+            "an unresolvable path must be refused — `could not compute` is not `yes`"
+        );
+    }
+
     use super::walk;
     use std::fs;
 

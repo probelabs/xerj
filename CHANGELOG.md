@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`autoindex --follow-symlinks` no longer follows a link out of the indexed
+  folder unless you ask it to.** Pointing autoindex at a folder is not consent
+  to index whatever that folder links to, and the hidden-file rule — the thing
+  keeping `.env`, `.ssh` and `.aws` out of a queryable brain — was defeated
+  entirely by a visible link name: `notes.txt -> .secretdir/k.txt` indexed the
+  secret, and `shared -> /etc` indexed `/etc/shadow` under `shared/shadow`,
+  while the run reported that the hidden directories had been pruned (#438).
+
+  A followed link is now judged by what it **resolves to**, not by the name it
+  wears. Targets outside the folder are refused and reported under a new
+  `symlink:outside-root` rule; targets inside a hidden directory are skipped
+  like any dotfile; and one that does both — left the folder AND resolved
+  through a dotted component — is reported as `symlink:outside-root+hidden`,
+  because it is refused even with the opt-in below and neither of the other two
+  labels tells the operator anything they can act on.
+
+  **This will index less than the previous release for some setups**, and the
+  first run after upgrading drops what it previously indexed through such a
+  link. If following links outward is why you turned the flag on — a vendored
+  sibling checkout, a monorepo package link, a mounted volume — pass
+  `--follow-symlinks-outside-root` to restore it (it requires
+  `--follow-symlinks`, and is refused on its own rather than accepted as a
+  silent no-op). That waives the root boundary
+  and nothing else: the hidden-file rule still applies to the resolved path,
+  judged from the point where the target diverges from the folder you pointed
+  at — so `notes -> ../sibling/pkg` is followed and `keys -> ../sibling/.ssh/id_rsa`
+  is not, while a dotted directory the two paths SHARE (a `/tmp/.tmpXXXX`, a
+  checkout under `~/.local`) does not refuse anything, because your own folder
+  is already inside it.
+
+  Known limit, stated rather than implied: this is a rule about names and about
+  where a link resolves. A **hard** link has neither, so a visible name hard-
+  linked to a file inside a hidden directory is still indexed, on this release
+  and on every earlier one.
+
 ### Fixed
 
 - **A multi-index `scroll` reported the wrong `_index` on every continuation
