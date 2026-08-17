@@ -564,10 +564,14 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         // and 0.4% of the buffer respectively.
                         //
                         // The discriminating is therefore done by the header
-                        // gate above, not here: `0x21` at 13+GCT and `0xFE` at
-                        // 14+GCT, and 0xFE is neither ASCII nor valid UTF-8.
+                        // gate above, not here: `0x21` at `block` and `0xFE`
+                        // at `block + 1`, where `block = 13 + gct` and `gct` is
+                        // 0 without a Global Colour Table — so the pair sits at
+                        // one of 13, 19, 25, 37, 61, 109, 205, 397 or 781, NOT
+                        // at a fixed offset. 0xFE is neither ASCII nor valid
+                        // UTF-8, which is the part ordinary text lacks.
                         // Verified on disk — the same 1 MiB French-prose file
-                        // with 0x7E at offset 14 stays TxtProse and with 0xFE
+                        // with 0x7E in that slot stays TxtProse and with 0xFE
                         // becomes binary/gif. All this arm decides is how much
                         // text has to accumulate behind that gate before it is
                         // admitted, which is why the budget is the whole rule
@@ -579,7 +583,7 @@ fn gif_screen_descriptor(prefix: &[u8]) -> bool {
                         //
                         //   * answering image unconditionally (round 2's
                         //     rejected `true`) junks 10 corpus text files —
-                        //     windows-1252 prose carrying `þ` at offset 14.
+                        //     windows-1252 prose carrying `þ` in that slot.
                         //   * answering text on a short buffer sends a
                         //     TRUNCATED real GIF to the prose extractor: 7 of 7
                         //     cuts of real corpus GIFs at 300 KB..1,048,575 B go
@@ -2369,19 +2373,30 @@ mod printable_magic_tests {
     /// accept, then `0x21 0xFE`. `0xFE` is `þ` in windows-1252 and not ASCII,
     /// which is the only part ordinary text lacks — and NOT at a fixed offset:
     /// when the packed byte at 10 has bit 7 set (any accented letter does it)
-    /// the Global Colour Table shifts `block` to 19, 25, 37, 61, 109, 205, 397
-    /// or 781. An earlier version of this comment said "offset 14" and was
-    /// wrong by a factor of nine.
+    /// the Global Colour Table shifts `block` from 13 to one of 19, 25, 37, 61,
+    /// 109, 205, 397 or 781 — nine possible slots, of which 13 (no colour
+    /// table) is one. An earlier version of this comment said "offset 14" flat;
+    /// the correction that replaced it then dropped the no-table case, which is
+    /// how the count below was wrong.
     ///
     /// So this is a measured trade against merged `main`, not a free win, and
     /// both sides are pinned here:
     ///
-    ///   * `main` keeps 8 corpus text negatives (`gctflag_ext_fe_p*`) and junks
-    ///     18 decodable GIFs whose canvas high bytes happen to be printable.
-    ///   * this rule keeps all 18 GIFs and junks those same 8 text files — but
-    ///     only above the budget. At their real 8,960 bytes every build keeps
-    ///     them as text; it is file LENGTH that flips them, which is exactly
-    ///     the blind spot the corpus could not show.
+    ///   * `main` keeps 10 corpus text negatives and junks 18 decodable GIFs
+    ///     whose canvas high bytes happen to be printable.
+    ///   * this rule keeps all 18 GIFs and junks those same 10 text files — but
+    ///     only above the budget. At their real sizes every build keeps them as
+    ///     text; it is file LENGTH that flips them, which is exactly the blind
+    ///     spot the corpus could not show.
+    ///
+    /// The 10 are the eight `gctflag_ext_fe_p*` (packed bit 7 set, `block` 19)
+    /// plus `label_fe_thorn.txt` and `label_fe_then_printable_size.txt` (no
+    /// colour table, `block` 13). An earlier version of this comment said
+    /// eight, because the class was enumerated from the filenames a reviewer
+    /// had supplied rather than from the code path — the same mistake this file
+    /// spends fifty lines warning about, made while correcting it. Above the
+    /// budget the shipped rule IS round 2's `true`, so the 10 named at that
+    /// bullet and the 10 here are necessarily the same set.
     ///
     /// Chosen because the 18 are real artifacts that giflib and Pillow both
     /// decode, while the 8 are fixtures that only reach this state when
@@ -2449,6 +2464,32 @@ mod printable_magic_tests {
              cost of the rule, and merged main does NOT pay it. Keeping this \
              assertion honest matters more than keeping it green: if a future \
              change makes it text, re-measure the 18 GIFs on the other side"
+        );
+
+        // The other two, which the first version of this test did not cover:
+        // no Global Colour Table, so `block` stays at 13 and the `21 FE` pair
+        // sits at 13/14 — the literal "offset 14" shape. Reproduces
+        // `label_fe_thorn.txt`, and it is why the trade costs 10 files, not 8.
+        let mut flat: Vec<u8> = b"GIF89a fichie".to_vec(); // 0..13, packed at 10
+        assert_eq!(flat[10] & 0x80, 0, "no colour table, so block stays 13");
+        flat.push(0x21); // 13
+        flat.push(0xfe); // 14
+        flat.push(b'L'); // 15
+        while flat.len() < GIF_PREFIX + 4096 {
+            flat.extend_from_slice("Le format GIF reste partout sur le web. ".as_bytes());
+        }
+        assert_eq!(
+            sniff_bytes(&flat[..8_960], p, p, false).unwrap().family,
+            Family::TxtProse,
+            "at its corpus size the no-table shape is text on every build"
+        );
+        assert_eq!(
+            sniff_bytes(&flat[..GIF_PREFIX], p, p, false)
+                .unwrap()
+                .family,
+            Family::Binary,
+            "the no-table shape pays the same cost past the budget — if this is \
+             not asserted the trade gets counted from filenames again"
         );
     }
 
