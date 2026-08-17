@@ -7,7 +7,246 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-rc.18] - 2026-08-17
+
+### Security
+
+- **Patched `h2` for RUSTSEC-2026-0258, "unbounded empty DATA frames"** (0.4.13 ->
+  0.4.16). `h2` is the HTTP/2 implementation beneath `hyper`, so it sits under
+  every listener this server runs — ES-compat and native REST through axum, gRPC
+  through tonic. An unbounded stream of empty DATA frames was a remote
+  resource-exhaustion vector against any reachable node; the patched version
+  answers with `GOAWAY ENHANCE_YOUR_CALM` instead.
+
+  The fix adds a per-connection budget, and it is a **token bucket, not a
+  quota** — though, as below, that is not enough to keep it off real traffic.
+  `h2-0.4.16/src/proto/streams/counts.rs:94-101`: a DATA frame *under* 256 bytes
+  consumes `256 - payload_len`; a frame of 256 bytes or more **replenishes**
+  `payload_len - 256`, up to a 25,600-byte ceiling. Any ordinary payload frame
+  therefore refills what small frames drain — but only a frame that reaches 256
+  bytes does. A body chunked below that is made entirely of frames that drain,
+  which is what the paragraphs below are about.
+
+  Two further details decide whether you can ever meet it. A small frame *with*
+  a payload is refunded when the application reads it (`streams.rs:1515`) — but
+  only once the read happens, which is later than you would think and is the
+  subject of the next paragraph. A frame with an **empty payload**
+  is not: h2 discards it before the application sees it (`recv.rs:757` returns
+  early for an empty frame without END_STREAM), so its 256 is never refunded —
+  only offset by a large frame elsewhere on the connection. "Empty" here means
+  zero *payload*, not zero bytes on the wire: a padding-only frame counts, and
+  so does a small frame on a stream that is reset before the application reads
+  it. An empty frame carrying END_STREAM is delivered, and is refunded. Exhaustion is a connection-level
+  `GOAWAY ENHANCE_YOUR_CALM`, and it takes the **101st** empty frame with
+  nothing ≥256 bytes in between (`checked_sub` fails once `available` reaches 0).
+
+  Reading the body is **not** by itself protection, and this is the part to take
+  operationally. The charge lands on arrival and the refund only on the read, so
+  once a flow-control window's worth of frames has arrived before the handler is
+  scheduled, the connection is already over budget. Measured on this build, a
+  handler consuming every frame in a tight loop is cut off at exactly the same
+  frame as one that never reads: 101 at 1 byte, 134 at 64, 201 at 128, 356 at
+  184. XERJ advertises `SETTINGS_INITIAL_WINDOW_SIZE = 1048576`, far above h2's
+  64 KiB default, so more frames buffer here than elsewhere before a read lands.
+
+  The safe line is frame size, not frame count, and it is sharp: **a frame of 256
+  bytes or more never charges at all**. The trip frame for a smaller size is
+  `floor(25600 / (256 - size)) + 1` — the first frame whose charge underflows the
+  remaining budget. Below roughly 200 bytes a legitimate, authenticated,
+  fully-read request can take the `GOAWAY`: a valid 27 KB `_bulk` chunked into
+  128-byte DATA frames did so repeatedly across runs, and a 307 KB body at 184
+  bytes likewise. How often depends on load and on how the client frames and
+  drains — measurements on two machines differed in both directions, so treat
+  the hazard as real and the frequency as unpredictable rather than as a rate.
+  If you control the client, chunk at 256 bytes or above.
+
+  XERJ has such a path: `auth_middleware` is an axum layer, so a request that
+  fails authentication is answered `401` without the handler ever extracting its
+  body (`xerj-api/src/auth.rs`). An unauthenticated client that streams many
+  small frames at a node with auth enabled therefore accumulates charges nothing
+  refunds, and the connection is eventually closed with `GOAWAY`. Authentication is not special
+  here: any rejection that answers without reading the body does the same, so an
+  *authenticated* client that mistypes a route and streams a small body into the
+  404 sees the identical `GOAWAY`. Worth recognising for what it is rather than
+  reading it as a client bug.
+
+  Two `unsound` advisories were cleared in the same pass: `anyhow` 1.0.102 ->
+  1.0.104 (RUSTSEC-2026-0190, `Error::downcast_mut()`) and `memmap2` 0.9.10 ->
+  0.9.11 (RUSTSEC-2026-0186, unchecked pointer offset), plus the yanked
+  `spin` 0.9.8 -> 0.9.9 (#483).
+
+### Fixed
+
+- **A node whose ES-compat port was taken printed a success banner and stayed
+  up, and `xerj autoindex` then wrote the user's documents into whichever other
+  node owned that port.** The three listeners were bound inside tasks spawned
+  *after* the banner, where a bind error was logged and explicitly non-fatal, so
+  losing one port was survivable. The process that does own the port answers
+  `GET /_cluster/health` with `green` — the readiness probe the docs prescribe —
+  so nothing downstream could tell the difference. Found by three independent
+  agents in a field study; one of them wrote 905 files, including contracts,
+  invoices and a bank export, into a stranger's data directory and got
+  `ok=true exit=0` for it. Every listener is now bound before the banner, a
+  refused bind ends startup with the port and the reason on stderr, and the
+  banner is printed from the addresses the kernel actually returned (#465,
+  #466).
+
+- **A `keyword` field holding a JSON array was indexed as one token, so a query
+  for any element but the first missed the document.** Array elements are now
+  indexed as N independent values separated by a position gap, so a phrase query
+  cannot span two elements, and the memtable's columnar path refuses an
+  array-valued field rather than silently reading only its first element
+  (#332, #470).
+
+- **The audit log recorded no writes and could not name the actor, and
+  `/_audit` was readable by any credential.** Create, index, update, bulk and
+  delete appended nothing; the one audited data-path op recorded the literal
+  `"anonymous"` for an authenticated admin call (#329, #471).
+
+- **`bool` scoring: a scoring-irrelevant clause collapsed `_score` and reordered
+  the page — partially fixed.** A `filter`, a second `must`, or a `must_not`
+  changed relevance scores and hit order, with no error and no warning. Three
+  defects of the same shape, all of them a clause or a pass affecting scoring
+  when it must not: `bool.filter` was projected onto the FTS `must` slot so its
+  BM25 landed in `_score`; the IDF rescore counted `filter`/`must_not` toward
+  its trigger; and that rescore derived IDF from `final_hits.len()`, which made
+  `_score` a function of `size`.
+
+  **Read the scope before you re-baseline. This fix is partial and #361 remains
+  open.** What is fixed: a `filter` or `must_not` carrying a `term`-shaped
+  child, on a page served entirely by the segment FTS path. What is *not*:
+  `filter: [{match_all: {}}]` and `filter: [{exists: ...}]` still return a flat
+  score over unrelated documents, and any page that also carries memtable or
+  stored-scan hits keeps rc.17 behaviour — that fallback is IDF-less
+  (`1 + ln(1 + tf)`) and was deliberately untouched. On those shapes `_score`
+  still varies with `size`; measured on rc.18, one query returned four different
+  top-1 documents at `size` 2 / 5 / 10 / 50.
+
+  **Where it does apply, this changes `_score` values and hit ordering versus
+  rc.17.** If you have pinned expected scores, recorded relevance baselines, or
+  tests asserting an exact order, re-baseline them on rc.18. The new behaviour
+  is the correct one — Lucene draws the same line at
+  `BooleanClause.isScoring()` — but a silent ranking change is exactly the kind
+  of thing that should not arrive unannounced (#361, #387).
+
+- **`xc.py` could not tell a corpus that was never loaded from a query that
+  genuinely matched nothing** (#476).
+
+- **An alias 404'd on `_refresh`, `_forcemerge`, `_cache/clear` and
+  `_terms_enum`.** `resolve_indices_for_op` had no alias branch, so a valid
+  alias was simply "not an index". It now expands to every member rather than
+  the first — a `_refresh` reaching one of three members makes the next search
+  non-deterministic with nothing in the response saying so (#459). The remaining
+  read-path half — an alias answered as an alias over one member — is still open
+  (#449).
+
+- **The air-gapped deployment recipe failed open: a bad digest extracted and
+  installed anyway.** The verify step did not stop extraction, and because
+  `set -eu` sat at the top of the block rather than inside it, a failure killed
+  the operator's shell — so the natural recovery, which the page itself named,
+  was to re-paste without it, and that made the digest check non-fatal. Every
+  block that decides something now runs inside its own subshell, the digest is
+  computed locally and asserted against the `.sha256` with `grep -qxF`, and the
+  block that verifies is the block that installs (#441).
+
+- **The install page's checksum step never hashed the archive.** It ran
+  `sha256sum -c`, which reports success for whatever filenames the `.sha256`
+  happens to list, skips `#` comment lines silently, and never checks that any
+  line names the archive being extracted. A `.sha256` carrying a comment naming
+  the archive plus a valid digest for an unrelated file verified clean at exit 0
+  while the archive was never hashed. Both the install page and `llms.txt` now
+  compute the digest, assert it is 64 hex characters, demand that exact line,
+  and chain extraction and install to the result (#444, #452).
+
+- **A GIF whose comment chain outruns the sniff budget is decided by the chain,
+  not by a canvas heuristic** (#427, #442).
+
+### Added
+
+- **`xerj feedback`** — one command drafts the field report the project asks every
+  agent to file, auto-filling version, OS and what was indexed;
+  `xerj feedback --open-pr` stages that report under
+  `user-feedback/16-agent-field-reports/` and opens the PR — it stages the report
+  but does not restrict the commit to it, so check `git status` first if you have
+  other work staged. Field-report PRs are CLA-exempt, so they merge without a
+  signature (#473).
+
+- **A build gate against release notes that promise the next release.** A file
+  shipping inside the release tag may no longer describe a capability as arriving
+  later — that sentence cannot be checked at review time and is wrong by
+  construction afterwards, whichever way it resolves. Both halves of that shipped
+  during this cycle. The gate is a list of known phrasings rather than a rule
+  about meaning, and says so; #474 tracks what would close the class (#474, #479).
+
+- **`word_delimiter` / `word_delimiter_graph` token filters and a `code`
+  analyzer**, so an identifier can be matched by its sub-words
+  (`getHTTPResponse` -> `get` / `HTTP` / `Response`) while the whole identifier
+  is preserved for exact matches. Capability only — no performance claim (#468).
+
+- A reproducible verification harness for the neural embedder's missing
+  batching, measuring lexical 1.3 s against neural 677.5 s on an identical
+  101-file slice. This is the measurement, not the fix — **#366 stays open**
+  (#467).
+
+- Operational-recipe verification protocol in `docs/CONTRIBUTION_REVIEW.md`,
+  including the two clauses that would have caught the round of #441 that went
+  green while still broken: run each negative control with the following block
+  appended, and with the failing block's exit status discarded (#447, thanks
+  @buger).
+
+- `docs/XERJ_VS_LUCENE.md` — a side-by-side comparison with Lucene 10.3.1,
+  honest in both directions (#373, #448, thanks @buger).
+
 ### Changed
+
+- **XERJ no longer sizes its memory budgets to the whole machine. New default:
+  8 GiB.** Every budget derived from `effective_memory_limit_bytes()`, which is
+  min(cgroup limit, total system RAM) — so with no cgroup, the normal laptop and
+  macOS case, a bigger machine bought a hungrier XERJ. Measured on a 121 GiB
+  host, the derivation base was 124,609 MB, giving a 31,152 MB memtable budget
+  and a 24,921 MB hydration cache before anything else allocated. Users reported
+  ~20 GiB resident for two indexed projects.
+
+  `limits.max_process_memory_mb` now defaults to `8192` and caps the derivation
+  base itself, so every dependent budget shrinks coherently. It only ever
+  lowers: a 4 GiB laptop stays 4 GiB and a smaller cgroup limit still wins. Set
+  `0` to restore the previous machine-proportional behaviour on a dedicated box
+  (#461).
+
+  **Read this before relying on it as a ceiling.** It caps the budgets derived
+  from machine size. It is NOT an RSS limit, and an audit of this release
+  measured a node configured with exactly these budgets reaching 7,924 MB
+  resident while the capped caches held 873 MB — the governed budgets cover
+  under half of peak RSS, and the rest is merge-path allocation, aggregation
+  workspace and allocator retention that consult no budget at all. On a large
+  corpus the cap can therefore surface as an HTTP 429 on ingest rather than as
+  flat memory. If you index a large project and see 429
+  `circuit_breaking_exception`, raise `limits.max_process_memory_mb`. Reducing
+  the memory that is outside these budgets is follow-up work, not something this
+  release completes.
+
+- **The README's lead was rewritten three times in this release; the third is
+  what ships.** #457 moved the lead from reference coding to `autoindex`, on the
+  argument that reference coding is one use case standing in for the whole
+  product, and changed `llms.txt` the same way. #472 moved it back to reference
+  coding with its measured 2.7x-fewer-output-tokens result at an equal solve
+  rate, and added a community CTA. #478 then replaced the lead again with a
+  paste-to-agent prompt — *"One prompt, and your AI agent installs XERJ, indexes
+  your code, and reads the exact implementation"* — and removed the top-level
+  `## Install` section, demoting installation to a `## Install by hand` section
+  further down.
+
+  So the net change versus rc.17 is the **#478** shape, not #472's, and rc.18
+  does not lead install-first. The badge and body corrections from #457 survive
+  all three (#457, #472, #478).
+
+- **Capability badges corrected.** The default embedder is lexical and offline;
+  neural is opt-in and downloads ~90 MB on first use. The previous pair
+  (`semantic` beside `built-in, offline`) described a configuration that does
+  not exist, and the README body said so correctly eighty lines below. The
+  release badge also no longer renders "no releases found" — both
+  `include_prereleases` and `sort=semver` break it for this repository's tags
+  (#455).
 
 - **`autoindex --follow-symlinks` no longer follows a link out of the indexed
   folder unless you ask it to.** Pointing autoindex at a folder is not consent
@@ -92,6 +331,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **A three-model reference-coding benchmark, and a number that does not match the
+  headline.** `demo/playbooks/REFCODING_BENCHMARK_3MODEL_2026-08-18.md` measures
+  XERJ at **~1.4x fewer output tokens than grep**, consistent across all three
+  models, plus a turnkey SWE-bench harness under `tools/xerj-code/swebench/`.
+  The README, `llms.txt` and the badge headline **2.7x**, from the earlier
+  single-model case study. Both are real measurements of different task sets;
+  neither supersedes the other, and the 1.4x figure is the one measured across
+  models. If you are choosing a number to quote, quote that one and say what it
+  was measured on (#480).
+
+- **Withdrew security and supply-chain claims the build does not back.** The
+  security page's air-gap row moved from `GA` to `DOCS` and its
+  `XERJ_AIRGAP=1 disables all telemetry` line was removed — that variable exists
+  nowhere in the tree. The `SBOM · SUPPLY CHAIN` section, which promised a
+  CycloneDX SBOM with every release, SLSA provenance, signed git tags and release
+  archives, cosign-compatible signatures and reproducible builds, was replaced by
+  a `RELEASE INTEGRITY` section stating what actually ships: a `.sha256`, which is
+  a checksum and not a signature or an attestation. The public-sector page lost
+  its `SBOM · SLSA` compliance row and its at-rest-encryption and BYOK claims.
+  A verified air-gapped deployment recipe was added in their place (#430).
+
+
 - **The 10,000-document scroll snapshot cap is now published, and pinned to the
   constant that enforces it**
   ([#370](https://github.com/xerj-org/xerj/issues/370)). XERJ's `_search?scroll=`
@@ -148,9 +409,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-index scroll copy at a XERJ source with no mention of the ceiling.
 
   One boundary is documented rather than fixed here: the cap is applied to the
-  request's summed total on `POST /{index}/_search?scroll=` (`es_compat.rs:14211`)
+  request's summed total on `POST /{index}/_search?scroll=` (`es_compat.rs:14229`)
   but *per index* on the `POST /{index}/_search_scroll` alias
-  (`es_compat.rs:19726`), so a multi-index scroll on that route can snapshot the
+  (`es_compat.rs:19808`), so a multi-index scroll on that route can snapshot the
   ceiling from each index. That direction is permissive, not lossy. The pages now
   say so and point at
   [#405](https://github.com/xerj-org/xerj/issues/405), where the engine

@@ -2,7 +2,7 @@
 
 This roadmap tracks capabilities that are **planned but not yet fully implemented**, so the project's public claims stay honest about what ships today versus what is coming. Status is verified against the actual code and by real API requests to the release binary, not aspirational.
 
-Last reviewed: 2026-08-15 (against `v1.0.0-rc.17` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298).
+Last reviewed: 2026-08-17 (against `v1.0.0-rc.18` and `main`). Statuses trace to issues, merged PRs, the CHANGELOG, and the conformance suite; items carried forward from the 2026-07-12 review without fresh live verification are marked as such. This review line is machine-checked: `docs_capability_lists` fails the build if a release is cut without re-reviewing this file (issue #298).
 
 ## Follow the roadmap
 
@@ -28,13 +28,21 @@ These are implemented and exercised by real API requests / the test suite / benc
 - Bulk / scroll / delete-by-query, aliases, index templates, **executed** index-lifecycle policies (ISM-modeled, `_ilm/*` + `_plugins/_ism/*`, since rc.15), `_cat/*`, `_cluster/health`, `_count` / `_msearch` / `_mget`, `_update` / `_update_by_query` — all live-verified.
 - **A single native binary**, statically linked, no JVM, sub-second cold start.
 
-The release-by-release record of how all of this landed (rc.1 through rc.17) is [CHANGELOG.md](./CHANGELOG.md) — this file no longer duplicates it.
+The release-by-release record of how all of this landed (rc.1 through rc.18) is [CHANGELOG.md](./CHANGELOG.md) — this file no longer duplicates it.
 
-## Next release — [v1.0.0-rc.18](https://github.com/xerj-org/xerj/milestones)
+## Next release — [v1.0.0-rc.19](https://github.com/xerj-org/xerj/milestones)
 
-rc.17 was cut on 2026-08-15 — its full contents are the [CHANGELOG.md](./CHANGELOG.md)
-entry, not this file. It is the largest RC of the series so far: 105 commits, and every
-PR that was in flight at the rc.16 review has landed.
+rc.18 was cut on 2026-08-17 — its full contents are the [CHANGELOG.md](./CHANGELOG.md)
+entry, not this file. Two of its fixes are on the paths a user follows to obtain and
+install XERJ: the air-gapped recipe extracted and installed on a bad digest
+([#441](https://github.com/xerj-org/xerj/pull/441)), and the install page's `sha256sum -c`
+step verified whatever filenames the `.sha256` listed without ever hashing the archive
+([#444](https://github.com/xerj-org/xerj/issues/444)). It also carries the `--follow-symlinks`
+escape fix ([#438](https://github.com/xerj-org/xerj/issues/438)), which **indexes less than
+rc.17 for some setups** — see the CHANGELOG entry before upgrading.
+
+rc.17 was cut on 2026-08-15 — the largest RC of the series so far: 105 commits, and every
+PR that was in flight at the rc.16 review had landed.
 
 Items it retired from this roadmap:
 
@@ -56,40 +64,46 @@ Items it retired from this roadmap:
 - The `fields` API deep-copy ([#311](https://github.com/xerj-org/xerj/issues/311)) and the
   `--no-graph` durable path ([#294](https://github.com/xerj-org/xerj/issues/294)) are closed.
 
-**Open defects on the rc.18 milestone.** Most were found by dogfooding the engine against
-its own reference corpora during the rc.17 cycle, and each carries a measured repro:
+**Open defects carried into rc.19.** Most sit on the rc.19 milestone; #469 and #450 are open but unmilestoned, listed here because they are real rather than because a milestone says so. Re-reviewed at the rc.18 cut: every item below was
+checked against its issue state, and the ones rc.18 closed were removed rather than carried.
+Most were found by dogfooding the engine against its own reference corpora, and each carries
+a measured repro:
 
-- **Correctness, release-blocking.** `dense_vector` `quantization: "scalar8"` /
-  `int8_hnsw` scores updated vectors from stale cached codes, so a document whose vector was
-  replaced with its own negation still ranks first at `1.000000`
-  ([#371](https://github.com/xerj-org/xerj/issues/371)).
-- **Ranking.** `_score` is derived from the returned page, so it changes with `size` and
-  ranking is not stable under pagination ([#361](https://github.com/xerj-org/xerj/issues/361));
-  `_count` and `_search` disagree for `term` on a `text` field
-  ([#362](https://github.com/xerj-org/xerj/issues/362)).
+- **Ranking, partially fixed in rc.18.** `_score` is derived from the returned page, so it
+  changes with `size` and ranking is not stable under pagination
+  ([#361](https://github.com/xerj-org/xerj/issues/361)). rc.18 fixed the `filter`/`must_not`
+  case with a `term`-shaped child on pages served entirely by the segment FTS path;
+  `filter: [{match_all}]` / `filter: [{exists}]` and any page carrying memtable or
+  stored-scan hits are unchanged, so the issue stays open.
 - **Silently answering a different question.** `match` on a `semantic_text` field runs BM25
   rather than kNN ([#363](https://github.com/xerj-org/xerj/issues/363)); a refused key
   suppresses field evolution for up to 100 documents
   ([#382](https://github.com/xerj-org/xerj/issues/382)).
-- **autoindex robustness.** Reconciliation aborts a whole run on a file declaring 2+ SQL
-  tables ([#360](https://github.com/xerj-org/xerj/issues/360)) and on the project's own
-  reference corpora ([#367](https://github.com/xerj-org/xerj/issues/367)); unqualified
-  printable magic silently junks text ([#379](https://github.com/xerj-org/xerj/issues/379),
-  [#380](https://github.com/xerj-org/xerj/issues/380)); nothing bounds what a magic-less
-  binary costs ([#381](https://github.com/xerj-org/xerj/issues/381)).
+- **autoindex robustness.** Reconciliation aborts a whole run on the project's own
+  reference corpora ([#367](https://github.com/xerj-org/xerj/issues/367)); nothing bounds
+  what a magic-less binary costs ([#381](https://github.com/xerj-org/xerj/issues/381)).
 - **Performance.** The neural embedder runs ~15 docs/s on short strings
   ([#366](https://github.com/xerj-org/xerj/issues/366)); nested term aggregations
   materialise all sub-buckets ([#375](https://github.com/xerj-org/xerj/issues/375)).
 - **Carried forward.** The `fields` API omitting embedding companions
   ([#310](https://github.com/xerj-org/xerj/issues/310)) and the dynamic-mapping field-budget
   overshoot ([#312](https://github.com/xerj-org/xerj/issues/312)).
-- **CI can only see what it is configured to run.** Two lib tests fail on clean `main` at
-  full test parallelism and are hidden by CI's `--test-threads=2`
-  ([#372](https://github.com/xerj-org/xerj/issues/372)); the same shape produced the
-  Rust-1.92 clippy lints and the Painless stack overflow
-  ([#353](https://github.com/xerj-org/xerj/issues/353)) this cycle.
+- **CI can only see what it is configured to run.** The Rust-1.92 clippy lints and the
+  Painless stack overflow ([#353](https://github.com/xerj-org/xerj/issues/353)) came from
+  this shape — a gate green only because of how it was invoked. The rc.18 cut produced
+  another instance: the ROADMAP review gate is satisfied by the version string in the review
+  line, so bumping the date passed it while this very section still listed six issues rc.18
+  had closed. The gate needs to check the statuses, not the header.
+- **Startup still announces what it has not got.** The first-launch console setup link is
+  printed from the configured ES-compat port before any listener is bound, so it can name a
+  port this process does not hold ([#469](https://github.com/xerj-org/xerj/issues/469)) —
+  the same class rc.18 closed for the banner itself (#465).
+- **ES-compat surface.** `_delete_by_query` / `_update_by_query` through a multi-index alias
+  touch only the first member and report success
+  ([#450](https://github.com/xerj-org/xerj/issues/450)); scroll through such an alias reports
+  the alias as `_index` ([#433](https://github.com/xerj-org/xerj/issues/433)).
 
-In flight: nothing. Every PR open at the rc.16 review merged into rc.17.
+In flight at this cut: #460 (this release) and #477 ready, and #431/#446/#449/#453/#458 as drafts. #473 landed before the cut and ships in rc.18. Note #477 proposes replacing the flat 8 GiB default this release ships with a stepped 8/16/32 GiB cap chosen by machine RAM.
 
 ## The road to [v1.0.0 GA](https://github.com/xerj-org/xerj/milestone/2)
 
