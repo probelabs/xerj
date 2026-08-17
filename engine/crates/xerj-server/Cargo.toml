@@ -52,10 +52,6 @@ rayon = { workspace = true }
 
 # gRPC server: the real XerjSearch service on :8081 (proto: ../../proto/xerj.proto).
 tonic.workspace = true
-# `TcpListenerStream`, so the gRPC listener can be bound up front alongside
-# the REST ones and a taken port fails startup rather than being logged
-# under a banner that already claimed it (issue #465).
-tokio-stream = { version = "0.1", features = ["net"] }
 prost.workspace = true
 
 # Use jemalloc as the global allocator.  The default glibc malloc causes
@@ -102,3 +98,4 @@ protox = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
 flate2 = "1"
+tokio-stream = "0.1"

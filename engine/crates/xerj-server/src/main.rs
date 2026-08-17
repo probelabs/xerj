@@ -360,7 +360,7 @@ fn url_host(bind: &str) -> String {
 ///
 /// The banner is printed from *these*, never from `cfg.server.*_port`, because
 /// a port in the config is a request and a port in here is a fact. See
-/// `bind_listeners` for why that distinction is load-bearing (issue #465).
+/// step 10a of `async_main` for why that distinction is load-bearing (#465).
 struct BoundAddrs {
     rest: SocketAddr,
     es: SocketAddr,
@@ -1017,9 +1017,10 @@ fn spawn_periodic_flusher(
 /// Take an address and bind it, then serve. Kept for tests, which want the
 /// convenience of `:0` and do not care about startup ordering.
 ///
-/// The server itself must NOT use this: it binds every listener up front, in
-/// `bind_listeners`, so that a taken port is a startup failure rather than a
-/// line in the log under a banner that already claimed success (issue #465).
+/// The server itself must NOT use this: it binds every listener up front at
+/// step 10a of `async_main`, so that a taken port is a startup failure rather
+/// than a line in the log under a banner that already claimed success
+/// (issue #465).
 #[cfg(test)]
 async fn serve(
     router: Router,

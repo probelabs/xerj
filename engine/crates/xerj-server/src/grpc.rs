@@ -436,8 +436,24 @@ where
     let addr = listener
         .local_addr()
         .context("gRPC: read the bound address")?;
+    // `TcpIncoming::from_listener`, NOT a bare `TcpListenerStream`.
+    //
+    // `serve_with_incoming_shutdown` "discards any provided Server TCP
+    // configuration" — including `Server::builder()`'s `tcp_nodelay: true`,
+    // which tonic applies only inside `TcpIncoming::poll_next`. Handing it a
+    // raw stream left Nagle on for every accepted gRPC connection and put
+    // Linux's 40 ms delayed-ACK back on unary RPCs: measured p50 0.31 ms ->
+    // 40.9 ms on loopback, against an unaffected ES-compat control on the same
+    // node. `main.rs` sets the same option on the REST path for the same
+    // reason ("a fixed per-request latency tax on trivial reads").
+    //
+    // `from_listener` keeps the bind-up-front property of #465 — the listener
+    // is already bound, this only adopts it — while restoring the per-accept
+    // socket options.
     let listener =
         tokio::net::TcpListener::from_std(listener).context("gRPC: adopt the bound listener")?;
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .map_err(|e| anyhow::anyhow!("gRPC: drive the bound listener: {e}"))?;
     let interceptor = GrpcAuth {
         state: state.clone(),
     };
@@ -445,10 +461,7 @@ where
     info!("gRPC XerjSearch listening on {addr}");
     tonic::transport::Server::builder()
         .add_service(svc)
-        .serve_with_incoming_shutdown(
-            tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown,
-        )
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .context("gRPC transport error")?;
     Ok(())

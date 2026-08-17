@@ -198,10 +198,21 @@ fn a_taken_es_compat_port_ends_the_process() {
          reading the exit code learns nothing.\n--- stderr ---\n{}",
         out.stderr
     );
+    // Deliberately matched against the bind error and not the bare port number:
+    // the first-launch console link (`http://127.0.0.1:{es}/_xerj-console/setup`)
+    // also reaches stderr, and before the fix, so `stderr.contains(port)` was
+    // satisfied whether or not the failure was ever reported. Verified by
+    // dropping `{addr}` from `bind_listener`'s context and watching the weaker
+    // form still pass.
     assert!(
-        out.stderr.contains(&es.to_string()),
+        out.stderr.contains(&format!("bind 127.0.0.1:{es}")),
         "the failure must name the port that was taken, so the operator can \
          act on it without reading the log\n--- stderr ---\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("Address already in use"),
+        "the failure must say why the port could not be taken\n--- stderr ---\n{}",
         out.stderr
     );
 
