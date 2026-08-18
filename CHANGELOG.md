@@ -165,6 +165,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compute the digest, assert it is 64 hex characters, demand that exact line,
   and chain extraction and install to the result (#444, #452).
 
+- **A text file whose first two characters were `BM`, or whose first four were
+  `GIF8`, was junked as an image and never indexed.** These were the last two
+  printable-ASCII signatures in `MAGIC_TABLE` matched without a qualifier, so
+  `sniff` returned `Family::Binary` and `scan_file` skipped the file citing
+  "binary content (gif)" / "(bmp)" — a reason that named a format the file did
+  not have. The reported case is a CSV whose first column header is `BMW`; a
+  health export headed `BMI` fails the same way, as does any prose beginning
+  "BM" or "GIF8". rc.17 shipped this knowingly and said so twice, pinning the
+  wrong answers in `gif8_and_bm_are_still_taken_on_faith` so the deferral was
+  visible rather than silent. That test is now replaced by
+  `text_that_opens_with_gif8_or_bm_is_text`, which asserts the right answer for
+  the same fixtures, and by `every_printable_signature_carries_a_qualifier`,
+  which walks every row of `MAGIC_TABLE` so the class cannot return through a
+  new signature. **If you deferred a corpus on account of the rc.17 note, re-run
+  `xerj autoindex` — files that were previously skipped will now be indexed**
+  (#379, #380, #427).
+
 - **A GIF whose comment chain outruns the sniff budget is decided by the chain,
   not by a canvas heuristic** (#427, #442).
 
