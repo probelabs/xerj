@@ -400,6 +400,141 @@ fn cap_memory_limit(machine_limit: u64, cap_mb: u64) -> u64 {
     machine_limit.min(cap_mb.saturating_mul(1024 * 1024))
 }
 
+/// The AUTO process-memory cap, in MiB, chosen from the effective memory the
+/// process can actually see, in binary-GiB steps:
+///
+///   effective < 64 GiB             → 8 GiB
+///   64 GiB ≤ effective < 128 GiB   → 16 GiB
+///   effective ≥ 128 GiB            → 32 GiB
+///
+/// Tier off the effective (cgroup-aware) limit — see
+/// `effective_memory_limit_bytes` — not raw host RAM, so a container smaller
+/// than its host is sized for the container. This only *chooses* a ceiling;
+/// `cap_memory_limit` still mins it with the machine, so the cap only ever
+/// LOWERS a budget: on a 40 GiB box the 8 GiB tier yields min(40, 8) = 8, and
+/// on a 6 GiB box it yields min(6, 8) = 6. It never invents headroom.
+fn tiered_cap_mb(effective_bytes: u64) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if effective_bytes < 64 * GIB {
+        8 * 1024
+    } else if effective_bytes < 128 * GIB {
+        16 * 1024
+    } else {
+        32 * 1024
+    }
+}
+
+/// Human-friendly binary size for the startup line: whole GiB when exact, one
+/// decimal when not, and MiB below 1 GiB. Presentation only.
+fn format_gib(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        let whole = bytes / GIB;
+        let tenths = (bytes % GIB) * 10 / GIB;
+        if tenths == 0 {
+            format!("{whole} GiB")
+        } else {
+            format!("{whole}.{tenths} GiB")
+        }
+    } else {
+        format!("{} MiB", bytes / MIB)
+    }
+}
+
+/// Where the resolved process-memory cap came from — logged in the friendly
+/// startup line so a first run states plainly whether the ceiling was auto,
+/// from config, or from the environment.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProcessMemoryCapSource {
+    /// Chosen by the AUTO tier from the machine size (the no-config default).
+    Auto,
+    /// An explicit `limits.max_process_memory_mb` (a fixed cap, or `0` = whole machine).
+    Config,
+    /// `XERJ_MAX_PROCESS_MEMORY_MB` in the environment (wins over config).
+    Env,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResolvedProcessMemoryCap {
+    /// MiB ceiling to hand to `cap_memory_limit`; `0` = uncapped (whole machine).
+    cap_mb: u64,
+    /// True when `cap_mb` came from the AUTO tier (drives the log wording).
+    auto_tier: bool,
+    source: ProcessMemoryCapSource,
+    warning: Option<String>,
+}
+
+/// Resolve the process-memory cap from config + optional env override, mirroring
+/// the `XERJ_SEGMENT_HYDRATION_CACHE_MB` grammar (`auto` | `off` | `<MiB>`).
+///
+/// Precedence: env wins over config. Semantics preserved from the flat-cap era —
+/// the AUTO sentinel means "tier it", `0` means UNCAPPED (whole machine), and a
+/// positive `N` means a fixed `N` MiB ceiling. A bare env `0` is ambiguous
+/// (uncapped? auto?) and falls back to config with a warning, exactly as the
+/// hydration resolver does.
+fn resolve_process_memory_cap(
+    effective_limit: u64,
+    configured_mb: u64,
+    env_value: Option<&str>,
+) -> ResolvedProcessMemoryCap {
+    use ProcessMemoryCapSource as Src;
+
+    let auto = |source| ResolvedProcessMemoryCap {
+        cap_mb: tiered_cap_mb(effective_limit),
+        auto_tier: true,
+        source,
+        warning: None,
+    };
+    let from_config = || {
+        if configured_mb == xerj_common::config::AUTO_PROCESS_MEMORY_MB {
+            auto(Src::Auto)
+        } else {
+            // 0 = uncapped, N = a fixed ceiling — both explicit config choices.
+            ResolvedProcessMemoryCap {
+                cap_mb: configured_mb,
+                auto_tier: false,
+                source: Src::Config,
+                warning: None,
+            }
+        }
+    };
+
+    match env_value.map(str::trim) {
+        Some("auto") => auto(Src::Env),
+        Some("off") | Some("unlimited") => ResolvedProcessMemoryCap {
+            cap_mb: 0,
+            auto_tier: false,
+            source: Src::Env,
+            warning: None,
+        },
+        Some(value) => match value.parse::<u64>() {
+            Ok(0) => {
+                let mut fallback = from_config();
+                fallback.warning = Some(
+                    "XERJ_MAX_PROCESS_MEMORY_MB=0 is ambiguous; use auto, off, or a positive MiB value; falling back to config"
+                        .to_owned(),
+                );
+                fallback
+            }
+            Ok(mb) => ResolvedProcessMemoryCap {
+                cap_mb: mb,
+                auto_tier: false,
+                source: Src::Env,
+                warning: None,
+            },
+            Err(_) => {
+                let mut fallback = from_config();
+                fallback.warning = Some(format!(
+                    "invalid XERJ_MAX_PROCESS_MEMORY_MB={value:?}; expected auto, off, or a positive MiB value; falling back to config"
+                ));
+                fallback
+            }
+        },
+        None => from_config(),
+    }
+}
+
 fn auto_memtable_budget(effective_limit: u64) -> u64 {
     // The 2 GiB floor is clamped by the 50% ceiling on the SAME effective
     // limit, so an 8 GiB cap yields 2 GiB (25% = 2 GiB) and a 2 GiB effective
@@ -514,18 +649,30 @@ fn build(config: &Config) -> ResourceGovernor {
 
     // ── RSS watermark against the effective memory limit ──
     //
-    // Capped by `limits.max_process_memory_mb` (default 8 GiB). Every budget
-    // below derives from this one number, so capping HERE is what makes the
-    // ceiling coherent — capping each dependent budget separately would let
-    // their sum exceed the ceiling nobody set.
+    // Capped by `limits.max_process_memory_mb`, resolved through
+    // `resolve_process_memory_cap`: the AUTO default tiers the cap off the
+    // machine (8/16/32 GiB), `0` means uncapped (whole machine), an explicit
+    // `N` forces a fixed MiB ceiling, and `XERJ_MAX_PROCESS_MEMORY_MB` can
+    // override any of it. Every budget below derives from this one number, so
+    // capping HERE is what makes the ceiling coherent — capping each dependent
+    // budget separately would let their sum exceed the ceiling nobody set.
     //
     // The cap only lowers: a smaller machine, or a smaller cgroup limit, still
     // wins. Users reported ~20 GiB resident for two projects because with no
     // cgroup the derivation base was the whole machine, so a 64 GiB host asked
     // for 16 GiB of memtables and a 12.8 GiB hydration cache before anything
-    // else allocated a byte.
-    let memory_limit_bytes =
-        cap_memory_limit(effective_memory_limit_bytes(), limits.max_process_memory_mb);
+    // else allocated a byte — the AUTO tier is what stops that on a laptop
+    // while still letting a big server climb to 16 or 32 GiB.
+    let effective_memory_bytes = effective_memory_limit_bytes();
+    let resolved_process_cap = resolve_process_memory_cap(
+        effective_memory_bytes,
+        limits.max_process_memory_mb,
+        std::env::var("XERJ_MAX_PROCESS_MEMORY_MB").ok().as_deref(),
+    );
+    if let Some(warning) = &resolved_process_cap.warning {
+        tracing::warn!("{warning}");
+    }
+    let memory_limit_bytes = cap_memory_limit(effective_memory_bytes, resolved_process_cap.cap_mb);
 
     // ── memtable budget: 0 = auto-derive from the effective (cgroup-aware)
     // memory limit — see `auto_memtable_budget`. Must be derived from the
@@ -581,9 +728,42 @@ fn build(config: &Config) -> ResourceGovernor {
     // 50 k-action bulks would allocate ~N × 15 MiB of parse-phase heap.
     let max_concurrent_bulks = 8usize;
 
+    // One friendly, non-alarming line stating what RAM was detected, the cap
+    // chosen and WHY, and how to override it. This is the first-run experience:
+    // a laptop user should see a sane 8 GiB cap explained, not a silent 20 GiB.
+    let cap_reason = match (
+        resolved_process_cap.source,
+        resolved_process_cap.auto_tier,
+        resolved_process_cap.cap_mb,
+    ) {
+        (ProcessMemoryCapSource::Auto, _, _) => "auto tier",
+        (ProcessMemoryCapSource::Config, _, 0) => "uncapped: whole machine, limits.max_process_memory_mb = 0",
+        (ProcessMemoryCapSource::Config, _, _) => "explicit limits.max_process_memory_mb",
+        (ProcessMemoryCapSource::Env, true, _) => "auto tier via XERJ_MAX_PROCESS_MEMORY_MB",
+        (ProcessMemoryCapSource::Env, _, 0) => "uncapped via XERJ_MAX_PROCESS_MEMORY_MB",
+        (ProcessMemoryCapSource::Env, _, _) => "explicit XERJ_MAX_PROCESS_MEMORY_MB",
+    };
+    if resolved_process_cap.cap_mb == 0 {
+        tracing::info!(
+            "memory: detected {} usable, using the whole machine (no process cap — {}); \
+             set limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB to add one",
+            format_gib(effective_memory_bytes),
+            cap_reason,
+        );
+    } else {
+        tracing::info!(
+            "memory: detected {} usable, using a {} cap ({}); change with \
+             limits.max_process_memory_mb or XERJ_MAX_PROCESS_MEMORY_MB (0 = whole machine)",
+            format_gib(effective_memory_bytes),
+            format_gib(memory_limit_bytes),
+            cap_reason,
+        );
+    }
+
     tracing::info!(
         memtable_budget_mb = memtable_budget_bytes / (1024 * 1024),
         memory_limit_mb = memory_limit_bytes / (1024 * 1024),
+        memory_limit_source = ?resolved_process_cap.source,
         memory_watermark_mb = memory_watermark_bytes / (1024 * 1024),
         memory_watermark_pct = limits.memory_watermark_percent,
         max_query_memory_mb = limits.max_query_memory_mb,
@@ -903,33 +1083,140 @@ mod tests {
         assert!(zero.warning.is_some());
     }
 
-    /// Regression test for the bug fixed in this PR: `auto_memtable_budget`
-    /// must be derived from the effective (cgroup-aware) limit passed in,
-    /// not from raw host RAM read separately inside the function. Before
-    /// the fix this formula lived inline in `build()` and called
-    /// `system_total_bytes()` directly, so it had no coverage at all —
-    /// this table pins the exact values a reviewer reproduced live on a
-    /// real cgroup-v2 host (1 GiB cap → 512 MiB, not the pre-fix ~30 GiB).
-    /// The reported symptom, as arithmetic: a big machine bought a hungrier
-    /// XERJ. Every budget derives from the same base, so the base is what the
-    /// cap has to bind.
+    /// The AUTO default (an omitted `max_process_memory_mb`) must pick a cap
+    /// from the machine in binary-GiB steps, and the cap must only ever LOWER
+    /// the base — never invent headroom the host does not have. This is the
+    /// no-config first-run contract: a laptop is capped, a big server climbs.
+    ///
+    /// The historical bug this whole subsystem exists for: a big machine bought
+    /// a hungrier XERJ (~20 GiB resident) because every budget derived from the
+    /// uncapped whole-machine base. The tier keeps that base bounded while
+    /// still letting a 64/128 GiB box use 16/32 GiB instead of a flat 8.
     #[test]
-    fn the_default_cap_binds_on_the_machines_users_actually_run() {
+    fn the_auto_default_tiers_the_cap_and_only_lowers() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        const DEFAULT_CAP_MB: u64 = 8192;
+        const AUTO: u64 = xerj_common::config::AUTO_PROCESS_MEMORY_MB;
 
-        // 64 GiB Mac Pro, no cgroup — the reported case.
-        let uncapped = cap_memory_limit(64 * GIB, 0);
-        let capped = cap_memory_limit(64 * GIB, DEFAULT_CAP_MB);
-        assert_eq!(uncapped, 64 * GIB, "0 must mean no ceiling");
-        assert_eq!(capped, 8 * GIB, "the default must bind on a 64 GiB host");
+        // 200 GiB server, no cgroup → 32 GiB tier, source Auto.
+        let big = resolve_process_memory_cap(200 * GIB, AUTO, None);
+        assert_eq!(big.cap_mb, 32 * 1024);
+        assert!(big.auto_tier);
+        assert_eq!(big.source, ProcessMemoryCapSource::Auto);
+        assert_eq!(cap_memory_limit(200 * GIB, big.cap_mb), 32 * GIB);
+        assert_eq!(auto_memtable_budget(32 * GIB), 8 * GIB);
 
-        // What that does to the budgets that actually allocate.
-        assert_eq!(auto_memtable_budget(uncapped), 16 * GIB);
-        assert_eq!(auto_memtable_budget(capped), 2 * GIB);
+        // 64 GiB workstation → 16 GiB tier (not the old flat 8), memtables 4 GiB.
+        let mid = resolve_process_memory_cap(64 * GIB, AUTO, None);
+        assert_eq!(mid.cap_mb, 16 * 1024);
+        assert_eq!(cap_memory_limit(64 * GIB, mid.cap_mb), 16 * GIB);
+        assert_eq!(auto_memtable_budget(16 * GIB), 4 * GIB);
 
-        // 128 GiB workstation: still 8 GiB, not 32.
-        assert_eq!(cap_memory_limit(128 * GIB, DEFAULT_CAP_MB), 8 * GIB);
+        // 40 GiB box → 8 GiB tier, min(40, 8) = 8, memtables 2 GiB.
+        let laptop = resolve_process_memory_cap(40 * GIB, AUTO, None);
+        assert_eq!(laptop.cap_mb, 8 * 1024);
+        assert_eq!(cap_memory_limit(40 * GIB, laptop.cap_mb), 8 * GIB);
+        assert_eq!(auto_memtable_budget(8 * GIB), 2 * GIB);
+
+        // 6 GiB box → 8 GiB tier, but the machine only has 6, so min = 6.
+        let tiny = resolve_process_memory_cap(6 * GIB, AUTO, None);
+        assert_eq!(tiny.cap_mb, 8 * 1024, "the tier is chosen before the min");
+        assert_eq!(cap_memory_limit(6 * GIB, tiny.cap_mb), 6 * GIB, "cap only lowers");
+    }
+
+    /// The tier steps exactly on the 64 GiB and 128 GiB binary boundaries.
+    #[test]
+    fn tiered_cap_steps_on_binary_gib_boundaries() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let cases = [
+            (32u64, 8 * 1024u64),
+            (40, 8 * 1024),
+            (63, 8 * 1024),
+            (64, 16 * 1024), // boundary is inclusive at the top of the step
+            (65, 16 * 1024),
+            (127, 16 * 1024),
+            (128, 32 * 1024),
+            (256, 32 * 1024),
+        ];
+        for (gib, expected_mb) in cases {
+            assert_eq!(
+                tiered_cap_mb(gib * GIB),
+                expected_mb,
+                "AUTO tier for {gib} GiB effective must be {expected_mb} MiB"
+            );
+        }
+    }
+
+    /// The two explicit escape hatches keep their pre-tier meaning: `0` =
+    /// uncapped (whole machine), `N` = a fixed MiB ceiling still min'd with
+    /// the machine. Backward compatibility for anyone who set the flat cap.
+    #[test]
+    fn explicit_config_zero_is_uncapped_and_n_forces_a_fixed_cap() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+
+        // 0 = uncapped: the whole machine, the preserved legacy meaning.
+        let uncapped = resolve_process_memory_cap(64 * GIB, 0, None);
+        assert_eq!(uncapped.cap_mb, 0);
+        assert!(!uncapped.auto_tier);
+        assert_eq!(uncapped.source, ProcessMemoryCapSource::Config);
+        assert_eq!(cap_memory_limit(64 * GIB, uncapped.cap_mb), 64 * GIB);
+        assert_eq!(auto_memtable_budget(64 * GIB), 16 * GIB, "uncapped = old behaviour");
+
+        // N > 0 = a fixed ceiling of exactly N MiB, still min'd with the machine.
+        let fixed = resolve_process_memory_cap(64 * GIB, 4096, None);
+        assert_eq!(fixed.cap_mb, 4096);
+        assert!(!fixed.auto_tier);
+        assert_eq!(fixed.source, ProcessMemoryCapSource::Config);
+        assert_eq!(cap_memory_limit(64 * GIB, fixed.cap_mb), 4 * GIB);
+
+        // A fixed cap larger than the machine still only lowers.
+        let over = resolve_process_memory_cap(2 * GIB, 8192, None);
+        assert_eq!(cap_memory_limit(2 * GIB, over.cap_mb), 2 * GIB);
+    }
+
+    /// `XERJ_MAX_PROCESS_MEMORY_MB` mirrors the hydration grammar
+    /// (`auto` | `off` | `<MiB>`), wins over config, and treats a bare `0` as
+    /// ambiguous — falling back to config with a warning.
+    #[test]
+    fn env_override_wins_and_mirrors_the_hydration_grammar() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        const AUTO: u64 = xerj_common::config::AUTO_PROCESS_MEMORY_MB;
+
+        // `auto` → tier, source Env, beating an explicit config number.
+        let a = resolve_process_memory_cap(200 * GIB, 4096, Some("auto"));
+        assert_eq!(a.cap_mb, 32 * 1024);
+        assert!(a.auto_tier);
+        assert_eq!(a.source, ProcessMemoryCapSource::Env);
+        assert!(a.warning.is_none());
+
+        // `off` / `unlimited` (trimmed) → uncapped.
+        for spelling in ["off", "unlimited", "  off  "] {
+            let off = resolve_process_memory_cap(64 * GIB, 4096, Some(spelling));
+            assert_eq!(off.cap_mb, 0, "{spelling:?} must mean uncapped");
+            assert_eq!(off.source, ProcessMemoryCapSource::Env);
+        }
+
+        // A positive number → a fixed cap, source Env.
+        let n = resolve_process_memory_cap(64 * GIB, AUTO, Some("2048"));
+        assert_eq!(n.cap_mb, 2048);
+        assert!(!n.auto_tier);
+        assert_eq!(n.source, ProcessMemoryCapSource::Env);
+
+        // A bare `0` is ambiguous → warn and fall back to config (AUTO → tier).
+        let zero = resolve_process_memory_cap(64 * GIB, AUTO, Some("0"));
+        assert_eq!(zero.cap_mb, 16 * 1024);
+        assert_eq!(zero.source, ProcessMemoryCapSource::Auto);
+        assert!(zero.warning.is_some());
+        // …and if config itself is an explicit 0, the fallback keeps uncapped.
+        let zero_cfg = resolve_process_memory_cap(64 * GIB, 0, Some("0"));
+        assert_eq!(zero_cfg.cap_mb, 0);
+        assert_eq!(zero_cfg.source, ProcessMemoryCapSource::Config);
+        assert!(zero_cfg.warning.is_some());
+
+        // Garbage → warn and fall back to config.
+        let bad = resolve_process_memory_cap(64 * GIB, AUTO, Some("banana"));
+        assert_eq!(bad.cap_mb, 16 * 1024);
+        assert_eq!(bad.source, ProcessMemoryCapSource::Auto);
+        assert!(bad.warning.is_some());
     }
 
     /// The cap lowers a budget; it must never invent headroom the host does
@@ -957,7 +1244,7 @@ mod tests {
                 "memtable budget {budget} exceeds half of a {base_gib} GiB base"
             );
         }
-        // Concretely: at the 8 GiB default cap the floor does not apply at all.
+        // Concretely: at the 8 GiB AUTO tier the floor does not apply at all.
         assert_eq!(auto_memtable_budget(8 * GIB), 2 * GIB);
         // And under a 2 GiB cgroup the floor is clamped to 1 GiB, not 2.
         assert_eq!(auto_memtable_budget(2 * GIB), GIB);

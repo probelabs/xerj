@@ -400,7 +400,7 @@ batch_size = 64
 # request fails with a timeout error.
 timeout_ms = 5000
 
-# ── Resource Limits (6 of 13 settings) ────────────────────────────────────────
+# ── Resource Limits (6 of 14 settings) ────────────────────────────────────────
 
 [limits]
 
