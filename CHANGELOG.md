@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.0-rc.18] - 2026-08-17
+## [1.0.0-rc.18] - 2026-08-18
 
 ### Security
 
@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quota** — though, as below, that is not enough to keep it off real traffic.
   `h2-0.4.16/src/proto/streams/counts.rs:94-101`: a DATA frame *under* 256 bytes
   consumes `256 - payload_len`; a frame of 256 bytes or more **replenishes**
-  `payload_len - 256`, up to a 25,600-byte ceiling. Any ordinary payload frame
+  `payload_len - 256`. The refill stops at a 25,600-byte ceiling, which lives
+  elsewhere — `Budget::new(DEFAULT_DATA_FRAME_BUDGET)` at `counts.rs:89` and the
+  `.min(self.max)` at `counts.rs:26`, over `DEFAULT_DATA_FRAME_BUDGET = 256 * 100`
+  at `proto/mod.rs:39`. Any ordinary payload frame
   therefore refills what small frames drain — but only a frame that reaches 256
   bytes does. A body chunked below that is made entirely of frames that drain,
   which is what the paragraphs below are about.
@@ -91,12 +94,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   banner is printed from the addresses the kernel actually returned (#465,
   #466).
 
-- **A `keyword` field holding a JSON array was indexed as one token, so a query
-  for any element but the first missed the document.** Array elements are now
-  indexed as N independent values separated by a position gap, so a phrase query
-  cannot span two elements, and the memtable's columnar path refuses an
-  array-valued field rather than silently reading only its first element
-  (#332, #470).
+- **A `keyword` field holding a JSON array was indexed as one token, so once the
+  document reached a segment a query for *any* element — including the first —
+  missed it.** Two distinct causes with two different symptoms, which is why this
+  reads as one bug that changed its mind: in a segment the whole array became a
+  single token, so every element missed; before the flush the memtable's columnar
+  path kept only element 0, so the first element still matched and the rest did
+  not. Array elements are now indexed as N independent values separated by a
+  position gap, so a phrase query cannot span two elements, and the columnar path
+  refuses an array-valued field rather than silently reading only its first
+  element (#332, #470).
 
 - **The audit log recorded no writes and could not name the actor, and
   `/_audit` was readable by any credential.** Create, index, update, bulk and

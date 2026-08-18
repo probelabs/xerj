@@ -32,7 +32,7 @@ The release-by-release record of how all of this landed (rc.1 through rc.18) is 
 
 ## Next release — [v1.0.0-rc.19](https://github.com/xerj-org/xerj/milestones)
 
-rc.18 was cut on 2026-08-17 — its full contents are the [CHANGELOG.md](./CHANGELOG.md)
+rc.18 was cut on 2026-08-18 — its full contents are the [CHANGELOG.md](./CHANGELOG.md)
 entry, not this file. Two of its fixes are on the paths a user follows to obtain and
 install XERJ: the air-gapped recipe extracted and installed on a bad digest
 ([#441](https://github.com/xerj-org/xerj/pull/441)), and the install page's `sha256sum -c`
@@ -41,7 +41,7 @@ step verified whatever filenames the `.sha256` listed without ever hashing the a
 escape fix ([#438](https://github.com/xerj-org/xerj/issues/438)), which **indexes less than
 rc.17 for some setups** — see the CHANGELOG entry before upgrading.
 
-rc.17 was cut on 2026-08-15 — the largest RC of the series so far: 105 commits, and every
+rc.17 was cut on 2026-08-15 — 105 commits, and every
 PR that was in flight at the rc.16 review had landed.
 
 Items it retired from this roadmap:
