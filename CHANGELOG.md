@@ -94,16 +94,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   banner is printed from the addresses the kernel actually returned (#465,
   #466).
 
-- **A `keyword` field holding a JSON array was indexed as one token, so once the
-  document reached a segment a query for *any* element — including the first —
-  missed it.** Two distinct causes with two different symptoms, which is why this
-  reads as one bug that changed its mind: in a segment the whole array became a
-  single token, so every element missed; before the flush the memtable's columnar
-  path kept only element 0, so the first element still matched and the rest did
-  not. Array elements are now indexed as N independent values separated by a
-  position gap, so a phrase query cannot span two elements, and the columnar path
-  refuses an array-valued field rather than silently reading only its first
-  element (#332, #470).
+- **A `keyword` field holding a JSON array was flattened into one token, and the
+  answer changed at `_flush`.** Two independent causes, which is why the symptom
+  looks inconsistent. In a segment the array was joined into a single string
+  before the FTS layer saw it, and the keyword analyzer emits its whole input as
+  one token — so *every clause that projects to a whole-value term* missed the
+  document, the first element included; measured on `{"tags":["red","blue"]}`,
+  after a flush both `red` and `blue` returned 0 hits and only the joined
+  artefact `"red blue"` matched. Before the flush a different cause applied: the
+  memtable's single-valued columns keep only element 0, and the fused columnar
+  walk that serves a bare `term` did not bail out on such a field the way its
+  sibling paths did, so there `red` matched and `blue` did not. The
+  first-element-survives shape people remember is the pre-flush one and does not
+  describe a flushed index. Array elements are now indexed as N independent
+  values separated by a position gap, so a phrase query cannot span two elements,
+  and the columnar path refuses an array-valued field rather than silently
+  reading only its first element (#332, #470).
 
 - **The audit log recorded no writes and could not name the actor, and
   `/_audit` was readable by any credential.** Create, index, update, bulk and
@@ -166,20 +172,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and chain extraction and install to the result (#444, #452).
 
 - **A text file whose first two characters were `BM`, or whose first four were
-  `GIF8`, was junked as an image and never indexed.** These were the last two
-  printable-ASCII signatures in `MAGIC_TABLE` matched without a qualifier, so
-  `sniff` returned `Family::Binary` and `scan_file` skipped the file citing
-  "binary content (gif)" / "(bmp)" — a reason that named a format the file did
-  not have. The reported case is a CSV whose first column header is `BMW`; a
-  health export headed `BMI` fails the same way, as does any prose beginning
-  "BM" or "GIF8". rc.17 shipped this knowingly and said so twice, pinning the
-  wrong answers in `gif8_and_bm_are_still_taken_on_faith` so the deferral was
-  visible rather than silent. That test is now replaced by
-  `text_that_opens_with_gif8_or_bm_is_text`, which asserts the right answer for
-  the same fixtures, and by `every_printable_signature_carries_a_qualifier`,
-  which walks every row of `MAGIC_TABLE` so the class cannot return through a
-  new signature. **If you deferred a corpus on account of the rc.17 note, re-run
-  `xerj autoindex` — files that were previously skipped will now be indexed**
+  `GIF8`, was junked as an image and never indexed.** They were the only two
+  entirely-printable signatures accepted without a qualifier, so `sniff`
+  returned `Family::Binary` and `scan_file` skipped the file citing "binary
+  content (gif)" / "(bmp)" — a reason naming a format the file did not have. The
+  reported case is a CSV whose first column header is `BMW`; a health export
+  headed `BMI` fails the same way, as does prose beginning "BM" or "GIF8".
+  rc.17 shipped this knowingly and said so twice, pinning the wrong answers in
+  `gif8_and_bm_are_still_taken_on_faith` so the deferral stayed visible. That
+  test is replaced by `text_that_opens_with_gif8_or_bm_is_text`, and
+  `every_printable_signature_carries_a_qualifier` now walks every row of the
+  signature table so the defect cannot return *through that table*. It is not
+  the whole class: `%PDF-` is matched earlier, is equally printable, and prose
+  opening with it is still handed to the PDF extractor — deliberately pinned and
+  still open as #403.
+
+  **Recovering an already-indexed corpus takes more than a re-run.** A plain
+  `xerj autoindex` over an existing state dir reuses the frozen plan instead of
+  re-sniffing, and a junked file was recorded in `plan.junk_files` rather than
+  `plan.files`, so it can never be selected — the re-run reports nothing and
+  changes nothing. Use `--fresh`, or a new `--state-dir` with a new `--prefix`;
+  both re-extract and, on a semantic index, re-embed the whole corpus, and
+  `--fresh` is refused outright once a durable corpus generation exists. Files
+  whose GIF-shaped bytes run past the sniff budget also remain classified
+  `Binary` — the release's own tests call that the cost of the rule
   (#379, #380, #427).
 
 - **A GIF whose comment chain outruns the sniff budget is decided by the chain,
