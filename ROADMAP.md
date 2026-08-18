@@ -64,10 +64,16 @@ Items it retired from this roadmap:
 - The `fields` API deep-copy ([#311](https://github.com/xerj-org/xerj/issues/311)) and the
   `--no-graph` durable path ([#294](https://github.com/xerj-org/xerj/issues/294)) are closed.
 
-**Open defects carried into rc.19.** Most sit on the rc.19 milestone; #469 and #450 are open but unmilestoned, listed here because they are real rather than because a milestone says so. Re-reviewed at the rc.18 cut: every item below was
-checked against its issue state, and the ones rc.18 closed were removed rather than carried.
-Most were found by dogfooding the engine against its own reference corpora, and each carries
-a measured repro:
+**Open defects carried into rc.19.** This is a curated shortlist, not the milestone. It
+carries the defects that change what an answer *is* — wrong results, silent substitutions,
+data that does not come back — because those are the ones worth reading before you adopt.
+The [rc.19 milestone](https://github.com/xerj-org/xerj/milestones) is authoritative and
+currently holds 26 open issues; if the two disagree about whether something is open, the
+milestone wins. #469 and #450 are open but unmilestoned, listed because they are real rather
+than because a milestone says so. Re-reviewed at the rc.18 cut: every item below was checked
+against its issue state, and the ones rc.18 closed were removed rather than carried. Most
+were found by dogfooding the engine against its own reference corpora, and each carries a
+measured repro:
 
 - **Ranking, partially fixed in rc.18.** `_score` is derived from the returned page, so it
   changes with `size` and ranking is not stable under pagination
@@ -101,7 +107,17 @@ a measured repro:
 - **ES-compat surface.** `_delete_by_query` / `_update_by_query` through a multi-index alias
   touch only the first member and report success
   ([#450](https://github.com/xerj-org/xerj/issues/450)); scroll through such an alias reports
-  the alias as `_index` ([#433](https://github.com/xerj-org/xerj/issues/433)).
+  the alias as `_index` ([#433](https://github.com/xerj-org/xerj/issues/433)); the scroll
+  snapshot cap is applied per index on `/{index}/_search`, so a scroll over several indices
+  can exceed it ([#405](https://github.com/xerj-org/xerj/issues/405)).
+- **Documents that do not come back the way they went in.** `POST /_bulk` drops explicit
+  `null` fields from `_source`, and whether it drops them depends on request size
+  ([#415](https://github.com/xerj-org/xerj/issues/415)). The rc.18 notes cite all four of
+  these as open; they are listed here so this file and the CHANGELOG do not disagree.
+- **Autoindex.** Catalog IDs are global, so two corpora sharing one byte-identical file
+  collide ([#416](https://github.com/xerj-org/xerj/issues/416)); and widening an exclusion
+  rule wedges the default graph path — the first rerun exits 1 and needs a documented
+  recovery ([#439](https://github.com/xerj-org/xerj/issues/439)).
 
 In flight at this cut: #460 (this release) and #477 ready, and #431/#446/#449/#453/#458 as drafts. #473 landed before the cut and ships in rc.18. Note #477 proposes replacing the flat 8 GiB default this release ships with a stepped 8/16/32 GiB cap chosen by machine RAM.
 
@@ -109,14 +125,17 @@ In flight at this cut: #460 (this release) and #477 ready, and #431/#446/#449/#4
 
 The 1.0 bar: **every public claim verified against the release binary, and every input either honoured or refused loudly.** The gate list, each item an issue:
 
-- **Close the accepted-and-ignored class** (the [#204](https://github.com/xerj-org/xerj/issues/204) umbrella closed once its members carried their own tracking; the sweep continues in PR [#258](https://github.com/xerj-org/xerj/pull/258)). Known members still open: `dense_vector` `quantization` accepted, echoed, and ignored ([#275](https://github.com/xerj-org/xerj/issues/275)); `nested` `score_mode` parsed-then-ignored and `inner_hits` unparsed; `random_sampler`'s ignored `probability`; `weighted_avg` returning HTTP 200 with an error buried in the aggregations body instead of a 400 (the 400 is part of #258).
+- **Close the accepted-and-ignored class** (the [#204](https://github.com/xerj-org/xerj/issues/204) umbrella closed once its members carried their own tracking; PR [#258](https://github.com/xerj-org/xerj/pull/258) carried one pass of the sweep and is merged). Known members still open: `nested` `score_mode` parsed-then-ignored and `inner_hits` unparsed; `random_sampler`'s ignored `probability`; `weighted_avg` returning HTTP 200 with an error buried in the aggregations body instead of a 400 (the 400 is part of #258).
 - **Security hardening backlog** — cargo-audit and fuzzing landed in CI with rc.16 ([#207](https://github.com/xerj-org/xerj/issues/207) closed); the deferred TLS/auth/symlink hardening items from the Phase-2 security backlog remain.
 - **The mixed read-under-write p99 gap** — the 4 benchmark losses out of 85 measured comparisons, all the same root cause (reads landing on the live memtable under writer pressure). Written up in [`demo/playbooks/MIXED_READ_UNDER_WRITE_FINDING_2026-07-08.md`](./demo/playbooks/MIXED_READ_UNDER_WRITE_FINDING_2026-07-08.md); the candidate fix is a visibility/parity-mode design decision, not a micro-optimisation, and it stays on the GA gate until fixed or explicitly descoped with the benchmark loss kept public.
 - **Ship-or-descope every entry in *Known partials* below.** GA does not ship with a "partial" section that reads like a feature list.
 
 ## Beyond 1.0 — themes
 
-- **AST language expansion** — 25 further tree-sitter grammars, tiered by demand, one PR per tier ([#295](https://github.com/xerj-org/xerj/issues/295)); Tier 1 (Kotlin, Swift, Scala, Dart, Lua, Perl, R, Julia, Haskell, Elixir) may land earlier in an RC if the grammar/ABI checks prove out.
+- **AST language expansion** — 25 further tree-sitter grammars, tiered by demand, one PR per
+  tier. [#295](https://github.com/xerj-org/xerj/issues/295) delivered the expansion to 34
+  languages and is closed; the remaining tiers have no tracking issue yet, so this theme is
+  a plan rather than a commitment until one exists. Tier 1 (Kotlin, Swift, Scala, Dart, Lua, Perl, R, Julia, Haskell, Elixir) may land earlier in an RC if the grammar/ABI checks prove out.
 - **Distributed clustering maturity** — embedded Raft handles cluster metadata today, but the default run is **single-node**; multi-node sharding/replication hardening is a post-GA track, and XERJ does not claim multi-node production readiness until it is measured.
 - **Neural embedder ergonomics** — share one loaded model across indices (today each index lazily holds its own `NeuralHandle`), optional pre-warm at startup, a larger default model option.
 - **Log-analytics data path** — the dedicated `xerj-logs` columnar module is still not invoked from non-test engine/server code; log-shaped analytics run through ZBS2 + the generic aggregation suite. Wire it or remove it.
