@@ -64,12 +64,12 @@ Items it retired from this roadmap:
 - The `fields` API deep-copy ([#311](https://github.com/xerj-org/xerj/issues/311)) and the
   `--no-graph` durable path ([#294](https://github.com/xerj-org/xerj/issues/294)) are closed.
 
-**Open defects carried into rc.19.** This is a curated shortlist, not the milestone. It
-carries the defects that change what an answer *is* — wrong results, silent substitutions,
-data that does not come back — because those are the ones worth reading before you adopt.
-The [rc.19 milestone](https://github.com/xerj-org/xerj/milestones) is authoritative and
-currently holds 26 open issues; if the two disagree about whether something is open, the
-milestone wins. #469 and #450 are open but unmilestoned, listed because they are real rather
+**Open defects carried into rc.19.** This is a hand-picked shortlist, not the milestone and
+not a filter you can reapply: it is what a reader evaluating XERJ would most want to know,
+grouped by theme, and it includes performance and CI items that change no answer at all. The
+[rc.19 milestone](https://github.com/xerj-org/xerj/milestones) is authoritative and currently
+holds 26 open issues; if the two disagree about whether something is open, the milestone
+wins. #469 and #450 are open but unmilestoned, listed because they are real rather
 than because a milestone says so. Re-reviewed at the rc.18 cut: every item below was checked
 against its issue state, and the ones rc.18 closed were removed rather than carried. Most
 were found by dogfooding the engine against its own reference corpora, and each carries a
@@ -108,8 +108,9 @@ measured repro:
   touch only the first member and report success
   ([#450](https://github.com/xerj-org/xerj/issues/450)); scroll through such an alias reports
   the alias as `_index` ([#433](https://github.com/xerj-org/xerj/issues/433)); the scroll
-  snapshot cap is applied per index on `/{index}/_search`, so a scroll over several indices
-  can exceed it ([#405](https://github.com/xerj-org/xerj/issues/405)).
+  snapshot cap is enforced on the summed total by `/{index}/_search?scroll=`, which fails
+  loudly, but `/{index}/_search_scroll` applies it per index and only raises a
+  `scroll_truncated` flag ([#405](https://github.com/xerj-org/xerj/issues/405)).
 - **Documents that do not come back the way they went in.** `POST /_bulk` drops explicit
   `null` fields from `_source`, and whether it drops them depends on request size
   ([#415](https://github.com/xerj-org/xerj/issues/415)). The rc.18 notes cite all four of
@@ -118,6 +119,22 @@ measured repro:
   collide ([#416](https://github.com/xerj-org/xerj/issues/416)); and widening an exclusion
   rule wedges the default graph path — the first rerun exits 1 and needs a documented
   recovery ([#439](https://github.com/xerj-org/xerj/issues/439)).
+
+- **Also open, and in the same wrong-answer class**, listed by number rather than written out
+  so the shortlist above stays readable: a `semantic`/`knn` clause nested in a `bool` is
+  silently dropped ([#395](https://github.com/xerj-org/xerj/issues/395)); a single-clause
+  `bool.must` changes `_score` and ranking versus the bare query
+  ([#399](https://github.com/xerj-org/xerj/issues/399)); `match`/`multi_match` on a `keyword`
+  field is mapping-aware only after flush ([#354](https://github.com/xerj-org/xerj/issues/354));
+  term-level matching has two implementations and only one has a schema
+  ([#423](https://github.com/xerj-org/xerj/issues/423), which consolidates eight others);
+  `sort` on an unresolvable field ([#437](https://github.com/xerj-org/xerj/issues/437));
+  scroll continuation pages never emit `_seq_no`/`_version`
+  ([#428](https://github.com/xerj-org/xerj/issues/428)); switching `embedding.mode` from
+  lexical to neural on an existing index is unguarded
+  ([#434](https://github.com/xerj-org/xerj/issues/434)); and `%PDF-` is an unqualified
+  printable magic, the residual of the fix rc.18 ships for `GIF8`/`BM`
+  ([#403](https://github.com/xerj-org/xerj/issues/403)).
 
 In flight at this cut: #460 (this release) and #477 ready, and #431/#446/#449/#453/#458 as drafts. #473 landed before the cut and ships in rc.18. Note #477 proposes replacing the flat 8 GiB default this release ships with a stepped 8/16/32 GiB cap chosen by machine RAM.
 
