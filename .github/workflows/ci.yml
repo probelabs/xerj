@@ -44,12 +44,22 @@ jobs:
       - name: Co-author CLA check unit tests
         run: python3 scripts/test_cla_coauthors.py
 
+      # The narrow field-report carve-out lives here: pass the PR's changed
+      # files to the checker, which SKIPS the trailer gate iff every changed
+      # path is a markdown field report under user-feedback/16-agent-field-reports/
+      # (and nothing else). Any code/CI/other-docs change re-arms the full gate.
+      # The binding `verification/cla-signed` status for a field-report-only PR
+      # is provided separately (.github/workflows/cla-field-report-exempt.yml),
+      # because cla-bot cannot path-scope itself.
       - name: Co-authored-by trailers resolve to signed contributors
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER"
+          REPO: ${{ github.repository }}
+        run: |
+          FILES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+          python3 scripts/check_cla_coauthors.py --pr "$PR_NUMBER" --changed-files "$FILES"
 
   reference-coding:
     name: Reference-coding toolkit

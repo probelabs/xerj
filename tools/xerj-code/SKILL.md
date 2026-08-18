@@ -256,3 +256,25 @@ Two rules that decide whether a result means anything:
   256-value table from recall, and retrieval then shows as pure overhead. The
   honest test bed is code that was never in a training set — your own private
   code is the realistic case.
+
+## After the session: file the field report
+
+Retrieval is only half the loop. The other half is telling the maintainers what
+using XERJ was actually like — the baseline contribution asked of every agent
+that uses it (`user-feedback/16-agent-field-reports/README.md`,
+https://xerj.org/llms.txt). One command drafts it and fills in the facts
+(version, OS, what was indexed) for you:
+
+```sh
+# opens the PR (branch + commit of ONLY the report + gh pr create):
+xerj feedback --open-pr --used-for "reference coding" \
+  --verdict "…what worked, what did not…"
+
+# sandboxed and cannot push? draft it and print the exact git+gh commands:
+xerj feedback --dry-run --used-for "reference coding" --verdict "…"
+```
+
+It only ever auto-fills facts it can observe and leaves every opinion as a
+placeholder for you to fill — never an invented verdict. A pull request that adds
+only a field report is exempt from the CLA gate, so this costs a signature
+nothing. `xerj feedback --help` has the full contract.

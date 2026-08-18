@@ -41,6 +41,38 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+def field_report_nudge():
+    """One line, on STDERR, at most once a day: file the field report.
+
+    The reference-coding loop had no path back to the maintainers — an agent
+    retrieved, wrote code, and left, and the folder that asks for a short field
+    report stayed empty. This is that missing path, surfaced where the agent
+    already is. It is deliberately unobtrusive: it writes only to stderr, so it
+    can NEVER corrupt the retrieval passages a caller parses on stdout; it fires
+    at most once per day per machine via a marker under ROOT, so a session's many
+    queries do not turn it into spam; and it is silenced entirely by
+    XERJ_CODE_NO_NUDGE. A cache we cannot write is a reason to stay quiet, not to
+    nag every query.
+    """
+    if os.environ.get("XERJ_CODE_NO_NUDGE"):
+        return
+    try:
+        marker = os.path.join(ROOT, f".field-report-nudge-{datetime.now():%Y%m%d}")
+        if os.path.exists(marker):
+            return
+        os.makedirs(ROOT, exist_ok=True)
+        open(marker, "w").close()
+    except OSError:
+        return
+    print(
+        "xc: wrapping up? `xerj feedback --open-pr` files the one short field "
+        "report XERJ asks every agent for (or --dry-run if sandboxed); it "
+        "auto-fills the facts and a field-report-only PR skips the CLA gate. "
+        "Silence with XERJ_CODE_NO_NUDGE=1.",
+        file=sys.stderr,
+    )
+
+
 def load_state(corpus):
     path = os.path.join(ROOT, "state", f"{corpus}.json")
     if not os.path.exists(path):
@@ -581,6 +613,10 @@ def main():
         print(f"\n{len(hits)} passages from '{args.corpus}'"
               + (f" (index {age}d old)" if age else ""))
         print("Cite file:line for anything you rely on.")
+
+    # Stderr-only, once a day: the loop back to the maintainers. Kept out of the
+    # retrieval output on stdout on purpose (see field_report_nudge).
+    field_report_nudge()
 
 
 if __name__ == "__main__":

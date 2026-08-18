@@ -17,7 +17,13 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from check_cla_coauthors import check_commits, noreply_login, parse_coauthors
+from check_cla_coauthors import (
+    FIELD_REPORT_DIR,
+    check_commits,
+    is_field_report_only,
+    noreply_login,
+    parse_coauthors,
+)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -146,11 +152,75 @@ class GateTests(unittest.TestCase):
         self.assertEqual(calls, ["leonsbox@gmail.com"])
 
 
+class FieldReportExemptionTests(unittest.TestCase):
+    """The narrow carve-out: a field-report-only diff is exempt; anything else
+    is not. Bundling a code change with a field report must NOT bypass the gate
+    — that would be a security hole, so the mixed case is asserted explicitly."""
+
+    def _report(self, name):
+        return f"{FIELD_REPORT_DIR}{name}"
+
+    def test_single_field_report_is_exempt(self):
+        self.assertTrue(
+            is_field_report_only([self._report("2026-08-18-reference-coding.md")])
+        )
+
+    def test_several_field_reports_are_exempt(self):
+        self.assertTrue(
+            is_field_report_only(
+                [
+                    self._report("2026-08-18-a.md"),
+                    self._report("2026-08-18-b.md"),
+                ]
+            )
+        )
+
+    def test_field_report_plus_code_is_NOT_exempt(self):
+        # THE security case: a code change riding along with a field report must
+        # get the full gate, never the exemption.
+        self.assertFalse(
+            is_field_report_only(
+                [
+                    self._report("2026-08-18-a.md"),
+                    "engine/crates/xerj-server/src/main.rs",
+                ]
+            )
+        )
+
+    def test_field_report_plus_other_docs_is_NOT_exempt(self):
+        self.assertFalse(
+            is_field_report_only([self._report("2026-08-18-a.md"), "README.md"])
+        )
+
+    def test_the_folder_readme_is_NOT_a_field_report(self):
+        self.assertFalse(is_field_report_only([self._report("README.md")]))
+
+    def test_a_nested_path_is_NOT_a_field_report(self):
+        self.assertFalse(is_field_report_only([self._report("sub/2026-08-18-a.md")]))
+
+    def test_a_non_markdown_file_in_the_folder_is_NOT_exempt(self):
+        self.assertFalse(is_field_report_only([self._report("2026-08-18-a.txt")]))
+
+    def test_an_empty_diff_is_NOT_exempt(self):
+        # "nothing changed" must never read as "exempt".
+        self.assertFalse(is_field_report_only([]))
+        self.assertFalse(is_field_report_only([""]))
+
+    def test_a_lookalike_prefix_outside_the_folder_is_NOT_exempt(self):
+        # A path that merely starts with the folder name but is not inside it.
+        self.assertFalse(
+            is_field_report_only(["user-feedback/16-agent-field-reports-notes.md"])
+        )
+
+
 class WiringTests(unittest.TestCase):
     """A checker CI never runs is not a gate (cf. the #207 lesson)."""
 
+    def _ci(self):
+        return (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
     def _cla_job(self):
-        ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        ci = self._ci()
         m = re.search(r"\n  cla-config:\n(.*?)(?=\n  \S)", ci, re.S)
         self.assertIsNotNone(m, "cla-config job missing from ci.yml")
         return m.group(1)
@@ -160,6 +230,24 @@ class WiringTests(unittest.TestCase):
 
     def test_ci_runs_these_tests(self):
         self.assertIn("test_cla_coauthors.py", self._cla_job())
+
+    def test_cla_config_computes_changed_files_for_the_carveout(self):
+        # The carve-out only works if the job actually passes the PR's changed
+        # files to the checker — otherwise every PR runs the full gate.
+        self.assertIn("--changed-files", self._cla_job())
+
+    def test_a_separate_job_provides_the_field_report_status(self):
+        # cla-bot cannot path-scope itself, so the required `verification/cla-signed`
+        # status for a strictly field-report-only PR is provided by a dedicated
+        # workflow, guarded by the same predicate.
+        wf = REPO_ROOT / ".github" / "workflows" / "cla-field-report-exempt.yml"
+        self.assertTrue(wf.exists(), "field-report exemption workflow missing")
+        text = wf.read_text()
+        self.assertIn("verification/cla-signed", text)
+        self.assertIn("--is-field-report-only", text)
+        # It must never run the PR's own code under the elevated token.
+        self.assertIn("pull_request_target", text)
+        self.assertIn("base.sha", text)
 
 
 if __name__ == "__main__":
