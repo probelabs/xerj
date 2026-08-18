@@ -49,6 +49,62 @@ def load_state(corpus):
         return json.load(fh)
 
 
+def live_index_count(prefix):
+    """How many indices under `prefix*` actually exist on the target server.
+
+    `state/<corpus>.json` records that a corpus was once indexed, and against
+    which url. It is NOT proof the corpus is loaded on the server THIS process
+    is querying: the state entry survives a data-dir swap, a server restart onto
+    an empty dir, or an XERJ_URL pointed at a different node. When that happens
+    the prefix resolves to zero indices and every query returns "no match" —
+    indistinguishable from a genuinely bad query, which is the exact failure
+    reference-coding exists to prevent (an agent concludes "no reference" and
+    starts guessing). So the count is checked explicitly.
+
+    Returns an int on success (0 meaning "in state/ but not loaded here"), or
+    None when the server is unreachable/unparseable — in which case the caller
+    must NOT claim "0 live indices": the ordinary search path will report the
+    transport failure honestly instead.
+    """
+    req = urllib.request.Request(f"{URL}/_cat/indices/{prefix}*?format=json&h=index")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        # A 404 on a wildcard means "no such indices" -> 0 loaded. Any other
+        # HTTP status is an ambiguous server condition, not a clean zero.
+        return 0 if e.code == 404 else None
+    except (urllib.error.URLError, ValueError):
+        return None
+    if not isinstance(data, list):
+        return None
+    return len(data)
+
+
+def require_loaded(state):
+    """Fail with a DISTINCT, actionable message when the corpus is not loaded.
+
+    Kept deliberately separate from the empty-result path in main(): "0 live
+    indices here" and "the corpus is loaded but nothing matched your query" are
+    different diagnoses with different fixes, and collapsing them is the bug this
+    guard closes.
+    """
+    prefix = state["prefix"]
+    count = live_index_count(prefix)
+    if count is None:
+        return  # server unreachable/ambiguous — let the search path report it.
+    if count == 0:
+        name = state.get("corpus", "?")
+        stamp = state.get("indexed_at", "?")
+        against = state.get("url")
+        hint = (f" It was indexed against {against}." if against and against != URL
+                else " It was indexed against a different data dir or server.")
+        die(f"corpus '{name}' is in state/ (indexed {stamp}) but has 0 live "
+            f"indices ('{prefix}*') on {URL}.{hint} Re-run xc-index.sh {name}, "
+            f"or set XERJ_URL to the node that has it. (This is NOT a 'no "
+            f"match' — the corpus simply is not loaded on this server.)", code=3)
+
+
 def check_fresh(state, stale_ok):
     """A stale index returns code that no longer exists, with false confidence."""
     stamp = state.get("indexed_at")
@@ -436,10 +492,47 @@ def provenance(src):
     return f"{path}:{line}" if line else path
 
 
+def list_corpora():
+    """Show every state/ entry and whether it is actually loaded HERE.
+
+    The whole point: freshness in state/ does not imply the corpus is queryable
+    on this server. This prints the live index count per corpus so an agent can
+    see the real, loadable corpus set without hitting _cat/indices by hand — and
+    without mistaking an over-advertised ledger for the truth.
+    """
+    state_dir = os.path.join(ROOT, "state")
+    if not os.path.isdir(state_dir):
+        die(f"no state directory at {state_dir} — nothing indexed yet")
+    entries = sorted(f[:-5] for f in os.listdir(state_dir) if f.endswith(".json"))
+    if not entries:
+        die(f"no corpora in {state_dir} — run xc-index.sh <corpus>")
+    print(f"corpora in state/ (queried against {URL}):")
+    loaded = 0
+    for name in entries:
+        try:
+            with open(os.path.join(state_dir, f"{name}.json")) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            print(f"  {name:<18} !! unreadable state file")
+            continue
+        prefix = st.get("prefix", f"xc-{name}")
+        stamp = (st.get("indexed_at") or "?")[:10]
+        count = live_index_count(prefix)
+        if count is None:
+            status = "server unreachable/ambiguous"
+        elif count == 0:
+            status = "NOT loaded here (0 indices) — stale/other-server"
+        else:
+            loaded += 1
+            status = f"loaded — {count} index(es)"
+        print(f"  {name:<18} {stamp}  {prefix:<18} {status}")
+    print(f"\n{loaded} of {len(entries)} corpora are actually loaded on {URL}.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="retrieve reference passages")
-    ap.add_argument("corpus")
-    ap.add_argument("query")
+    ap.add_argument("corpus", nargs="?")
+    ap.add_argument("query", nargs="?")
     ap.add_argument("-k", type=int, default=5, help="max passages (default 5)")
     ap.add_argument("--lang", help="restrict to a file extension, e.g. rs")
     ap.add_argument("--stale-ok", action="store_true", help="answer from an old index anyway")
@@ -481,10 +574,26 @@ def main():
                     help="retrieval arm (default bm25 — best top-3 on both corpora)")
     ap.add_argument("--hybrid", action="store_const", const="hybrid", dest="mode",
                     help="shorthand for --mode hybrid (lexical + vector, RRF-fused)")
+    ap.add_argument("--list", action="store_true",
+                    help="list state/ corpora and whether each is loaded HERE, "
+                         "then exit (no corpus/query needed)")
     args = ap.parse_args()
+
+    if args.list:
+        list_corpora()
+        return
+    if not args.corpus or not args.query:
+        ap.error("the following arguments are required: corpus, query "
+                 "(or pass --list)")
 
     state = load_state(args.corpus)
     age = check_fresh(state, args.stale_ok)
+    # A corpus can be in state/ yet have zero live indices on THIS server (it
+    # was indexed against another data dir / node). Catch that here with a
+    # distinct, actionable error — never let it fall through to the generic
+    # "no passage matches" path, which reads as a bad query and sends the agent
+    # off to guess. This is the fix for the state-ledger trust trap.
+    require_loaded(state)
 
     note = None
     if args.mode == "hybrid":
