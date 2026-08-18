@@ -194,25 +194,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening with it is still handed to the PDF extractor — deliberately pinned and
   still open as #403.
 
-  **Recovering an already-indexed corpus takes more than a re-run, and the
-  remedy depends on which path indexed it.** Both were measured on this build.
+  **A corpus indexed before this release will not necessarily pick the file up
+  on a re-run.** What happens depends on the state dir, not on a flag, and the
+  cases differ enough that the only guidance worth giving is: check the exit
+  code, and read the error if there is one.
 
-  On the default (graph) path a re-run reuses the frozen plan instead of
-  re-sniffing. The junked file was recorded in `plan.junk_files` rather than
-  `plan.files`, and `pending_for_phase_b` selects only keys present in
-  `plan.files`, so it can never be picked up: the re-run exits 0 and changes
-  nothing. `--fresh` is the remedy here and it works.
+  Two things decide it. The default (graph) path reuses the frozen plan instead
+  of re-sniffing, so a file recorded in `plan.junk_files` is never reconsidered
+  — the re-run leaves the index unchanged and still exits 3
+  (`completed-with-junk`), which is the same code the original run gave. The
+  `--no-graph` path does re-sniff, and then the file is admitted only if a
+  frozen dataset already accepts its family (`reconcile_plan.rs:282` matches on
+  `dataset.family` and `group`). A CSV headed `BMW` rejoins a `csv` dataset and
+  is recovered by the plain re-run; prose can never match a `docs` dataset, and
+  that run stops with `no frozen dataset accepts family txt-prose … use a new
+  prefix` rather than indexing it.
 
-  On `--no-graph` — what `--approve fast` selects — the opposite happens. The
-  re-run *does* re-sniff, the file is now correctly text, and the run **aborts
-  with exit 1**: `no frozen dataset accepts family txt-prose … this requires
-  unsupported dataset/schema evolution (use a new prefix)`. `--fresh` does not
-  help, because it is refused once a durable corpus generation exists and those
-  exist only on this path. The remedy is a new `--state-dir` with a new
-  `--prefix`.
-
-  Either way the recovery re-extracts the whole corpus, and re-embeds it on a
-  semantic index.
+  A new `--state-dir` with a new `--prefix` recovers the file in every
+  configuration measured. `--fresh` recovers it in some and is refused in
+  others — the refusal tracks what the state dir contains, not which flag you
+  pass. Both re-extract the whole corpus and re-embed it on a semantic index.
+  The full matrix, including the cross-path cases where a corpus indexed one way
+  is re-run the other, is #490.
 
   A residual class stays `Family::Binary` regardless: the GIF arm junks a file
   whose prefix fills the sniff buffer **or** whose bytes cannot be written as a
