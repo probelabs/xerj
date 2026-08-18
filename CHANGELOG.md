@@ -415,7 +415,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   archives, cosign-compatible signatures and reproducible builds, was replaced by
   a `RELEASE INTEGRITY` section stating what actually ships: a `.sha256`, which is
   a checksum and not a signature or an attestation. The public-sector page lost
-  its `SBOM · SLSA` compliance row and its at-rest-encryption and BYOK claims.
+  its `SBOM · SLSA` compliance row and one at-rest/BYOK line. Others on that page
+  survive — two of them carrying no status marker at all — so the withdrawal is
+  partial, not complete (#491).
   A verified air-gapped deployment recipe was added in their place (#430).
 
 

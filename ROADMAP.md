@@ -108,13 +108,15 @@ measured repro:
   touch only the first member and report success
   ([#450](https://github.com/xerj-org/xerj/issues/450)); scroll through such an alias reports
   the alias as `_index` ([#433](https://github.com/xerj-org/xerj/issues/433)); the scroll
-  snapshot cap is enforced on the summed total by `/{index}/_search?scroll=`, which fails
-  loudly, but `/{index}/_search_scroll` applies it per index and only raises a
-  `scroll_truncated` flag ([#405](https://github.com/xerj-org/xerj/issues/405)).
+  snapshot cap is compared against the summed total by `/{index}/_search?scroll=` but applied
+  per index by `/{index}/_search_scroll`, so a multi-index scroll that the first route refuses
+  is accepted by the second. Both fail with the same 400 when they do refuse — the divergence
+  is which total the ceiling is measured against, and it is permissive rather than lossy
+  ([#405](https://github.com/xerj-org/xerj/issues/405)).
 - **Documents that do not come back the way they went in.** `POST /_bulk` drops explicit
   `null` fields from `_source`, and whether it drops them depends on request size
-  ([#415](https://github.com/xerj-org/xerj/issues/415)). The rc.18 notes cite all four of
-  these as open; they are listed here so this file and the CHANGELOG do not disagree.
+  ([#415](https://github.com/xerj-org/xerj/issues/415)). #405 and #415 are cited as open by
+  the rc.18 notes as well; #450 and #433 appear only here, which is the point of listing them.
 - **Autoindex.** Catalog IDs are global, so two corpora sharing one byte-identical file
   collide ([#416](https://github.com/xerj-org/xerj/issues/416)); and widening an exclusion
   rule wedges the default graph path — the first rerun exits 1 and needs a documented
