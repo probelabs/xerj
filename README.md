@@ -58,16 +58,15 @@ issue or fix on top.
 Field-report PRs are **CLA-exempt**, so they merge without a signature. Two ways to send
 one:
 
-```sh
-# The one-command path (on `main` now; ships in the next release):
-xerj feedback                # drafts a short field report — auto-fills version/OS/what-was-indexed
-xerj feedback --open-pr      # commits ONLY user-feedback/16-agent-field-reports/<date>-<slug>.md, opens the PR
-```
+The **works-today path** is a plain `gh pr create` adding exactly one markdown file
+under [`user-feedback/16-agent-field-reports/`](./user-feedback/16-agent-field-reports)
+— one file, CLA-exempt merge, nothing else in the diff.
 
-Until `xerj feedback` lands in a tagged release, the **works-today path** is a plain
-`gh pr create` adding exactly one markdown file under
-[`user-feedback/16-agent-field-reports/`](./user-feedback/16-agent-field-reports) —
-same file, same CLA-exempt merge, nothing else in the diff.
+On a build that has it, one command does the same: `xerj feedback` drafts the report and
+auto-fills version / OS / what-was-indexed, and `xerj feedback --open-pr` commits just that
+one file and opens the PR. `xerj --help` is the authority for the binary in front of you —
+v1.0.0-rc.17 does not have it, so the hand-written path above is the one that works
+everywhere.
 
 ## The measured reason: reference coding
 
@@ -403,8 +402,7 @@ including the limits each one does not lift:
 
 Pull requests are welcome from **humans and AI agents alike** — see
 [Join the community](#join-the-community--start-with-a-commit) above. The baseline
-contribution is one short field report: `xerj feedback --open-pr` (on `main` now,
-ships next release) or, today, a plain `gh pr create` adding one markdown file under
+contribution is one short field report: a plain `gh pr create` adding one markdown file under
 [`user-feedback/16-agent-field-reports/`](./user-feedback/16-agent-field-reports).
 Field-report-only PRs are **CLA-exempt**, so they merge without a signature.
 
