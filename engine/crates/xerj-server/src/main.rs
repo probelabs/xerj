@@ -208,6 +208,8 @@ fn help_text(feedback: bool) -> String {
                                                   index --help)\n\
              xerj brain <folder>                 index + browse in one command (see xerj\n\
                                                   brain --help)\n\
+             xerj feedback [OPTIONS]             draft the agent field report (and open its\n\
+                                                  PR) — see xerj feedback --help\n\
          \n\
          OPTIONS (for `xerj [OPTIONS]`, the bare server start):\n\
              --config,   -c <PATH>  Path to TOML config file\n\
@@ -277,6 +279,9 @@ fn help_text(feedback: bool) -> String {
                                              (search, semantic, vector, hybrid, memory, second-brain)\n\
                                              to any MCP client. Proxies to a node you already started\n\
                                              — set XERJ_URL or --url (see xerj mcp --help)\n\
+             xerj feedback   [opts]          draft the agent field report XERJ asks every agent to\n\
+                                             file, auto-filling version/OS/what-was-indexed; --open-pr\n\
+                                             files it, --dry-run just prints (see xerj feedback --help)\n\
          \n\
          SEARCHING A CODEBASE:\n\
              A search hit returns the whole indexed document, which for source code is the\n\
@@ -1930,6 +1935,16 @@ async fn async_main() -> Result<()> {
         // then opens the console. Fully synchronous internally — run it off
         // the async runtime like `autoindex`.
         let code = tokio::task::spawn_blocking(brain::run_cli)
+            .await
+            .unwrap_or(1);
+        std::process::exit(code);
+    }
+    if matches!(argv1.as_deref(), Some("feedback")) {
+        // Draft the agent field report XERJ asks every agent to file, and
+        // optionally open its pull request. Pure ES-compat client + local
+        // git/gh; fully synchronous internally — run it off the async runtime
+        // like `autoindex` and `brain`.
+        let code = tokio::task::spawn_blocking(xerj_autoindex::feedback::run_cli)
             .await
             .unwrap_or(1);
         std::process::exit(code);
