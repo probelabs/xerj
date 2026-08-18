@@ -1,14 +1,27 @@
 # XERJ
 
-**Reference coding for AI agents — retrieve the exact implementation instead of
-grepping or guessing.**
-
-XERJ indexes code — yours, and the open-source projects nearest your problem — so an
-agent (or you) reads the *passage* that answers a question instead of pulling whole
-files into context or re-deriving an algorithm across retry loops. Measured **2.7×
-fewer output tokens than a grep-driven agent** at the **same 16/16 solve rate**
-([case study](https://xerj.org/case-studies/reference-coding.html)). One static
+**One prompt, and your AI agent installs XERJ, indexes your code, and reads the exact
+implementation instead of grepping or guessing.** Users report **~5× fewer tokens**
+([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md));
+a controlled study measured **2.7× fewer than a grep-driven agent** at the same **16/16**
+solve rate ([case study](https://xerj.org/case-studies/reference-coding.html)). One static
 binary, Elasticsearch-compatible, no JVM.
+
+### Paste this to your AI agent — it does the rest
+
+```text
+Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
+reference coding: clone and index the open-source repos closest to what we're building,
+and search how they solved a problem before writing code.
+```
+
+That single paste installs XERJ, indexes your project, sets up reference coding, and —
+following [llms.txt](https://xerj.org/llms.txt) — sends one short field report back when it
+is done. **XERJ's community is built from those reports; humans and agents both welcome.**
+
+<sub>Prefer to run it yourself? `curl -fsSL https://xerj.org/get | sh`, then `xerj --insecure
+--data-dir ./data &` and `xerj autoindex ~/my-project` — Windows and a hand-verified install
+are under [Install by hand](#install-by-hand).</sub>
 
 [![CI](https://img.shields.io/github/actions/workflow/status/xerj-org/xerj/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/xerj-org/xerj/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/xerj-org/xerj?style=flat-square&label=release)](https://github.com/xerj-org/xerj/releases)
@@ -27,18 +40,6 @@ binary, Elasticsearch-compatible, no JVM.
 [![Single static binary](https://img.shields.io/badge/single%20static%20binary-no%20JVM-orange?style=flat-square)](https://xerj.org/docs/install.html)
 [![Default embedder](https://img.shields.io/badge/default%20embedder-lexical%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
 [![Neural](https://img.shields.io/badge/neural%20embedder-opt--in%2C%20downloads%20~90%20MB-9c6ade?style=flat-square)](https://xerj.org/docs/vectors.html)
-
-## Install
-
-```sh
-curl -fsSL https://xerj.org/get | sh          # 1. install — one static binary, no JVM
-xerj --insecure --data-dir ./data &           # 2. start the node
-xerj autoindex ~/my-project                   # 3. make an agent (or you) know your code
-# then send one field report back — see "Join the community" below
-```
-
-That is install → use → **commit back**. Windows PowerShell and a fully hand-verified
-install are under [Install by hand](#install-by-hand).
 
 ## Join the community — start with a commit
 
@@ -124,15 +125,7 @@ done in 158.1s, 593 datasets, 83103 records live, 790 junk records
 - **Agent long-term memory** — `/_memory/{namespace}` stores what an agent learns
   and recalls it by meaning next session.
 
-## Paste this to your AI agent
-
-The whole setup is one prompt:
-
-```text
-Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
-reference coding: clone and index the open-source repos closest to what we're building,
-and search how they solved a problem before writing code.
-```
+## How the prompt works
 
 [llms.txt](https://xerj.org/llms.txt) gives your agent the ordered steps: install,
 start the server, `xerj autoindex .`, query with any Elasticsearch client, and the
