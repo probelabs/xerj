@@ -98,13 +98,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer changed at `_flush`.** Two independent causes, which is why the symptom
   looks inconsistent. In a segment the array was joined into a single string
   before the FTS layer saw it, and the keyword analyzer emits its whole input as
-  one token — so *every clause that projects to a whole-value term* missed the
-  document, the first element included; measured on `{"tags":["red","blue"]}`,
-  after a flush both `red` and `blue` returned 0 hits and only the joined
-  artefact `"red blue"` matched. Before the flush a different cause applied: the
-  memtable's single-valued columns keep only element 0, and the fused columnar
-  walk that serves a bare `term` did not bail out on such a field the way its
-  sibling paths did, so there `red` matched and `blue` did not. The
+  one token — so every clause that projects to a whole-value `FtsQuery::Term`
+  missed the document, the first element included; measured on
+  `{"tags":["red","blue"]}`, after a flush both `red` and `blue` returned 0 hits
+  and only the joined artefact `"red blue"` matched. The type name is
+  load-bearing: `terms` reads like such a clause but does not compile to one —
+  it routes to the doc-values path, which already bailed on array fields, and it
+  returned the document correctly on both sides of the flush. Before the flush a
+  different cause applied: the memtable's single-valued columns keep only element
+  0, and the fused columnar walk did not bail out on such a field the way its
+  sibling paths did. That walk serves `term` and `range`, and `bool` with `must`
+  or `filter`, through `constant_score` and boosted wrappers — so a `bool`/
+  `filter` query was affected too, not only a bare `term`. There `red` matched
+  and `blue` did not. The
   first-element-survives shape people remember is the pre-flush one and does not
   describe a flushed index. Array elements are now indexed as N independent
   values separated by a position gap, so a phrase query cannot span two elements,
@@ -173,7 +179,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A text file whose first two characters were `BM`, or whose first four were
   `GIF8`, was junked as an image and never indexed.** They were the only two
-  entirely-printable signatures accepted without a qualifier, so `sniff`
+  entirely-printable signatures *in the magic table* accepted without a
+  qualifier — the scoping matters, and the rest of this entry says why — so `sniff`
   returned `Family::Binary` and `scan_file` skipped the file citing "binary
   content (gif)" / "(bmp)" — a reason naming a format the file did not have. The
   reported case is a CSV whose first column header is `BMW`; a health export
@@ -187,15 +194,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opening with it is still handed to the PDF extractor — deliberately pinned and
   still open as #403.
 
-  **Recovering an already-indexed corpus takes more than a re-run.** A plain
-  `xerj autoindex` over an existing state dir reuses the frozen plan instead of
-  re-sniffing, and a junked file was recorded in `plan.junk_files` rather than
-  `plan.files`, so it can never be selected — the re-run reports nothing and
-  changes nothing. Use `--fresh`, or a new `--state-dir` with a new `--prefix`;
-  both re-extract and, on a semantic index, re-embed the whole corpus, and
-  `--fresh` is refused outright once a durable corpus generation exists. Files
-  whose GIF-shaped bytes run past the sniff budget also remain classified
-  `Binary` — the release's own tests call that the cost of the rule
+  **Recovering an already-indexed corpus takes more than a re-run, and the
+  remedy depends on which path indexed it.** Both were measured on this build.
+
+  On the default (graph) path a re-run reuses the frozen plan instead of
+  re-sniffing. The junked file was recorded in `plan.junk_files` rather than
+  `plan.files`, and `pending_for_phase_b` selects only keys present in
+  `plan.files`, so it can never be picked up: the re-run exits 0 and changes
+  nothing. `--fresh` is the remedy here and it works.
+
+  On `--no-graph` — what `--approve fast` selects — the opposite happens. The
+  re-run *does* re-sniff, the file is now correctly text, and the run **aborts
+  with exit 1**: `no frozen dataset accepts family txt-prose … this requires
+  unsupported dataset/schema evolution (use a new prefix)`. `--fresh` does not
+  help, because it is refused once a durable corpus generation exists and those
+  exist only on this path. The remedy is a new `--state-dir` with a new
+  `--prefix`.
+
+  Either way the recovery re-extracts the whole corpus, and re-embeds it on a
+  semantic index.
+
+  A residual class stays `Family::Binary` regardless: the GIF arm junks a file
+  whose prefix fills the sniff buffer **or** whose bytes cannot be written as a
+  canvas dimension, and the second disjunct has no size floor — the release's
+  own tests pin a 3,000-byte prose file junked as an image under a 1 MiB budget.
+  Describing the cost as "large files only" would name one half of it
   (#379, #380, #427).
 
 - **A GIF whose comment chain outruns the sniff budget is decided by the chain,
