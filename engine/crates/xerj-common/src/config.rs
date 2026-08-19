@@ -1471,10 +1471,10 @@ pub struct LimitsConfig {
     /// smaller cgroup limit the smaller value wins. Two explicit escape hatches:
     ///
     ///   * `0`  → NO cap: derive every budget from the whole machine (the old
-    ///            machine-proportional behaviour; a 64 GiB host then asks for
-    ///            ~16 GiB of memtables before anything else allocates).
+    ///     machine-proportional behaviour; a 64 GiB host then asks for
+    ///     ~16 GiB of memtables before anything else allocates).
     ///   * `N`  (N > 0) → force a fixed ceiling of exactly N MiB, still min'd
-    ///            with the machine.
+    ///     with the machine.
     ///
     /// Override at runtime without editing config via the environment:
     /// `XERJ_MAX_PROCESS_MEMORY_MB=auto|off|<MiB>` (env wins over this value;

@@ -737,7 +737,9 @@ fn build(config: &Config) -> ResourceGovernor {
         resolved_process_cap.cap_mb,
     ) {
         (ProcessMemoryCapSource::Auto, _, _) => "auto tier",
-        (ProcessMemoryCapSource::Config, _, 0) => "uncapped: whole machine, limits.max_process_memory_mb = 0",
+        (ProcessMemoryCapSource::Config, _, 0) => {
+            "uncapped: whole machine, limits.max_process_memory_mb = 0"
+        }
         (ProcessMemoryCapSource::Config, _, _) => "explicit limits.max_process_memory_mb",
         (ProcessMemoryCapSource::Env, true, _) => "auto tier via XERJ_MAX_PROCESS_MEMORY_MB",
         (ProcessMemoryCapSource::Env, _, 0) => "uncapped via XERJ_MAX_PROCESS_MEMORY_MB",
@@ -1120,7 +1122,11 @@ mod tests {
         // 6 GiB box → 8 GiB tier, but the machine only has 6, so min = 6.
         let tiny = resolve_process_memory_cap(6 * GIB, AUTO, None);
         assert_eq!(tiny.cap_mb, 8 * 1024, "the tier is chosen before the min");
-        assert_eq!(cap_memory_limit(6 * GIB, tiny.cap_mb), 6 * GIB, "cap only lowers");
+        assert_eq!(
+            cap_memory_limit(6 * GIB, tiny.cap_mb),
+            6 * GIB,
+            "cap only lowers"
+        );
     }
 
     /// The tier steps exactly on the 64 GiB and 128 GiB binary boundaries.
@@ -1159,7 +1165,11 @@ mod tests {
         assert!(!uncapped.auto_tier);
         assert_eq!(uncapped.source, ProcessMemoryCapSource::Config);
         assert_eq!(cap_memory_limit(64 * GIB, uncapped.cap_mb), 64 * GIB);
-        assert_eq!(auto_memtable_budget(64 * GIB), 16 * GIB, "uncapped = old behaviour");
+        assert_eq!(
+            auto_memtable_budget(64 * GIB),
+            16 * GIB,
+            "uncapped = old behaviour"
+        );
 
         // N > 0 = a fixed ceiling of exactly N MiB, still min'd with the machine.
         let fixed = resolve_process_memory_cap(64 * GIB, 4096, None);
