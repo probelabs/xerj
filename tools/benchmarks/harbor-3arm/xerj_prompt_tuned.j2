@@ -1,0 +1,30 @@
+{{ instruction }}
+
+---
+TOOL NOTE: XERJ code search is installed (server at http://localhost:9210) and
+tuned for this work. It is usually MUCH faster than grep for finding the right
+definition in an unfamiliar repo. Playbook:
+
+1. Index once (seconds; --no-semantic keeps it pure BM25 — the embedder is
+   lexical, so semantic fields add cost without adding meaning):
+   xerj autoindex "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --url http://localhost:9210 --prefix task --no-semantic
+
+2. Find the DEFINITION of a symbol (ranks definers above callers; `_passage`
+   returns the enclosing function/block so you rarely need to open the file):
+   curl -s 'http://localhost:9210/task-*/_search' -H 'Content-Type: application/json' -d '{
+     "size": 5,
+     "query": {"bool": {"should": [
+         {"multi_match": {"query": "<symbol or phrase>", "fields": ["body","defs","title"], "type": "most_fields"}},
+         {"match_phrase": {"defs": {"query": "<symbol>", "boost": 4}}}],
+       "filter": [{"term": {"ax_format": "code"}}]}},
+     "_source": ["ax_path","start_line"], "fields": ["_passage"]}'
+   For docs/config instead of code, drop the ax_format filter.
+
+3. IMPORTANT ranking caveat: relevance scores are only comparable WITHIN one
+   index, and the indexer creates one index per source directory. If top hits
+   look off, list indices (curl -s 'http://localhost:9210/_cat/indices?h=index')
+   and re-query just the index for the subtree you care about, e.g.
+   'http://localhost:9210/<one-index-name>/_search'.
+
+4. Search FIRST when you need to locate unfamiliar code; fall back to grep for
+   exact-string sweeps. Do not spend more than one attempt fixing XERJ itself.

@@ -1,0 +1,15 @@
+terminal-bench/atrx-vep-crispr
+terminal-bench/batched-eval-parity
+terminal-bench/biped-contact-dynamics
+terminal-bench/bun-sourcemap-leak
+terminal-bench/cad-model
+terminal-bench/cargo-flight-dispatch
+terminal-bench/cli-2ph-simplex
+terminal-bench/coq-block-bound
+terminal-bench/ctr-optimization
+terminal-bench/cumulative-layout-shift
+terminal-bench/data-anonymization
+terminal-bench/distributed-dedup
+terminal-bench/embedding-drift-monitor
+terminal-bench/erp-procurement-planning
+terminal-bench/exam-pdf-eval
