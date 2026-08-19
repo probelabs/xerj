@@ -189,7 +189,16 @@ fn sniff_bytes(
     }
 
     // 1. Magic bytes.
-    if prefix.starts_with(b"%PDF-") {
+    //
+    // %PDF- stays here rather than in MAGIC_TABLE (#403's own fix sketch
+    // floated moving it): every MAGIC_TABLE row reports `Family::Binary` +
+    // a `binary_kind` string, but %PDF- has to report the distinct
+    // `Family::Pdf` the extractor routes on (lib.rs:1229) — widening the
+    // shared `MagicRow` type for the one row that needs a different Family
+    // is a bigger, riskier change than this bug needs. `pdf_header` gives it
+    // the same structural qualifier the table's own rows carry; see its doc
+    // comment for what it rejects.
+    if prefix.starts_with(b"%PDF-") && pdf_header(prefix) {
         return Ok(mk(Family::Pdf));
     }
     if prefix.starts_with(b"SQLite format 3\0") {
@@ -938,6 +947,29 @@ fn id3v2_header(prefix: &[u8]) -> bool {
         && matches!(prefix[3], 2..=4)
         && prefix[4] != 0xff
         && prefix[6..10].iter().all(|b| *b < 0x80)
+}
+
+/// PDF header: `%PDF-M.N` — a single-digit major version, `.`, a single-digit
+/// minor version — immediately followed by an end-of-line marker, which the
+/// spec requires right after the version (ISO 32000-1 §7.5.2, "the header
+/// line shall be immediately followed by a comment... the header
+/// itself... terminated by an end-of-line marker").
+///
+/// Unqualified, this signature is five ASCII characters including `%` and
+/// `-`. Prose opening "%PDF- is the five byte header every PDF file begins
+/// with. " sniffed `Family::Pdf` and was handed to the PDF extractor, which
+/// cannot parse it (#403 — same class as #379/#380, filed separately: `%`
+/// and `-` shrink the collision surface a lot, and the wrong answer is a
+/// parse error rather than #379's silent junk reason). The qualifier is
+/// exactly what makes it safe: a sentence has a space (or nothing) after
+/// "1.7", never a CR/LF, and real generators always emit that break —
+/// Adobe's own spec calls it out as required, not conventional.
+fn pdf_header(prefix: &[u8]) -> bool {
+    prefix.len() >= 9
+        && prefix[5].is_ascii_digit()
+        && prefix[6] == b'.'
+        && prefix[7].is_ascii_digit()
+        && matches!(prefix[8], b'\r' | b'\n')
 }
 
 /// Truevision TGA, which has no magic number at all — every byte of its
@@ -2899,15 +2931,10 @@ mod printable_magic_tests {
     /// — they are early returns in `sniff_bytes` — so the walk above says
     /// nothing about them. Two of the three are safe for the usual reason (a
     /// byte text cannot contain: the NUL after `3`, and `\x03\x04`), and this
-    /// pins that.
-    ///
-    /// `%PDF-` is NOT safe and is the same class as #379/#380: prose opening
-    /// `%PDF-` sniffs `Family::Pdf` and is handed to the PDF extractor.
-    /// Measured on this branch and filed as #403 rather than widened into this
-    /// fix — five characters including `%` and `-` is a far smaller collision
-    /// surface than `BM`, and it does not produce #379's silent "binary
-    /// content" junk reason. The wrong answer is asserted here on purpose so
-    /// #403 has to come to this file and flip it.
+    /// pins that. `%PDF-` needed its own structural qualifier (`pdf_header`,
+    /// #403 — same class as #379/#380) since all five of its bytes are
+    /// printable ASCII; this pins that prose opening with the bare signature
+    /// now reads `TxtProse`, not `Pdf`.
     #[test]
     fn signatures_matched_before_the_table() {
         for (label, opener, want) in [
@@ -2921,11 +2948,10 @@ mod printable_magic_tests {
                 "PK is the local file header signature of the ZIP format. ",
                 Family::TxtProse,
             ),
-            // #403: this one is wrong. It must read TxtProse when #403 lands.
             (
                 "pdf",
                 "%PDF- is the five byte header every PDF file begins with. ",
-                Family::Pdf,
+                Family::TxtProse,
             ),
         ] {
             let text = opener.repeat(30);
@@ -2936,6 +2962,31 @@ mod printable_magic_tests {
                 "{label}: prose opening with a pre-table signature classified \
                  {:?}/{:?}",
                 sn.family, sn.binary_kind
+            );
+        }
+    }
+
+    /// The positive control `every_printable_signature_carries_a_qualifier`
+    /// cannot provide for `%PDF-`, since it walks `MAGIC_TABLE` only: a real
+    /// PDF header must still classify `Family::Pdf`, or `pdf_header` is not a
+    /// qualifier but a second way to break the format.
+    #[test]
+    fn a_real_pdf_header_still_classifies_as_pdf() {
+        let headers: [&[u8]; 3] = [
+            b"%PDF-1.7\n%\xE2\xE3\xCF\xD3\n1 0 obj\n",
+            b"%PDF-1.4\r\n1 0 obj\n",
+            b"%PDF-2.0\r%comment\r",
+        ];
+        for header in headers {
+            let p = Path::new("doc.pdf");
+            let sn = sniff_bytes(header, p, p, false).unwrap();
+            assert_eq!(
+                sn.family,
+                Family::Pdf,
+                "real PDF header {header:?} classified {:?}/{:?} — pdf_header \
+                 rejected a spec-conformant file",
+                sn.family,
+                sn.binary_kind
             );
         }
     }
