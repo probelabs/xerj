@@ -61,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes likewise. How often depends on load and on how the client frames and
   drains — measurements on two machines differed in both directions, so treat
   the hazard as real and the frequency as unpredictable rather than as a rate.
+  Tracked as [#485](https://github.com/xerj-org/xerj/issues/485) — every other
+  caveat in this release is numbered and this one, the most operationally
+  actionable of them, was not.
   If you control the client, chunk at 256 bytes or above.
 
   XERJ has such a path: `auth_middleware` is an axum layer, so a request that
@@ -199,16 +202,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cases differ enough that the only guidance worth giving is: check the exit
   code, and read the error if there is one.
 
-  Two things decide it. The default (graph) path reuses the frozen plan instead
-  of re-sniffing, so a file recorded in `plan.junk_files` is never reconsidered
-  — the re-run leaves the index unchanged and still exits 3
-  (`completed-with-junk`), which is the same code the original run gave. The
-  `--no-graph` path does re-sniff, and then the file is admitted only if a
-  frozen dataset already accepts its family (`reconcile_plan.rs:282` matches on
-  `dataset.family` and `group`). A CSV headed `BMW` rejoins a `csv` dataset and
-  is recovered by the plain re-run; prose can never match a `docs` dataset, and
-  that run stops with `no frozen dataset accepts family txt-prose … use a new
-  prefix` rather than indexing it.
+  On the default (graph) path the frozen plan is reused instead of re-sniffed, so
+  a file recorded in `plan.junk_files` is never reconsidered: the re-run leaves
+  the index unchanged and exits 3 (`completed-with-junk`), the same code the
+  original run gave — there is no signal that anything is now recoverable. With
+  `--no-graph` the file is re-sniffed, but it is then re-admitted only if some
+  frozen dataset survives all three checks in `classify_new`
+  (`reconcile_plan.rs:279-303`): the family/group filter, `ensure_compatible`,
+  and a field-overlap threshold. In an ordinary corpus at least one of those
+  fails and the run stops with `no frozen dataset accepts family …` instead of
+  indexing anything. Do not plan around the plain re-run recovering the file.
 
   A new `--state-dir` with a new `--prefix` recovers the file in every
   configuration measured. `--fresh` recovers it in some and is refused in
@@ -310,9 +313,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   neural is opt-in and downloads ~90 MB on first use. The previous pair
   (`semantic` beside `built-in, offline`) described a configuration that does
   not exist, and the README body said so correctly eighty lines below. The
-  release badge also no longer renders "no releases found" — both
-  `include_prereleases` and `sort=semver` break it for this repository's tags
-  (#455).
+  release badge no longer carries `include_prereleases&sort=semver`. Recording a
+  correction to this entry rather than restating it: neither parameter is
+  actually broken for this repository's tags — all four combinations, the
+  pre-#455 URL included, render `v1.0.0-rc.17` against the live endpoint. The
+  parameters were dropped as unnecessary, not as a fix (#455).
 
 - **`autoindex --follow-symlinks` no longer follows a link out of the indexed
   folder unless you ask it to.** Pointing autoindex at a folder is not consent
@@ -391,7 +396,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   names are not expanded by the index resolver, so every hit still reports the
   alias and `(_index, _id)` remains non-distinct there. That matters because
   reindex and CDC tooling routinely scrolls an alias, which is exactly the
-  audience named above — tracked separately rather than folded into this entry.
+  audience named above — tracked separately rather than folded into this entry ([#433](https://github.com/xerj-org/xerj/issues/433)).
   The type change is also a breaking one for any out-of-tree reader of the
   public `ScrollContext::hits` field.
 
@@ -926,10 +931,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retrievable hits — and now answers `0`, which is what its own `_search`
   returns. A count no page of hits can reproduce is a coincidence, not
   compatibility. What `_search` *should* answer for a `term` on an analysed
-  field is the separate, hit-set-moving decision tracked in
-  [#397](https://github.com/xerj-org/xerj/issues/397); closing that is what
-  makes both properties true at once, and is also the only route back to a
-  sub-linear count for this shape.
+  field is a separate, hit-set-moving decision. It was tracked in
+  [#397](https://github.com/xerj-org/xerj/issues/397), which was closed
+  `not_planned` on 2026-08-15 — so there is no open work item behind it and
+  **waiting for it is not a plan**. Until something reopens that decision, this
+  shape has no sub-linear count: budget for the measured cost above, or avoid
+  `_count` with a `term` on an analysed field in a serving path.
 
   Two things this change does **not** do. It does not touch the other half of
   #362's thread — `case_insensitive` accepted and silently dropped on
