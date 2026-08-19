@@ -18,20 +18,14 @@
 [![Default embedder](https://img.shields.io/badge/default%20embedder-lexical%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
 [![Neural](https://img.shields.io/badge/neural%20embedder-opt--in%2C%20downloads%20~90%20MB-9c6ade?style=flat-square)](https://xerj.org/docs/vectors.html)
 
-XERJ is a search engine for your code and data that an AI agent talks to over the
-Elasticsearch API. Point it at a folder and it indexes the files into typed, queryable
-indices. The agent then reads the exact passage it needs instead of pulling whole files
-into its context window. It ships as one static binary, no JVM.
-
-The use case it was built for is reference coding. Instead of re-deriving a solution, an
-agent retrieves how a peer project already solved the problem and then writes code. A
-controlled study measured 2.7x fewer output tokens than a grep-driven agent at the same
-16/16 solve rate ([case study](https://xerj.org/case-studies/reference-coding.html)).
-People running it in day-to-day work report roughly 5x fewer tokens end to end
+XERJ makes an AI agent read the exact code it needs instead of grepping whole files into
+its context window. Point it at a folder and your agent retrieves the precise passage, so
+it can see how a peer project already solved a problem before writing its own. A controlled
+study measured 2.7x fewer output tokens than a grep-driven agent at the same 16/16 solve
+rate ([case study](https://xerj.org/case-studies/reference-coding.html)); people using it
+day to day report roughly 5x fewer tokens end to end
 ([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md)).
-
-Paste this to your agent and it installs XERJ, indexes the project, and sets up reference
-coding:
+Install it by pasting one prompt to your agent:
 
 ```text
 Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
