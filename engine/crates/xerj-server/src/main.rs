@@ -2202,6 +2202,62 @@ async fn async_main() -> Result<()> {
         None
     };
 
+    // 8c. Bind all three listeners NOW — before the console setup link, before
+    //     the banner, before anything reports readiness, and fatally.
+    //
+    //     This used to happen at step 10/10a below, well after the console
+    //     bootstrap at (old) step 9 had already built and printed its
+    //     first-launch setup link from `cfg.server.es_compat_port` — the
+    //     *requested* port, not the one the kernel handed back. With an
+    //     ephemeral port (`es_compat_port = 0`) that produced
+    //     `http://127.0.0.1:0/_xerj-console/setup#token=…`, a link the single
+    //     action a first-run operator is told to take, and unreachable. It
+    //     also ran ahead of the bind, so it printed to stderr whether or not
+    //     the bind that follows ever succeeds (issue #469; #466 fixed the
+    //     same class for the startup banner, printed from `local_addr()`
+    //     right below).
+    //
+    //     Moving the bind here — ahead of the console bootstrap rather than
+    //     just ahead of the banner — means both the setup link and the banner
+    //     can only ever be built from a port this process actually holds; see
+    //     `bind_listener` for why binding eagerly and fatally is itself
+    //     load-bearing (issue #465).
+    //
+    //     Addresses are composed from the parsed IP, never by formatting
+    //     `"{bind}:{port}"` — that string is unparseable for every IPv6
+    //     literal (`"::1:9200"`), which made `bind_address = "::1"` a node
+    //     that could not start at all. `socket_addr` cannot be `None` here:
+    //     step 3a rejected an unparseable `bind_address` before the data
+    //     directory existed, which is where that failure belongs. The
+    //     context is kept as a backstop so that if a future edit reorders or
+    //     drops 3a, this still names the setting rather than surfacing a bare
+    //     `Option` unwrap.
+    let rest_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.rest_port)
+        .with_context(|| bad_bind_address(&cfg))?;
+    let es_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.es_compat_port)
+        .with_context(|| bad_bind_address(&cfg))?;
+    let grpc_addr: SocketAddr = cfg
+        .socket_addr(cfg.server.grpc_port)
+        .with_context(|| bad_bind_address(&cfg))?;
+
+    let rest_listener = bind_listener(rest_addr, "native REST")?;
+    let es_listener = bind_listener(es_addr, "ES-compat")?;
+    let grpc_listener = bind_listener(grpc_addr, "gRPC")?;
+
+    let bound = BoundAddrs {
+        rest: rest_listener
+            .local_addr()
+            .context("native REST: read the bound address")?,
+        es: es_listener
+            .local_addr()
+            .context("ES-compat: read the bound address")?,
+        grpc: grpc_listener
+            .local_addr()
+            .context("gRPC: read the bound address")?,
+    };
+
     // 9. Xerj Console bootstrap.  Creates `.xerj_*` system indices on first
     //    boot, persists a 32-byte master key under data_dir/.xerj_master_key
     //    (mode 0600), and prints the first-launch magic-link banner to
@@ -2223,7 +2279,10 @@ async fn async_main() -> Result<()> {
             // first-launch console link.
             url_host(&cfg.server.bind_address)
         },
-        cfg.server.es_compat_port,
+        // The bound ES-compat port (8c), not `cfg.server.es_compat_port`: with
+        // an ephemeral port (`= 0`) the config value is never the port the
+        // node ends up listening on (issue #469).
+        bound.es.port(),
     );
     let xerj_console_node_id: String = match (cfg.cluster.enabled, cluster_listen_addr) {
         // The same string the cluster transport registered as this node's id.
@@ -2336,62 +2395,15 @@ async fn async_main() -> Result<()> {
         es_router = es_router.merge(xerj_console_router);
     }
 
-    // 10. Bind addresses. Composed from the parsed IP, never by formatting
-    //     `"{bind}:{port}"` — that string is unparseable for every IPv6
-    //     literal (`"::1:9200"`), which made `bind_address = "::1"` a node
-    //     that could not start at all.
-    //
-    //     `socket_addr` cannot be `None` here: step 3a rejected an
-    //     unparseable `bind_address` before the data directory existed, which
-    //     is where that failure belongs. The context is kept as a backstop so
-    //     that if a future edit reorders or drops 3a, this still names the
-    //     setting rather than surfacing a bare `Option` unwrap.
-    let rest_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.rest_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let es_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.es_compat_port)
-        .with_context(|| bad_bind_address(&cfg))?;
-    let grpc_addr: SocketAddr = cfg
-        .socket_addr(cfg.server.grpc_port)
-        .with_context(|| bad_bind_address(&cfg))?;
+    // 10/10a. Bind addresses + listeners: moved up to step 8c, ahead of the
+    //         console bootstrap at step 9, so the setup link it prints is
+    //         built from a port this process actually holds (issue #469).
+    //         `rest_addr`/`es_addr`/`grpc_addr`, the three listeners, and
+    //         `bound` all still live from there.
 
-    // 10a. Bind all three listeners NOW — before the banner, before anything
-    //      reports readiness, and fatally.
-    //
-    //      This used to happen inside the three `tokio::spawn`s below, where a
-    //      bind error was `error!`-logged and explicitly non-fatal. Because
-    //      `tokio::join!` returns only when all three tasks end, a node that
-    //      lost just one port stayed up — and the banner, printed earlier,
-    //      had already announced that port and this data directory as its own.
-    //
-    //      That is not a cosmetic lie. The node that *does* own :9200 answers
-    //      `GET /_cluster/health` with `green`, which is the readiness probe
-    //      the docs prescribe, so `xerj autoindex` proceeds and streams the
-    //      user's corpus into a datastore they have never heard of. It was
-    //      reported by three independent agents; one of them put 905 files —
-    //      contracts, invoices, a bank export — into another node's data
-    //      directory and got `ok=true exit=0` for it (issue #465).
-    //
-    //      Binding first collapses the whole class: the kernel decides who
-    //      owns the port before we make any claim about owning it.
-    let rest_listener = bind_listener(rest_addr, "native REST")?;
-    let es_listener = bind_listener(es_addr, "ES-compat")?;
-    let grpc_listener = bind_listener(grpc_addr, "gRPC")?;
-
-    // 11. Banner (includes total startup time). Printed from the addresses the
-    //     kernel gave us, so every port on it is one this process holds.
-    let bound = BoundAddrs {
-        rest: rest_listener
-            .local_addr()
-            .context("native REST: read the bound address")?,
-        es: es_listener
-            .local_addr()
-            .context("ES-compat: read the bound address")?,
-        grpc: grpc_listener
-            .local_addr()
-            .context("gRPC: read the bound address")?,
-    };
+    // 11. Banner (includes total startup time). Printed from `bound` (8c) —
+    //     the addresses the kernel gave us — so every port on it is one this
+    //     process holds.
     let startup_ms = startup_start.elapsed().as_millis();
     info!("startup complete in {}ms", startup_ms);
     print_banner(&cfg, &bound, startup_ms);
