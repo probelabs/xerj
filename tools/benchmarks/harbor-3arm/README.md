@@ -31,6 +31,15 @@ export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat-...
 export ANTHROPIC_API_KEY=...             # ONLY for senior-swe's LLM judge
 ```
 
+Parallel cells (measured): running many cells at once exhausts Docker's
+default ~30-subnet address pool ("all predefined address pools have been fully
+subnetted") — every trial creates 2 networks. Expand it once:
+
+```json
+// /etc/docker/daemon.json
+{ "default-address-pools": [ {"base": "10.200.0.0/13", "size": 24} ] }
+```
+
 Auth note (measured): Harbor's automatic key resolution remaps whatever it
 finds into `ANTHROPIC_API_KEY`, which an OAuth token cannot serve — the runner
 therefore injects `CLAUDE_CODE_OAUTH_TOKEN` + `CLAUDE_FORCE_OAUTH=true` via
