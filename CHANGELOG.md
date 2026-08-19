@@ -198,9 +198,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still open as #403.
 
   **A corpus indexed before this release will not necessarily pick the file up
-  on a re-run.** What happens depends on the state dir, not on a flag, and the
-  cases differ enough that the only guidance worth giving is: check the exit
-  code, and read the error if there is one.
+  on a re-run.** Two things decide it and they are easy to confuse: the indexing
+  path decides whether the file is re-sniffed at all, and the state dir decides
+  whether anything can then accept it. The cases differ enough that the only
+  guidance worth giving is: check the exit code, and read the error if there is
+  one.
 
   On the default (graph) path the frozen plan is reused instead of re-sniffed, so
   a file recorded in `plan.junk_files` is never reconsidered: the re-run leaves
@@ -217,6 +219,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration measured. `--fresh` recovers it in some and is refused in
   others — the refusal tracks what the state dir contains, not which flag you
   pass. Both re-extract the whole corpus and re-embed it on a semantic index.
+  The new-prefix route also leaves the old prefix's indices live and serving
+  until you delete them by hand, so budget for two copies of the corpus in the
+  interim.
   The full matrix, including the cross-path cases where a corpus indexed one way
   is re-run the other, is #490.
 
