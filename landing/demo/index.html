@@ -351,7 +351,8 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
 
   <pre class="cmd"><span class="prompt">$ </span>(
     ver=1.0.0-rc.1                              # this demo was captured on rc.1
-    asset="xerj-${ver}-x86_64-unknown-linux-gnu.tar.gz"
+    stage="xerj-${ver}-x86_64-unknown-linux-gnu"
+    asset="${stage}.tar.gz"
     base="https://github.com/xerj-org/xerj/releases/download/v${ver}"
 
     curl -fsSLO "$base/$asset"
@@ -365,7 +366,7 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
       | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
       || { echo "CHECKSUM MISMATCH for $asset — do not run it" &gt;&amp;2; exit 1; }
 
-    tar xzf "$asset"
+    tar xzf "$asset" &amp;&amp; mv "$stage/xerj" ./xerj
   )
 <span class="prompt">$ </span>./xerj --insecure --data-dir ./data
 <span class="out">2026-04-27T19:11:41.6Z  INFO xerj: xerj v1.0.0-rc.1 starting
