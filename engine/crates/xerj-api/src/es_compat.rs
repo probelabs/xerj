@@ -8629,7 +8629,17 @@ async fn search_impl(
         .map(|n| resolve_date_math_index(n.trim()))
         .collect();
     let raw_names: Vec<&str> = resolved_names_owned.iter().map(|s| s.as_str()).collect();
-    let needs_resolve = raw_names.iter().any(|n| *n == "_all" || n.contains('*'));
+    // An ALIAS also needs resolving, and used not to be counted here — which is
+    // why a multi-index alias behaved as an alias over one member on every read
+    // path (#433). `_count` and plain `_search` truncated the same way: three
+    // indices of 40 documents behind one alias answered 40, from the first
+    // member, with no error and a `_count` that agreed with the short result.
+    // The `_index`-stamping problem reported alongside it is downstream of this
+    // — the hits could not carry the right index because the other indices were
+    // never searched.
+    let needs_resolve = raw_names
+        .iter()
+        .any(|n| *n == "_all" || n.contains('*') || state.engine.aliases.contains_key(*n));
     let index_names: Vec<String> = if needs_resolve {
         let all = state.engine.list_indices().await;
         let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
@@ -8644,6 +8654,16 @@ async fn search_impl(
             } else if pattern.contains('*') {
                 for name in &all_names {
                     if glob_match_simple(pattern, name) && !resolved.contains(name) {
+                        resolved.push(name.clone());
+                    }
+                }
+            } else if let Some(targets) = state.engine.aliases.get(*pattern) {
+                // Expand to the concrete members, exactly as
+                // `resolve_index_selector` already does for every other
+                // endpoint. An alias naming one index resolves to that one, so
+                // the single-member case is unchanged.
+                for name in targets.value() {
+                    if !resolved.contains(name) {
                         resolved.push(name.clone());
                     }
                 }
@@ -9184,15 +9204,23 @@ async fn search_impl(
     // filter. The combined filter is also handed to run_aggs via the
     // background corpus (covered by the query's filter path already).
     {
+        // Built from the names as WRITTEN, not from `index_names`. Expanding
+        // an alias to its concrete members (#433) removes the alias name from
+        // that list, and this lookup matches on the alias name — so reading it
+        // from the expanded list silently dropped every filtered alias's
+        // filter. `global_with_aliases.yml` caught exactly that.
         let mut alias_filters: Vec<Value> = Vec::new();
-        for name in &index_names {
+        for name in &resolved_names_owned {
             for entry in state.engine.aliases.iter() {
                 if entry.key() != name {
                     continue;
                 }
                 for backing in entry.value().iter() {
                     if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
-                        if let Some(filter) = meta.get(*name).and_then(|v| v.get("filter")).cloned()
+                        if let Some(filter) = meta
+                            .get(name.as_str())
+                            .and_then(|v| v.get("filter"))
+                            .cloned()
                         {
                             alias_filters.push(filter);
                         }
@@ -17975,7 +18003,24 @@ pub async fn count_docs(
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
     // Multi-index / all selector: sum counts from every participating index.
-    if index == "_all" || index == "*" || index.contains(',') || index.contains('*') {
+    //
+    // An ALIAS belongs in this branch too. It used not to, so a multi-index
+    // alias fell through to the single-index path and answered one member's
+    // count — three indices of 40 documents behind one alias reported 40, with
+    // no error (#433). This is a THIRD copy of the same resolution, alongside
+    // `resolve_index_selector` and the one inside `search_impl`; they disagreed
+    // about aliases in different ways, which is why `_search` and `_count`
+    // could give different answers for the same selector.
+    let alias_selector = index
+        .split(',')
+        .map(str::trim)
+        .any(|n| state.engine.aliases.contains_key(n));
+    if index == "_all"
+        || index == "*"
+        || index.contains(',')
+        || index.contains('*')
+        || alias_selector
+    {
         let all = state.engine.list_indices().await;
         let all_names: Vec<String> = all.into_iter().map(|i| i.name).collect();
         let wanted: Vec<String> = if index == "_all" || index == "*" {
@@ -17990,17 +18035,47 @@ pub async fn count_docs(
                             out.push(n.clone());
                         }
                     }
+                } else if let Some(targets) = state.engine.aliases.get(pat) {
+                    for n in targets.value() {
+                        if !out.contains(n) {
+                            out.push(n.clone());
+                        }
+                    }
                 } else if !out.iter().any(|e| e == pat) {
                     out.push(pat.to_string());
                 }
             }
             out
         };
-        let has_query = body
-            .as_ref()
-            .and_then(|b| b.get("query"))
-            .map(|q| !q.is_null())
-            .unwrap_or(false);
+        // Alias filters, collected from the selector AS WRITTEN. Expanding an
+        // alias to its members and summing their raw document counts answers
+        // the unfiltered corpus — for a filtered alias that is not a smaller
+        // wrong answer than before, it is a LARGER one, and it made `_count`
+        // disagree with `_search` in the opposite direction. A filtered alias
+        // is the usual poor-man's document boundary, so the count has to be of
+        // what the alias exposes.
+        let mut alias_filters: Vec<Value> = Vec::new();
+        for part in index.split(',').map(str::trim) {
+            for entry in state.engine.aliases.iter() {
+                if entry.key() != part {
+                    continue;
+                }
+                for backing in entry.value().iter() {
+                    if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                        if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned()
+                        {
+                            alias_filters.push(filter);
+                        }
+                    }
+                }
+            }
+        }
+        let has_query = !alias_filters.is_empty()
+            || body
+                .as_ref()
+                .and_then(|b| b.get("query"))
+                .map(|q| !q.is_null())
+                .unwrap_or(false);
         // A refused query is not a zero. This loop used to run the search under
         // `if let Ok(..)` with no else, so an index whose mapping refuses the
         // query — a `match` on an `"index": false` field, say — contributed
@@ -18033,6 +18108,14 @@ pub async fn count_docs(
                     .and_then(|b| b.get("query"))
                     .cloned()
                     .unwrap_or(json!({ "match_all": {} }));
+                if !alias_filters.is_empty() {
+                    query_val = json!({
+                        "bool": {
+                            "must": [query_val],
+                            "filter": alias_filters.clone(),
+                        }
+                    });
+                }
                 // Resolve `terms` lookups exactly as `_search` does — without
                 // this, `_count` silently returned 0 for a filter that
                 // `_search` counts correctly (the parser sees the raw lookup
