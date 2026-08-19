@@ -18,14 +18,17 @@
 [![Default embedder](https://img.shields.io/badge/default%20embedder-lexical%2C%20offline-teal?style=flat-square)](https://xerj.org/docs/vectors.html)
 [![Neural](https://img.shields.io/badge/neural%20embedder-opt--in%2C%20downloads%20~90%20MB-9c6ade?style=flat-square)](https://xerj.org/docs/vectors.html)
 
-XERJ makes an AI agent read the exact code it needs instead of grepping whole files into
-its context window. Point it at a folder and your agent retrieves the precise passage, so
-it can see how a peer project already solved a problem before writing its own. A controlled
-study measured 2.7x fewer output tokens than a grep-driven agent at the same 16/16 solve
-rate ([case study](https://xerj.org/case-studies/reference-coding.html)); people using it
-day to day report roughly 5x fewer tokens end to end
+XERJ is a community-trusted local AI search that indexes any folder automatically, so your
+coding agent stops burning tokens reading files one by one and pulls the exact code it
+needs instead. Reference coding is its main use case and the clearest win: point an agent
+at a task and it downloads the open-source repos closest to it, indexes them, and reuses
+how they solved the problem before writing its own code. In a controlled study that cut a
+coding agent's output tokens by 2.7x at the same 16/16 solve rate
+([case study](https://xerj.org/case-studies/reference-coding.html)), and people report
+roughly 5x in everyday work
 ([field reports](./user-feedback/11-reference-coding-field-reports/2026-08-11-token-savings-reports.md)).
-Install it by pasting one prompt to your agent:
+It is enough for a smaller, cheaper model to out-code a pricier one working from memory,
+while you spend less time in fix loops. Try it now with a one-prompt install:
 
 ```text
 Install XERJ (docs: https://xerj.org/llms.txt), index this project's sources, and set up
