@@ -22,8 +22,29 @@ An email resolves to a login by, in order:
 Anything unresolvable FAILS the gate, deliberately: an identity the gate
 cannot attribute is exactly what it exists to flag.
 
-Usage (CI): check_cla_coauthors.py --pr <number>
-  Needs `gh` and GH_TOKEN; repo comes from GITHUB_REPOSITORY or --repo.
+Field-report carve-out (issue: the agent field-report loop was dead)
+-------------------------------------------------------------------
+
+A pull request whose ENTIRE diff is agent field reports — new markdown files
+under ``user-feedback/16-agent-field-reports/`` and nothing else — is exempt
+from this trailer gate. That folder is documentation of the *experience* of
+using XERJ (see its README and https://xerj.org/llms.txt); requiring a CLA to
+add one file there is exactly the friction that kept the folder empty. The
+exemption is deliberately narrow: it needs every changed path to be a
+field-report ``*.md``, so bundling any code, CI, or other-docs change with a
+field report re-arms the full gate — a mixed PR must never slip a code change in
+under a field report. ``README.md`` in that folder is NOT a field report and
+does not qualify. See :func:`is_field_report_only`.
+
+Usage (CI):
+  check_cla_coauthors.py --pr <number> [--changed-files "<paths>"]
+    Runs the trailer gate. If --changed-files is a field-report-only set, the
+    gate is skipped (exempt) and this exits 0 without a network lookup.
+  check_cla_coauthors.py --is-field-report-only --changed-files "<paths>"
+    Prints nothing; exits 0 iff the paths are a field-report-only set, else 1.
+    Used by the separate CI job that provides `verification/cla-signed` for
+    strictly field-report-only pull requests.
+  Needs `gh` and GH_TOKEN for --pr; repo comes from GITHUB_REPOSITORY or --repo.
 
 Tests: scripts/test_cla_coauthors.py
 """
@@ -62,6 +83,39 @@ def noreply_login(email):
     """Login embedded in a GitHub noreply address, or None."""
     m = _NOREPLY_RE.match(email.strip())
     return m.group("login") if m else None
+
+
+# The one directory agent field reports live in. Kept in lock-step with
+# xerj-autoindex's `feedback::FIELD_REPORT_DIR`; the `xerj feedback` command
+# writes reports here and the carve-out below recognises them here.
+FIELD_REPORT_DIR = "user-feedback/16-agent-field-reports/"
+
+
+def is_field_report_only(paths):
+    """True iff `paths` is a non-empty set of ONLY field-report markdown files.
+
+    A field report is a ``*.md`` file directly inside FIELD_REPORT_DIR — not a
+    nested subdirectory, and not the folder's own ``README.md`` (which is the
+    template, not a report). An empty diff is NOT field-report-only: "nothing
+    changed" must never read as "exempt". Any single non-qualifying path makes
+    the whole set non-exempt, so a code change bundled with a field report gets
+    the full gate.
+    """
+    paths = [p for p in paths if p.strip()]
+    if not paths:
+        return False
+    for p in paths:
+        p = p.strip()
+        if not p.startswith(FIELD_REPORT_DIR):
+            return False
+        rest = p[len(FIELD_REPORT_DIR):]
+        if "/" in rest:  # a nested subdirectory, not a direct field report
+            return False
+        if not rest.endswith(".md"):
+            return False
+        if rest == "README.md":  # the folder template is not a field report
+            return False
+    return True
 
 
 def check_commits(commits, contributors, resolve):
@@ -134,15 +188,51 @@ def make_repo_resolver(repo):
     return resolve
 
 
+def _split_paths(raw):
+    """Changed-file paths from a --changed-files value (whitespace/newline sep)."""
+    return [] if raw is None else raw.split()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--pr", required=True, type=int, help="pull request number")
+    ap.add_argument("--pr", type=int, help="pull request number")
     ap.add_argument(
         "--repo",
         default=os.environ.get("GITHUB_REPOSITORY", "xerj-org/xerj"),
         help="owner/name (default: $GITHUB_REPOSITORY or xerj-org/xerj)",
     )
+    ap.add_argument(
+        "--changed-files",
+        help="whitespace/newline-separated changed paths in the PR. When this is "
+        "a field-report-only set, the trailer gate is skipped (exempt).",
+    )
+    ap.add_argument(
+        "--is-field-report-only",
+        action="store_true",
+        help="predicate mode: exit 0 iff --changed-files is a field-report-only "
+        "set, else 1. Prints nothing; used by the exemption CI job.",
+    )
     args = ap.parse_args()
+
+    paths = _split_paths(args.changed_files)
+
+    # Predicate mode: no PR, no network — just answer the path question.
+    if args.is_field_report_only:
+        return 0 if is_field_report_only(paths) else 1
+
+    if args.pr is None:
+        ap.error("--pr is required unless --is-field-report-only is given")
+
+    # Carve-out: a field-report-only PR skips the trailer gate entirely. The
+    # predicate is a guard here, so check_commits() stays untouched and every
+    # mixed or non-field-report PR runs the full check below.
+    if args.changed_files is not None and is_field_report_only(paths):
+        print(
+            f"CLA co-author check EXEMPT for PR #{args.pr}: the diff is "
+            f"{len(paths)} field-report file(s) under {FIELD_REPORT_DIR} and "
+            "nothing else."
+        )
+        return 0
 
     contributors = json.loads((REPO_ROOT / ".contributors").read_text())
     raw = _gh_api(f"repos/{args.repo}/pulls/{args.pr}/commits?per_page=100")

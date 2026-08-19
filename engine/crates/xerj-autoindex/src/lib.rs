@@ -13,6 +13,7 @@ pub mod detect;
 pub mod esclient;
 pub mod estimate;
 pub mod extract;
+pub mod feedback;
 pub mod gate;
 mod generation_catalog;
 #[cfg(test)]
@@ -5753,6 +5754,117 @@ fn run_map(cfg: MapCfg) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+// ─── catalog summary (reused by `xerj feedback`) ─────────────────────────
+
+/// A compact, factual view of what the latest autoindex run put on a node.
+///
+/// `xerj feedback` uses it to auto-fill the "what was indexed" line of a field
+/// report without re-deriving the catalog queries `run_map` already owns. It is
+/// deliberately read-only and narrow: the latest run document and the dataset
+/// documents, nothing else. Everything else the caller needs (correlations,
+/// junk, gotchas) belongs to the full `autoindex map`, not to a one-line
+/// summary.
+pub struct CatalogSummary {
+    /// The most recent `doc_kind: run` document, if any run has been recorded.
+    pub run: Option<Value>,
+    /// Every `doc_kind: dataset` document, most records first — the same order
+    /// `run_map` renders them in.
+    pub datasets: Vec<Value>,
+}
+
+impl CatalogSummary {
+    /// A single honest sentence for a field report's "Pointed at" line, or
+    /// `None` when nothing was indexed (so the caller emits a placeholder
+    /// rather than a sentence that says "0 records"). Never fabricates: every
+    /// number here comes straight from the catalog the server wrote.
+    pub fn one_line(&self) -> Option<String> {
+        if self.datasets.is_empty() {
+            return None;
+        }
+        let get = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
+        // Prefer the run document's own total; fall back to summing datasets so
+        // a node whose run doc predates that field still reports a real count.
+        let records = self
+            .run
+            .as_ref()
+            .and_then(|r| get(r, "records_total").as_u64())
+            .unwrap_or_else(|| {
+                self.datasets
+                    .iter()
+                    .filter_map(|d| d.get("record_count").and_then(Value::as_u64))
+                    .sum()
+            });
+        let mut sentence = format!(
+            "{records} records across {} dataset(s)",
+            self.datasets.len()
+        );
+        if let Some(root) = self
+            .run
+            .as_ref()
+            .and_then(|r| r.get("root"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            sentence.push_str(&format!(" under {root}"));
+        }
+        if let Some(run_id) = self
+            .run
+            .as_ref()
+            .and_then(|r| r.get("run_id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            sentence.push_str(&format!(" (autoindex run {run_id})"));
+        }
+        Some(sentence)
+    }
+}
+
+/// Fetch the [`CatalogSummary`] from a running node's `autoindex-catalog`.
+///
+/// Reuses the same catalog index and query shapes as `run_map`, minus the
+/// correlation/junk/duplicate passes a one-line summary does not need. Any
+/// failure — endpoint unreachable, auth rejected, no catalog yet — is returned
+/// as an `Err`, so `xerj feedback` can degrade to a template placeholder
+/// instead of inventing a number (the repo's honest-claims rule).
+pub fn fetch_catalog_summary(url: &str, api_key: Option<String>) -> Result<CatalogSummary> {
+    let es = Es::new(url, api_key)?;
+    es.ping()?;
+    let fetch = |query: Value, size: usize, sort: Option<Value>| -> Result<Vec<Value>> {
+        let mut body = json!({"query": query, "size": size});
+        if let Some(s) = sort {
+            body["sort"] = s;
+        }
+        let v = es.search(catalog::CATALOG_INDEX, &body)?;
+        Ok(v.pointer("/hits/hits")
+            .and_then(|h| h.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|h| h.get("_source").cloned())
+                    .collect()
+            })
+            .unwrap_or_default())
+    };
+    let datasets = fetch(
+        json!({"term": {"doc_kind": "dataset"}}),
+        500,
+        Some(json!([{"record_count": "desc"}])),
+    )?;
+    let mut runs = fetch(json!({"term": {"doc_kind": "run"}}), 50, None)?;
+    runs.sort_by_key(|r| {
+        std::cmp::Reverse(
+            r.get("started")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+        )
+    });
+    Ok(CatalogSummary {
+        run: runs.into_iter().next(),
+        datasets,
+    })
 }
 
 // ─── status subcommand ───────────────────────────────────────────────────

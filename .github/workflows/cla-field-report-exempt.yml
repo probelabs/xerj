@@ -1,0 +1,75 @@
+name: CLA field-report exemption
+
+# Provides the required `verification/cla-signed` status for a pull request whose
+# ENTIRE diff is agent field reports — markdown files under
+# user-feedback/16-agent-field-reports/ — and ONLY such a pull request.
+#
+# Why a separate job at all: `verification/cla-signed` is normally posted by the
+# external cla-bot GitHub App, which matches commit AUTHORS against .contributors
+# and CANNOT path-scope itself. The agent field-report loop exists so any agent
+# can file one short report; gating that behind a CLA signature is the friction
+# that kept the folder empty (see demo/playbooks/AGENT_CONTRIBUTION_LOOP_2026-08-18.md).
+# This job scopes the exemption: it fires only when EVERY changed path is a field
+# report, so a mixed pull request (a field report plus any code/CI/other change)
+# is left entirely to cla-bot and gets the full gate. The predicate is the same
+# one the internal trailer gate uses (scripts/check_cla_coauthors.py
+# --is-field-report-only), so the two cannot drift.
+#
+# Why pull_request_target, not pull_request: only that event's token can write a
+# commit status on a fork pull request, and field reports come from exactly those
+# forks. This job is safe under the elevated token because it NEVER checks out or
+# runs the pull request's code — it checks out the trusted base ref, reads the
+# changed FILE LIST from the API, and posts a status. Do not add a checkout of the
+# PR head here.
+#
+# Honest limitation (stated plainly, per the task): posting this status races
+# cla-bot's own status for the same context — GitHub keeps the last writer per
+# context. Because this job never fires on a mixed PR, cla-bot stays authoritative
+# everywhere it matters, but the fully robust fix for field-report-only PRs is an
+# admin-level branch-protection or .clabot change, which lives outside this repo.
+# The status post is non-fatal (`|| echo`) so a token that cannot write it never
+# reddens the PR; cla-bot simply remains authoritative in that case.
+
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: cla-fr-exempt-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  field-report-exempt:
+    name: Field-report CLA exemption
+    runs-on: ubuntu-latest
+    steps:
+      # Trusted base code ONLY — never the PR head. This runs under the elevated
+      # pull_request_target token and must not execute untrusted contributor code.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Provide verification/cla-signed for a field-report-only PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          FILES="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+          if python3 scripts/check_cla_coauthors.py --is-field-report-only --changed-files "$FILES"; then
+            echo "PR #${PR_NUMBER} is field-report-only; posting verification/cla-signed=success."
+            gh api -X POST "repos/${REPO}/statuses/${HEAD_SHA}" \
+              -f context=verification/cla-signed \
+              -f state=success \
+              -f description="Field-report-only PR: CLA gate waived for user-feedback/16-agent-field-reports/*.md" \
+              -f target_url="https://github.com/${REPO}/blob/main/user-feedback/16-agent-field-reports/README.md" \
+              || echo "note: could not post the status (insufficient token permissions?). cla-bot remains authoritative."
+          else
+            echo "PR #${PR_NUMBER} touches non-field-report paths; leaving verification/cla-signed to cla-bot."
+          fi

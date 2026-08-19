@@ -75,8 +75,9 @@ authority whenever your binary disagrees):
   - Start detached and poll rather than booting in the foreground:
       xerj --insecure --data-dir ~/xerj-data > ~/xerj-node.log 2>&1 &
       until curl -sf localhost:9200/_cluster/health >/dev/null; do sleep 1; done
-  - On a released binary (v1.0.0-rc.16 and earlier) there is NO `--port` flag —
-    ports are TOML settings passed with `--config`:
+  - Ports: `--port` since v1.0.0-rc.17, TOML on any binary. On v1.0.0-rc.16 and
+    earlier there is NO `--port` flag — ports are TOML settings passed with
+    `--config`:
       [server] rest_port = 8080 · grpc_port = 8081 · es_compat_port = 9200
     All three must be distinct. If a port is taken (e.g. a real Elasticsearch on
     :9200) the node does not fall back — it exits with
@@ -84,9 +85,9 @@ authority whenever your binary disagrees):
     ports and point clients at them (`xerj autoindex … --url http://localhost:9280`).
     A `--port <PORT>` flag, which sets es_compat_port and DERIVES the other two
     (PORT+1 for the native REST API, PORT+2 for gRPC, so they cannot collide with
-    each other), is on main and ships in the next release; `xerj --help` tells you
-    which binary you have. The TOML route stays the answer on every released
-    binary, and whenever the three ports must be set independently.
+    each other), ships since v1.0.0-rc.17; `xerj --help` tells you
+    which binary you have. The TOML route works on every binary, and is the
+    answer whenever the three ports must be set independently.
   - `--bind` sets the interface; default 127.0.0.1 (loopback only). Exposing it with
     TLS off additionally requires `server.allow_insecure_network_bind = true`.
   - Stop with Ctrl-C / SIGTERM: the node flushes state and prints
@@ -274,7 +275,7 @@ ESTIMATE + DECISION GATE (`--max-minutes`, `--approve`, exit 4):
   and never over-asks. A person at a terminal is prompted instead, but only when the
   question is actually visible (stdin+stderr a terminal, progress surface on);
   --quiet/--progress none take the agent path (payload on stdout, exit 4).
-  VERSION: the gate ships in v1.0.0-rc.16 (2026-08-13, the current release).
+  VERSION: the gate ships since v1.0.0-rc.16 (2026-08-13).
   --approve/--max-minutes/exit 4 are absent from every earlier release, including
   v1.0.0-rc.15; on those binaries a long index simply starts and YOU are the gate.
   `xerj autoindex --help` is the authority for the binary in front of you. Full
@@ -996,7 +997,7 @@ and it covers CLIENT-SIDE EXTRACTION ONLY — server-side indexing, embedding an
 time are excluded (`excludes` says so), so treat it as a floor with a shape.
 
 VERSION CHECK. The gate, `--approve`, `--max-minutes` and exit 4 ship in
-v1.0.0-rc.16 (2026-08-13, the current release); no earlier release has them,
+v1.0.0-rc.16 (2026-08-13); no earlier release has them,
 including v1.0.0-rc.15, and there a long index simply starts. `xerj autoindex --help`
 is the authority for the binary in front of you: if it lists `--approve`, steps 2–3
 apply; if it does not, YOU are the gate — estimate, ask, and only then run.
