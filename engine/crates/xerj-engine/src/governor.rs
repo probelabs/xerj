@@ -466,7 +466,7 @@ struct ResolvedProcessMemoryCap {
 }
 
 /// Resolve the process-memory cap from config + optional env override, mirroring
-/// the `XERJ_SEGMENT_HYDRATION_CACHE_MB` grammar (`auto` | `off` | `<MiB>`).
+/// the `XERJ_SEGMENT_HYDRATION_CACHE_MB` grammar (`auto` | `off` | `unlimited` | `<MiB>`).
 ///
 /// Precedence: env wins over config. Semantics preserved from the flat-cap era —
 /// the AUTO sentinel means "tier it", `0` means UNCAPPED (whole machine), and a
@@ -526,7 +526,7 @@ fn resolve_process_memory_cap(
             Err(_) => {
                 let mut fallback = from_config();
                 fallback.warning = Some(format!(
-                    "invalid XERJ_MAX_PROCESS_MEMORY_MB={value:?}; expected auto, off, or a positive MiB value; falling back to config"
+                    "invalid XERJ_MAX_PROCESS_MEMORY_MB={value:?}; expected auto, off, unlimited, or a positive MiB value; falling back to config"
                 ));
                 fallback
             }
@@ -591,7 +591,7 @@ fn resolve_segment_hydration_budget(
             source: SegmentHydrationBudgetSource::Env,
             warning: None,
         },
-        Some("off") => ResolvedSegmentHydrationBudget {
+        Some("off") | Some("unlimited") => ResolvedSegmentHydrationBudget {
             bytes: 0,
             source: SegmentHydrationBudgetSource::Env,
             warning: None,
@@ -611,7 +611,7 @@ fn resolve_segment_hydration_budget(
                 let mut fallback =
                     resolve_segment_hydration_budget(effective_limit, configured_mb, None);
                 fallback.warning = Some(format!(
-                    "invalid XERJ_SEGMENT_HYDRATION_CACHE_MB={value:?}; expected auto, off, or a positive MiB value; falling back to config"
+                    "invalid XERJ_SEGMENT_HYDRATION_CACHE_MB={value:?}; expected auto, off, unlimited, or a positive MiB value; falling back to config"
                 ));
                 fallback
             }
@@ -1061,6 +1061,12 @@ mod tests {
         let off = resolve_segment_hydration_budget(8 * GIB, 1024, Some("off"));
         assert_eq!(off.bytes, 0);
         assert_eq!(off.source, SegmentHydrationBudgetSource::Env);
+
+        // `unlimited` is an accepted synonym for `off`, so this resolver actually
+        // mirrors the XERJ_MAX_PROCESS_MEMORY_MB grammar it claims to (#502).
+        let unlimited = resolve_segment_hydration_budget(8 * GIB, 1024, Some("unlimited"));
+        assert_eq!(unlimited.bytes, 0);
+        assert_eq!(unlimited.source, SegmentHydrationBudgetSource::Env);
 
         let env = resolve_segment_hydration_budget(8 * GIB, 1024, Some("2048"));
         assert_eq!(env.bytes, 2 * GIB);

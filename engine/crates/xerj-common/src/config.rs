@@ -1477,7 +1477,7 @@ pub struct LimitsConfig {
     ///     with the machine.
     ///
     /// Override at runtime without editing config via the environment:
-    /// `XERJ_MAX_PROCESS_MEMORY_MB=auto|off|<MiB>` (env wins over this value;
+    /// `XERJ_MAX_PROCESS_MEMORY_MB=auto|off|unlimited|<MiB>` (env wins over this value;
     /// `off`/`unlimited` == `0`; a bare `0` is ambiguous and falls back here).
     pub max_process_memory_mb: u64,
 }
