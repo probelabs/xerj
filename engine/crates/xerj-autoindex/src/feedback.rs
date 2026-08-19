@@ -357,7 +357,7 @@ pub fn pr_commands(d: &Draft) -> String {
          \x20 -o {relpath}\n\
          git checkout -b {branch}\n\
          git add {relpath}\n\
-         git commit -m \"docs(field-report): {slug}\"\n\
+         git commit --only {relpath} -m \"docs(field-report): {slug}\"\n\
          git push -u origin {branch}\n\
          gh pr create --base main --head {branch} \\\n\
          \x20 --title \"Agent field report: {title}\" \\\n\
@@ -382,6 +382,23 @@ fn write_report_file(path: &Path, report: &str) -> io::Result<()> {
         }
     }
     std::fs::write(path, report)
+}
+
+/// The argv for the field-report commit. It commits ONLY the report path via
+/// `git commit --only <relpath>`, so anything a caller happened to have staged
+/// is left in the index and never reaches the public PR. A bare `git commit -m`
+/// committed the whole index instead — the field report's own `--open-pr`
+/// promise ("commit ONLY that one file") was false, and an agent working in a
+/// dirty repo would publish whatever else was staged (a `.env`, a credential, an
+/// unrelated change). #484.
+fn field_report_commit_argv(relpath: &str, slug: &str) -> Vec<String> {
+    vec![
+        "commit".into(),
+        "--only".into(),
+        relpath.into(),
+        "-m".into(),
+        format!("docs(field-report): {slug}"),
+    ]
 }
 
 /// `--open-pr`: commit ONLY the field report on a new branch and run
@@ -422,11 +439,7 @@ fn open_pr(draft: &Draft, report: &str, commands: &str) -> i32 {
         ("git add", vec!["add".into(), relpath.clone()]),
         (
             "git commit",
-            vec![
-                "commit".into(),
-                "-m".into(),
-                format!("docs(field-report): {}", draft.slug),
-            ],
+            field_report_commit_argv(&relpath, &draft.slug),
         ),
         (
             "git push",
@@ -792,5 +805,85 @@ mod tests {
         ] {
             assert!(help.contains(expected), "help missing {expected:?}");
         }
+    }
+
+    /// #484: `--open-pr` must publish ONLY the field report, even when the
+    /// agent's repo already has something else staged. Proven by the commit
+    /// tree, not by inspecting the argv.
+    #[test]
+    fn the_field_report_commit_includes_only_the_report_not_a_staged_decoy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .expect("run git")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("seed"), "seed").unwrap();
+        git(&["add", "seed"]);
+        git(&["commit", "-qm", "seed"]);
+
+        // Something the agent had staged: a secret, an unrelated change, ...
+        std::fs::write(root.join("SECRET.env"), "TOKEN=leakme").unwrap();
+        git(&["add", "SECRET.env"]);
+
+        // The report, written and staged the way `open_pr` does.
+        let relpath = report_relpath("2026-08-19", "my-report");
+        let path = root.join(&relpath);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# report\n").unwrap();
+        git(&["add", &relpath]);
+
+        // The fix under test: commit --only the report.
+        let argv = field_report_commit_argv(&relpath, "my-report");
+        let argv_str: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let ok = Command::new("git")
+            .args(&argv_str)
+            .current_dir(root)
+            .status()
+            .expect("run git commit")
+            .success();
+        assert!(ok, "git commit --only failed");
+
+        let committed = String::from_utf8(
+            Command::new("git")
+                .args(["show", "--name-only", "--format=", "HEAD"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            committed.contains(&relpath),
+            "the field report must be committed: {committed:?}"
+        );
+        assert!(
+            !committed.contains("SECRET.env"),
+            "a staged decoy must NOT be committed by --open-pr (#484): {committed:?}"
+        );
+
+        // The decoy is left in the index, untouched — not committed, not lost.
+        let staged = String::from_utf8(
+            Command::new("git")
+                .args(["diff", "--cached", "--name-only"])
+                .current_dir(root)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            staged.contains("SECRET.env"),
+            "the decoy must remain staged, untouched: {staged:?}"
+        );
     }
 }
