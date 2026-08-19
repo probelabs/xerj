@@ -19784,10 +19784,6 @@ pub async fn search_with_scroll(
     // Execute search across all indices and collect ALL hits.
     let mut all_hits: Vec<(String, xerj_query::executor::Hit)> = Vec::new();
     let mut total_count: u64 = 0;
-    // Issue #198: set when any index matches more documents than the
-    // per-index snapshot fetch could carry — the scroll would be a
-    // silently truncated export.
-    let mut scroll_truncated = false;
 
     for idx_name in &index_names {
         let idx = match state.engine.get_index(idx_name) {
@@ -19805,11 +19801,6 @@ pub async fn search_with_scroll(
                 if let Some(reason) = &result.script_failure {
                     return script_limit_response(reason);
                 }
-                if result.hits.len() >= SCROLL_SNAPSHOT_MAX_HITS
-                    && result.total.value > result.hits.len() as u64
-                {
-                    scroll_truncated = true;
-                }
                 total_count += result.total.value;
                 for hit in result.hits {
                     all_hits.push((idx_name.clone(), hit));
@@ -19823,10 +19814,19 @@ pub async fn search_with_scroll(
 
     // If scroll param present, store context and return first page.
     if params.scroll.is_some() {
-        // Issue #198: refuse to register a context whose snapshot is
-        // missing documents — a truncated scroll looks complete to the
-        // caller (reindex/backup/migration) and silently loses data.
-        if scroll_truncated {
+        // Issue #198 (and #405: this route used to flag truncation only
+        // when a SINGLE index alone exceeded the per-index snapshot fetch
+        // — `full_req.size` is `SCROLL_SNAPSHOT_MAX_HITS` PER index, so an
+        // N-index request could materialise up to
+        // `N * SCROLL_SNAPSHOT_MAX_HITS` hits into one context and never
+        // trip that check, even though `POST /{index}/_search?scroll=`
+        // (search_impl) rejects the identical summed total. `total_count`
+        // above is already the exact sum across every index — compare it
+        // against the cap directly, matching search_impl's check
+        // (es_compat.rs, `is_scroll_request` block) exactly, so a request
+        // whose combined result set cannot fit the snapshot is refused
+        // loudly regardless of which route opened it.
+        if total_count > SCROLL_SNAPSHOT_MAX_HITS as u64 {
             return scroll_window_exceeded(total_count, SCROLL_SNAPSHOT_MAX_HITS);
         }
         let scroll_id = Uuid::new_v4().to_string();
