@@ -297,7 +297,7 @@ Tool definitions for the operations above, ready to paste into an agent framewor
 - [openai-tools.json](https://xerj.org/docs/agents/schemas/openai-tools.json) — OpenAI function-calling shape: an array of `{"type":"function","function":{name, description, parameters}}`.
 - [anthropic-tools.json](https://xerj.org/docs/agents/schemas/anthropic-tools.json) — Anthropic tool-use shape: an array of `{name, description, input_schema}`.
 
-The OpenAI and Anthropic files define the same six operations — `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`.
+The OpenAI and Anthropic files define six of the seven canonical operations — the HTTP-reachable ones: `xerj_search`, `xerj_semantic_search`, `xerj_vector_search`, `xerj_hybrid_search`, `xerj_memory_store`, `xerj_memory_recall`. (`xerj_autoindex`, the seventh, is CLI-only and has no HTTP route to describe — see above.)
 
 If you *can* run a process, `xerj mcp` is an MCP stdio server inside the same binary (since **v1.0.0-rc.16**) serving those ten tools. It does not start a node — point it at one you already started.
 

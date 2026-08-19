@@ -87,6 +87,26 @@ jobs:
       - name: Vetted hub manifests validate
         run: python3 tools/xerj-code/tests/validate_manifest.py --hub tools/xerj-code/hub/*.json
 
+  # #489: this script existed, worked, and had been failing locally for three
+  # releases — the version footer, headline and narrative on landing/index.html
+  # stayed pinned to rc.15 through rc.16 and rc.17 because nothing ran it. It is
+  # fast, needs no toolchain, and only touches static HTML/text, so it belongs
+  # beside the other docs/tooling gates rather than in the release job —
+  # catching drift at PR time is the point, not after the site has been stale
+  # for weeks. fetch-depth: 0 is required (not the default fetch-depth: 1):
+  # the guard resolves "the newest released tag" via `git tag --list`, which a
+  # shallow checkout does not fetch.
+  landing-constants-guard:
+    name: Landing constants guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Landing page constants agree with the newest release
+        run: bash .github/scripts/landing-constants-guard.sh
+
   lint:
     name: Format + Clippy
     runs-on: ubuntu-latest
