@@ -27770,7 +27770,7 @@ fn validate_embedding_execution(
         if persisted.identity_sha256 != current.identity_sha256 && has_documents {
             return Err(EngineError::Common(xerj_common::XerjError::embedding(
                 format!(
-                    "index {} holds vectors produced by embedding backend {:?} but this server                      resolves embedding.mode={:?} to backend {:?}. Query vectors from one                      embedder scored against document vectors from another are silently wrong                      rather than visibly wrong: the widths can agree, so no dimension check                      fires, and the scores stay plausible while the ranking degrades toward                      noise. Restore the previous embedding configuration, or reindex into a new                      index under this one.",
+                    "index {} holds vectors produced by embedding backend {:?} but this server resolves embedding.mode={:?} to backend {:?}. Query vectors from one embedder scored against document vectors from another are silently wrong rather than visibly wrong: the widths can agree, so no dimension check fires, and the scores stay plausible while the ranking degrades toward noise. Restore the previous embedding configuration, or reindex into a new index under this one.",
                     index_dir.display(),
                     persisted.backend,
                     cfg.mode.trim(),
