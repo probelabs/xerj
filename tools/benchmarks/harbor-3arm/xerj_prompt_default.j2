@@ -1,0 +1,18 @@
+{{ instruction }}
+
+---
+TOOL NOTE: XERJ (an AI-native search engine, xerj.org) is installed with a
+server running at http://localhost:9210. You can make this repository
+searchable and query it, as the standard install flow suggests:
+
+1. Index:  xerj autoindex "$(git rev-parse --show-toplevel 2>/dev/null || pwd)" --url http://localhost:9210 --prefix task
+
+2. Search (autoindex prints this recipe when code is indexed):
+   curl -s 'http://localhost:9210/task-*/_search' -H 'Content-Type: application/json' -d '{
+     "query": {"bool": {"should": [
+       {"multi_match": {"query": "<symbol or phrase>", "fields": ["body","defs"], "type": "most_fields"}},
+       {"match_phrase": {"defs": {"query": "<symbol or phrase>", "boost": 4}}}]}},
+     "_source": ["ax_path","title"], "fields": ["_passage"]}'
+
+Use it when helpful; your normal tools remain available. Do not spend more than
+one attempt fixing XERJ if it errors.
