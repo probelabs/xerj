@@ -207,13 +207,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   On the default (graph) path the frozen plan is reused instead of re-sniffed, so
   a file recorded in `plan.junk_files` is never reconsidered: the re-run leaves
   the index unchanged and exits 3 (`completed-with-junk`), the same code the
-  original run gave — there is no signal that anything is now recoverable. With
-  `--no-graph` the file is re-sniffed, but it is then re-admitted only if some
-  frozen dataset survives all three checks in `classify_new`
-  (`reconcile_plan.rs:279-303`): the family/group filter, `ensure_compatible`,
-  and a field-overlap threshold. In an ordinary corpus at least one of those
-  fails and the run stops with `no frozen dataset accepts family …` instead of
-  indexing anything. Do not plan around the plain re-run recovering the file.
+  original run gave — there is no signal that anything is now recoverable.
+
+  With `--no-graph` the file is re-sniffed and then has to be re-admitted, which
+  is decided by four gates in `classify_new` (`reconcile_plan.rs:279-323`): the
+  family/group filter, `ensure_compatible`, a field-overlap threshold, and a
+  refusal when two frozen datasets match equally well. All three outcomes are
+  reachable — the file is recovered in place, or the run aborts naming it, or it
+  stays junk — and which one you get depends on what the other files in the
+  corpus froze into the plan. This entry deliberately does not predict it: six
+  attempts to state the rule concisely were each refuted by measurement, and the
+  honest instruction is to run it and read the exit code. A `csv` file rejoining
+  a compatible `csv` dataset is recovered incrementally in seconds; prose never
+  is, because prose datasets record `family = docs` while the file sniffs
+  `txt-prose`, so the first gate can never match.
 
   A new `--state-dir` with a new `--prefix` recovers the file in every
   configuration measured. `--fresh` recovers it in some and is refused in
@@ -936,12 +943,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retrievable hits — and now answers `0`, which is what its own `_search`
   returns. A count no page of hits can reproduce is a coincidence, not
   compatibility. What `_search` *should* answer for a `term` on an analysed
-  field is a separate, hit-set-moving decision. It was tracked in
+  field is a separate, hit-set-moving decision. It was raised as
   [#397](https://github.com/xerj-org/xerj/issues/397), which was closed
-  `not_planned` on 2026-08-15 — so there is no open work item behind it and
-  **waiting for it is not a plan**. Until something reopens that decision, this
-  shape has no sub-linear count: budget for the measured cost above, or avoid
-  `_count` with a `term` on an analysed field in a serving path.
+  `not_planned` on 2026-08-15 — not abandoned, but consolidated into
+  [#423](https://github.com/xerj-org/xerj/issues/423), which is open and carries
+  #397's repro as acceptance criteria. #423 is the tracker to watch: it treats
+  the cause rather than this symptom — `doc_matches_query` evaluates buffered
+  documents against raw `_source` with no mapping and no analyser, while flushed
+  documents go through the term dictionary. Until it closes, this shape has no
+  sub-linear count: budget for the measured cost above, or avoid `_count` with a
+  `term` on an analysed field in a serving path.
 
   Two things this change does **not** do. It does not touch the other half of
   #362's thread — `case_insensitive` accepted and silently dropped on
