@@ -194,6 +194,12 @@ impl ApiError {
             rt.to_string()
         } else if reason.starts_with("failed to create query:") {
             "query_shard_exception".to_string()
+        } else if reason.starts_with("No mapping found for") {
+            // #437: a sort field with no mapping is a shard-level query-
+            // build failure in real ES too, wrapped the same way as
+            // `failed to create query:` above — `query_shard_exception`
+            // in root_cause, outer wrapper unchanged.
+            "query_shard_exception".to_string()
         } else if reason.starts_with("function score query returned an invalid score:") {
             // ES validates function_score results and raises
             // `illegal_argument_exception` with a 400 status when a

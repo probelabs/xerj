@@ -6475,17 +6475,19 @@ fn parse_sort(sort_val: &Value) -> Vec<xerj_query::sort::SortField> {
                         mode: SortMode::default(),
                         missing: SortMissing::default(),
                         format: None,
+                        unmapped_type: None,
                     },
                 };
                 fields.push(sf);
             }
             Value::Object(obj) => {
                 for (field_name, spec) in obj {
-                    let (order, mode, missing, format) = match spec {
+                    let (order, mode, missing, format, unmapped_type) = match spec {
                         Value::String(ord) => (
                             parse_sort_order(ord),
                             SortMode::default(),
                             SortMissing::default(),
+                            None,
                             None,
                         ),
                         Value::Object(opts) => {
@@ -6509,12 +6511,17 @@ fn parse_sort(sort_val: &Value) -> Vec<xerj_query::sort::SortField> {
                                 .unwrap_or_default();
                             let format =
                                 opts.get("format").and_then(Value::as_str).map(String::from);
-                            (order, mode, missing, format)
+                            let unmapped_type = opts
+                                .get("unmapped_type")
+                                .and_then(Value::as_str)
+                                .map(String::from);
+                            (order, mode, missing, format, unmapped_type)
                         }
                         _ => (
                             SortOrder::Asc,
                             SortMode::default(),
                             SortMissing::default(),
+                            None,
                             None,
                         ),
                     };
@@ -6525,6 +6532,7 @@ fn parse_sort(sort_val: &Value) -> Vec<xerj_query::sort::SortField> {
                             mode,
                             missing,
                             format,
+                            unmapped_type,
                         },
                         "_doc" => SortField {
                             field: "_doc".to_string(),
@@ -6532,6 +6540,7 @@ fn parse_sort(sort_val: &Value) -> Vec<xerj_query::sort::SortField> {
                             mode,
                             missing,
                             format,
+                            unmapped_type,
                         },
                         other => SortField {
                             field: other.to_string(),
@@ -6539,6 +6548,7 @@ fn parse_sort(sort_val: &Value) -> Vec<xerj_query::sort::SortField> {
                             mode,
                             missing,
                             format,
+                            unmapped_type,
                         },
                     };
                     fields.push(sf);

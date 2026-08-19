@@ -632,6 +632,7 @@ mod tests {
             mode: SortMode::default(),
             missing: SortMissing::Last,
             format: None,
+            unmapped_type: None,
         }];
 
         let merged = merge_hits(vec![vec![h1, h2, h3]], 0, 10, &sort_fields);

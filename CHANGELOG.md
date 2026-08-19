@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`sort` on a field XERJ cannot resolve returned `null` on every hit
+  instead of an error** ([#437](https://github.com/xerj-org/xerj/issues/437)).
+  `compute_sort_values` special-cased `_score`, `_doc`, `_id` and the four
+  meta-fields [#420](https://github.com/xerj-org/xerj/pull/420) made
+  resolvable (`_seq_no`, `_version`, `_primary_term`, `_index`); every other
+  ES meta-field name (`_source`, `_size`, `_doc_count`, `_field_names`,
+  `_meta`, `_tier`, `_nested`, `_nested_path`, `_feature`, `_parent`,
+  `_matched_queries`) and any unmapped or misspelled field fell through to a
+  plain `_source` lookup that returned `Null` when absent. The whole result
+  set tied on `[null]`, HTTP 200, and `search_after` paging on that field
+  was stranded at page one with no error anywhere — the same
+  silently-truncated-export failure mode
+  [#198](https://github.com/xerj-org/xerj/issues/198) closes for scroll,
+  reached through `sort` instead.
+
+  A prior attempt, [#402](https://github.com/xerj-org/xerj/pull/402), tried
+  a request-level denylist of "known-unresolvable" field names and was
+  closed after independent verification refuted it: XERJ deliberately
+  accepts a metadata-named key inside a document body (`{"_seq_no": 1}`,
+  where real Elasticsearch rejects it — see #420's entry above), so whether
+  a name resolves is a property of the *corpus* being searched, not of the
+  field name, and a static list is guaranteed wrong on some corpus. #402
+  was also wired into `_search` only, leaving `_msearch`,
+  `_search/template` and `_async_search` answering the identical
+  "unresolvable" field with 200.
+
+  This fix checks the index's **schema** instead of the corpus — the same
+  thing real Elasticsearch validates — with a single gate inside the
+  engine's `search_inner`, which every search entry point funnels through
+  regardless of endpoint. A sort field that is not one of the seven
+  already-resolvable special cases and is not declared in the schema (via
+  the same recursive dotted-path resolution already used for `.keyword`
+  multi-fields and nested/object properties) is now rejected up front with
+  Elasticsearch's real error: a 400 `search_phase_execution_exception`
+  wrapping `query_shard_exception`, reason `"No mapping found for [x] in
+  order to sort on"`.
+
+  **Known gap, not closed here:** `collapse.inner_hits.sort` and
+  aggregation `top_hits.sort` implement their own sorting independently of
+  `compute_sort_values` and are not covered by this gate — an unresolvable
+  field named in either still sorts silently wrong rather than erroring.
+  Tracked as a follow-up.
+
 ## [1.0.0-rc.18] - 2026-08-18
 
 ### Security

@@ -13809,6 +13809,7 @@ impl Index {
                     mode: xerj_query::sort::SortMode::default(),
                     missing: xerj_query::sort::SortMissing::default(),
                     format: None,
+                    unmapped_type: None,
                 }];
                 r.leaf_ts_field = None;
                 Some(r)
@@ -13868,6 +13869,45 @@ impl Index {
                          since it is not indexed nor has doc values."
                     ),
                 )));
+            }
+            // #437: a sort field this engine cannot resolve (any of 11 ES
+            // meta-field names besides the ones handled below, or an
+            // unmapped/misspelled field) fell through to `_source` lookup
+            // in `compute_sort_values` and silently returned `null` on
+            // every hit — a full-corpus tie that strands `search_after` at
+            // page one, HTTP 200, indistinguishable from a correct run.
+            // #402 tried to catch this with a request-level allowlist of
+            // "known-unresolvable" names and was refuted: xerj permits a
+            // metadata-named `_source` key (`{"_seq_no": 1}`), so whether a
+            // name resolves is a property of the CORPUS, not of the field
+            // name — a static list is guaranteed wrong on some corpus. The
+            // schema is the stable thing to check instead, matching what
+            // real ES actually validates. Bypass set kept in lockstep with
+            // `compute_sort_values`'s own special cases (`_score`/`_doc`/
+            // `_id`/`is_meta_sort_field`) — anything else must be declared,
+            // via the same recursive dotted-path walk `declared_field`
+            // already does for `.keyword` multi-fields and nested/object
+            // properties (unlike `Schema::has_field`, which is flat/exact
+            // match only and would false-reject both).
+            for sf in &request.sort {
+                if sf.is_score()
+                    || sf.is_doc_order()
+                    || sf.field == "_id"
+                    || is_meta_sort_field(&sf.field)
+                {
+                    continue;
+                }
+                // `unmapped_type` is ES's escape hatch: a sort on an unmapped
+                // field carrying it is NOT an error — every doc is treated as
+                // missing. Skip the guard so those requests keep working (real
+                // ES answers 200, and XERJ's own memory-list issues exactly
+                // this against a legacy namespace). #437 / #504 review.
+                if sf.unmapped_type.is_none() && declared_field(&schema.schema, &sf.field).is_none()
+                {
+                    return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+                        format!("No mapping found for [{}] in order to sort on", sf.field),
+                    )));
+                }
             }
             // #328's query half, and it rides the same guard for the same
             // reason: a `dense_vector` has no term dictionary to consult, so a

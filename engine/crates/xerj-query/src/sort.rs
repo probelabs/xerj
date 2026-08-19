@@ -34,6 +34,13 @@ pub struct SortField {
     /// than the raw numeric epoch that the engine produces by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+    /// ES `unmapped_type`: when set, sorting a field that has no mapping is not
+    /// an error — every document is treated as missing (ES semantics). The
+    /// unresolvable-field guard skips a field carrying this, so a client that
+    /// asks for `unmapped_type` (e.g. a cross-index sort, or a query written to
+    /// survive a schema that predates the field) is not rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unmapped_type: Option<String>,
 }
 
 impl SortField {
@@ -45,6 +52,7 @@ impl SortField {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         }
     }
 
@@ -56,6 +64,7 @@ impl SortField {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         }
     }
 
@@ -279,6 +288,7 @@ mod tests {
             mode: SortMode::default(),
             missing: SortMissing::Last,
             format: None,
+            unmapped_type: None,
         }];
         let a = vec![json!(1)];
         let b = vec![json!(2)];
@@ -293,6 +303,7 @@ mod tests {
             mode: SortMode::default(),
             missing: SortMissing::Last,
             format: None,
+            unmapped_type: None,
         }];
         let a = vec![json!(2)];
         let b = vec![json!(1)];
@@ -307,6 +318,7 @@ mod tests {
             mode: SortMode::default(),
             missing: SortMissing::Last,
             format: None,
+            unmapped_type: None,
         }];
         // null sorts after non-null
         assert_eq!(
@@ -323,6 +335,7 @@ mod tests {
             mode: SortMode::default(),
             missing: SortMissing::First,
             format: None,
+            unmapped_type: None,
         }];
         assert_eq!(
             compare_sort_keys(&[json!(null)], &[json!(1)], &fields),
@@ -339,6 +352,7 @@ mod tests {
                 mode: SortMode::default(),
                 missing: SortMissing::Last,
                 format: None,
+                unmapped_type: None,
             },
             SortField {
                 field: "name".to_string(),
@@ -346,6 +360,7 @@ mod tests {
                 mode: SortMode::default(),
                 missing: SortMissing::Last,
                 format: None,
+                unmapped_type: None,
             },
         ];
         // Same date, "alice" < "bob"

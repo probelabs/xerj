@@ -3197,6 +3197,7 @@ fn parse_sort_field_str(s: &str) -> SortField {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         },
         "_doc" => SortField {
             field: "_doc".to_string(),
@@ -3204,6 +3205,7 @@ fn parse_sort_field_str(s: &str) -> SortField {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         },
         other => SortField {
             field: other.to_string(),
@@ -3211,6 +3213,7 @@ fn parse_sort_field_str(s: &str) -> SortField {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         },
     }
 }
@@ -3224,6 +3227,7 @@ fn parse_sort_field_spec(field: &str, spec: &Value) -> Result<SortField> {
             mode: SortMode::default(),
             missing: SortMissing::default(),
             format: None,
+            unmapped_type: None,
         });
     }
 
@@ -3253,6 +3257,10 @@ fn parse_sort_field_spec(field: &str, spec: &Value) -> Result<SortField> {
     };
 
     let format = obj.get("format").and_then(|v| v.as_str()).map(String::from);
+    let unmapped_type = obj
+        .get("unmapped_type")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     Ok(SortField {
         field: field.to_string(),
@@ -3260,6 +3268,7 @@ fn parse_sort_field_spec(field: &str, spec: &Value) -> Result<SortField> {
         mode,
         missing,
         format,
+        unmapped_type,
     })
 }
 
