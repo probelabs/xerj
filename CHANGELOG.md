@@ -61,9 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bytes likewise. How often depends on load and on how the client frames and
   drains — measurements on two machines differed in both directions, so treat
   the hazard as real and the frequency as unpredictable rather than as a rate.
-  Tracked as [#485](https://github.com/xerj-org/xerj/issues/485) — every other
-  caveat in this release is numbered and this one, the most operationally
-  actionable of them, was not.
+  Tracked as [#485](https://github.com/xerj-org/xerj/issues/485).
   If you control the client, chunk at 256 bytes or above.
 
   XERJ has such a path: `auth_middleware` is an axum layer, so a request that
@@ -688,7 +686,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   43 alias documents lucene published are still in the catalog: the barrier
   stopped counting them, it does not delete them.
 
-  This does **not** close #360. The third abort the issue reports — `catalog
+  This is not what closed #360 — that closed `completed` on 2026-08-15 via #407. The third abort the issue reports — `catalog
   read-back for ds:… disagrees with the sealed generation projection`, which
   ended the full `apache/lucene` run after 1,073s before this change and 663s
   after it — reproduces on this branch and is not an autoindex defect:
@@ -955,7 +953,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `term` on an analysed field in a serving path.
 
   Two things this change does **not** do. It does not touch the other half of
-  #362's thread — `case_insensitive` accepted and silently dropped on
+  #423 (which consolidated #362, closed `not_planned` for that reason) — `case_insensitive` accepted and silently dropped on
   `prefix`/`wildcard` — so the issue's headline symptom survives:
   `{"term":{"title":"TestSegmentReader.java"}}` still answers `1` while
   `{"prefix":{"title":"TestSeg"}}` answers `0`. And it is not the narrower fix

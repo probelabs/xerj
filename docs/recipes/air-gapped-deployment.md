@@ -115,12 +115,16 @@ written into `STAGE` in the enclave block below, because that one is spelled out
 rather than derived.
 
 The extracted tree is removed by the `trap` on every exit this block can take
-after the `cd` — success, `set -e`, a failed digest, and a hangup, `SIGTERM` or
-Ctrl-C, because bash runs an `EXIT` trap when a non-interactive shell is killed
-by a fatal signal. Only the archive and its `.sha256` should cross the airgap,
-so that no unverified binary travels beside the verified one. What genuinely
-survives is `SIGKILL`, an OOM kill and power loss, and what survives then is a
-*half-extracted* tree — so if the block did not print its `staged …` line, look
+after the `cd` — success, `set -e`, a failed digest, and a dropped session,
+because bash runs an `EXIT` trap when a non-interactive shell is killed by a
+fatal signal. `SIGTERM` delivered to the whole process group is the exception
+and the one worth knowing: `timeout`, a CI runner, an Ansible task and a
+systemd unit all signal the group, so `rm -rf` is killed alongside the shell
+and the tree survives — measured 10 times out of 10, with the trap entered and
+interrupted mid-delete in 8 of them. Only the archive and its `.sha256` should cross the airgap,
+so that no unverified binary travels beside the verified one. What else
+survives is `SIGKILL`, an OOM kill and power loss, and what survives in all of
+these cases is a *half-extracted* tree — so if the block did not print its `staged …` line, look
 before transferring.
 
 Three earlier versions of this paragraph were wrong, and each is worth knowing
