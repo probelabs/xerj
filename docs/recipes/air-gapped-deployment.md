@@ -114,14 +114,16 @@ a different target, which means changing `TARGET` here **and** the triple
 written into `STAGE` in the enclave block below, because that one is spelled out
 rather than derived.
 
-The extracted tree is removed by the `trap` on every exit this block can take
-after the `cd` — success, `set -e`, a failed digest, and a hangup, `SIGTERM` or
-Ctrl-C, because bash runs an `EXIT` trap when a non-interactive shell is killed
-by a fatal signal. Only the archive and its `.sha256` should cross the airgap,
-so that no unverified binary travels beside the verified one. What genuinely
-survives is `SIGKILL`, an OOM kill and power loss, and what survives then is a
-*half-extracted* tree — so if the block did not print its `staged …` line, look
-before transferring.
+The extracted tree is removed by the `trap` after the `cd` on a clean exit —
+success, `set -e`, and a failed digest. An **interrupted** run may or may
+not leave the tree behind: whether the trap runs to completion depends on
+how and when the interrupt lands, and the honest summary is that you cannot
+tell from the outside. So do not use the trap to decide safety. The rule
+that always holds: only the archive and its `.sha256` should cross the
+airgap, and **if the block did not print its `staged …` line, treat the
+staging directory as unverified — delete it, or inspect it, before
+transferring anything.** The trap is a convenience for the normal exits,
+not a guarantee across interrupts.
 
 Three earlier versions of this paragraph were wrong, and each is worth knowing
 because two of them are about where the trap sits and the third is about how
@@ -141,13 +143,15 @@ this was measured:
   the tree went; with `OUT=stagedir` it survived all four cases.
 
 - The third claimed an `EXIT` trap "does not run on `SIGTERM` or `SIGHUP`, so a
-  dropped session leaves the tree". Also false, and the interesting part is how:
-  the measurement behind it signalled the wrapping `bash script.sh` process
-  instead of the forked subshell that actually owns the trap, so the trap was
-  never asked to run. Signal the subshell and it runs — `SIGTERM`, `SIGHUP` and
-  `SIGINT` all clean, verified in a real pty with the signal landing provably
-  mid-`tar`. Three of this page's wrong sentences now trace to a harness that
-  measured the wrong thing rather than to the shell behaving unexpectedly.
+  dropped session leaves the tree". That was measured wrong, but so were two
+  attempts to correct it: whether the trap runs on an interrupt turned out to
+  depend on details the measurements kept getting different answers on —
+  which process was signalled, and whether a controlling terminal was
+  attached. The honest conclusion is the one now in the lead: do not assert
+  what the trap does under interrupts, and trust the `staged …` line instead.
+  Several of this page's earlier wrong sentences trace to a harness that
+  signalled or observed the wrong thing, which is the whole reason the recipe
+  keys on the printed line and not on the trap.
 
 Hence the form above: the body is `"$STAGE"`, relative to the directory the
 block already `cd`-ed into and never leaves, and the `trap` is installed
