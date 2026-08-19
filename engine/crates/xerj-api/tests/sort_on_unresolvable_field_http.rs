@@ -310,3 +310,59 @@ async fn sort_on_a_keyword_multi_field_and_a_nested_property_still_works() {
         assert_eq!(body["hits"]["hits"].as_array().map(Vec::len), Some(2));
     }
 }
+
+/// The `#437` gate must NOT reject a sort on an unmapped field that carries
+/// ES's `unmapped_type` escape hatch: real Elasticsearch answers 200 and
+/// treats every document as missing, and XERJ's own memory-list endpoint
+/// issues exactly `{"stored_at":{"order":"desc","unmapped_type":"long"}}` as a
+/// guard for namespaces created before `stored_at` existed. Rejecting it (the
+/// #504 review's blocking finding) would 400 those requests. Both directions
+/// are pinned here so the exemption cannot silently regress in either sense.
+#[tokio::test]
+async fn sort_on_an_unmapped_field_with_unmapped_type_is_not_rejected() {
+    let (app, _dir) = app().await;
+    seed(&app, "umt", 4).await; // docs carry only `n`; `stored_at` is unmapped
+
+    // With unmapped_type: ES treats every doc as missing — 200, not an error.
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/umt/_search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "query": {"match_all": {}},
+                    "sort": [{"stored_at": {"order": "desc", "unmapped_type": "long"}}]
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sort on an unmapped field carrying unmapped_type must be answered (ES \
+         treats it as all-missing), not rejected: {body}"
+    );
+    assert_eq!(
+        body["hits"]["total"]["value"], 4,
+        "all four docs must come back, sorted as missing: {body}"
+    );
+
+    // Without unmapped_type the same field is still rejected (the #437 fix).
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/umt/_search")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"query": {"match_all": {}}, "sort": [{"stored_at": "desc"}]}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_no_mapping_found_error(status, &body, "stored_at");
+}

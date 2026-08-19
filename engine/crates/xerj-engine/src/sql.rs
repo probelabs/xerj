@@ -376,6 +376,7 @@ pub fn parse_sql(sql: &str) -> Result<SqlQuery, String> {
                 mode: xerj_query::sort::SortMode::default(),
                 missing: xerj_query::sort::SortMissing::default(),
                 format: None,
+                unmapped_type: None,
             });
             if let Some(Token::Comma) = peek(pos) {
                 pos += 1;

@@ -13768,6 +13768,7 @@ impl Index {
                     mode: xerj_query::sort::SortMode::default(),
                     missing: xerj_query::sort::SortMissing::default(),
                     format: None,
+                    unmapped_type: None,
                 }];
                 r.leaf_ts_field = None;
                 Some(r)
@@ -13855,7 +13856,13 @@ impl Index {
                 {
                     continue;
                 }
-                if declared_field(&schema.schema, &sf.field).is_none() {
+                // `unmapped_type` is ES's escape hatch: a sort on an unmapped
+                // field carrying it is NOT an error — every doc is treated as
+                // missing. Skip the guard so those requests keep working (real
+                // ES answers 200, and XERJ's own memory-list issues exactly
+                // this against a legacy namespace). #437 / #504 review.
+                if sf.unmapped_type.is_none() && declared_field(&schema.schema, &sf.field).is_none()
+                {
                     return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
                         format!("No mapping found for [{}] in order to sort on", sf.field),
                     )));
