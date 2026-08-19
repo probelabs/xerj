@@ -50,6 +50,18 @@ pub struct Hit {
     /// The document source fields (filtered per `_source`).
     #[serde(rename = "_source")]
     pub source: serde_json::Value,
+    /// ES-wire (0-based) sequence number, read from the SAME version-map
+    /// entry `source` was resolved from — never re-resolved later, so a
+    /// concurrent write can't pair a stale `source` with a live `seq_no`
+    /// (#440). `None` for a doc that is unknown/tombstoned at read time, or
+    /// when the deferred-hydration path hasn't reached this hit yet
+    /// (resolved in that case by whatever later fills `source`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq_no: Option<u64>,
+    /// Document version, from the same read as `seq_no`/`source`. Same
+    /// `None` semantics as `seq_no`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
     /// The sort key values for this hit (used by `search_after`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sort: Vec<serde_json::Value>,
@@ -542,6 +554,8 @@ mod tests {
             id: id.to_string(),
             score,
             source: serde_json::Value::Null,
+            seq_no: None,
+            version: None,
             sort: vec![],
             explain: None,
             highlight: None,

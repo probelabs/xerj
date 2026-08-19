@@ -161,6 +161,15 @@ pub struct ScrollContext {
     pub hits: Vec<(String, xerj_query::executor::Hit)>,
     pub position: usize,
     pub page_size: usize,
+    /// Whether to emit `_seq_no`/`_primary_term` on every page. Real ES
+    /// fixes this at the scroll-opening request and does not re-read it
+    /// from continuation bodies — the flag governs the whole scroll's
+    /// lifetime, not each page — so it's captured once here, not re-parsed
+    /// per continuation.
+    pub seq_no_primary_term: bool,
+    /// Whether to emit `_version` on every page. Same once-at-open semantics
+    /// as `seq_no_primary_term`.
+    pub version: bool,
     pub created: Instant,
     /// The keep-alive window last requested for this context. A
     /// continuation without an explicit `scroll` parameter re-arms the
