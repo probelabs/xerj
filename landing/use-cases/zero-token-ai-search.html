@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="night">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>XERJ.ai — Zero-token AI search</title>
+<meta name="description" content="Point XERJ at a folder of code, PDFs, or Markdown. Ask in plain English, get the exact files back. No model runs to search — zero tokens, nothing leaves the box.">
+<meta property="og:title" content="XERJ.ai — zero-token AI search">
+<meta property="og:description" content="Index any folder locally in seconds, then ask in natural language. Pure retrieval, no LLM in the loop — deterministic, private, and free to search.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@400;700;800;900&family=Inter:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' fill='%230b0b0d'/><text x='50' y='68' font-size='60' font-family='Big Shoulders Display,sans-serif' font-weight='900' fill='%23ffc400' text-anchor='middle'>X</text></svg>">
+<link rel="stylesheet" href="/style.css?v=sc0706">
+<style>
+  /* ---- zero-token scenario terminals (page-scoped, built on the site tokens) ---- */
+  .zt-term{border:1px solid var(--z-line);background:color-mix(in srgb,var(--z-ink) 3%,var(--z-bg));
+    font-family:var(--font-mono);font-size:var(--fs-13);line-height:1.6;overflow:hidden}
+  .zt-head{display:flex;align-items:center;gap:8px;padding:10px 16px;border-bottom:1px solid var(--z-line);
+    background:color-mix(in srgb,var(--z-ink) 6%,var(--z-bg))}
+  .zt-dot{width:9px;height:9px;border-radius:50%;background:var(--z-faint)}
+  .zt-head .t{margin-left:6px;color:var(--z-mute);font-size:var(--fs-11);letter-spacing:var(--track-label);text-transform:uppercase}
+  .zt-body{padding:16px 18px;display:flex;flex-direction:column;gap:3px;overflow-x:auto}
+  .zt-run{white-space:pre-wrap;word-break:break-word}
+  .zt-p{color:var(--z-accent)}
+  .zt-out{color:var(--z-mute)}
+  .zt-ok{color:var(--z-ink)}
+  .zt-rule{height:1px;background:var(--z-line);margin:15px -18px}
+  .zt-ask{display:flex;gap:9px;align-items:baseline;margin-bottom:2px}
+  .zt-ask .m{color:var(--z-accent);font-weight:700}
+  .zt-ask .q{color:var(--z-ink)}
+  .zt-hits{display:flex;flex-direction:column;gap:7px;padding-left:2px;margin-top:4px}
+  .zt-hit{border-left:2px solid var(--z-line);padding:1px 0 1px 12px}
+  .zt-hit .path{color:var(--z-accent);font-weight:600}
+  .zt-hit .snip{display:block;color:var(--z-mute);margin-top:2px;font-size:var(--fs-11);line-height:1.55}
+  .zt-hit .snip b{color:var(--z-ink);font-weight:600}
+  .zt-meta{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+  .zt-chip{font-size:var(--fs-11);letter-spacing:.02em;border:1px solid var(--z-line);padding:2px 9px;color:var(--z-mute)}
+  .zt-chip.z{color:var(--z-accent);border-color:color-mix(in srgb,var(--z-accent) 45%,transparent)}
+  .zt-answer{margin-top:12px;padding:11px 14px;border:1px dashed color-mix(in srgb,var(--z-accent) 50%,transparent);
+    color:var(--z-ink);font-family:var(--font-data);font-size:var(--fs-13)}
+  .zt-answer b{color:var(--z-accent)}
+  /* token-cost bars */
+  .zt-cost{display:flex;flex-direction:column;gap:10px;margin-top:var(--sp-6);max-width:640px}
+  .zt-bar{display:grid;grid-template-columns:140px 1fr;gap:14px;align-items:center}
+  .zt-bar .lbl{font-family:var(--font-mono);font-size:var(--fs-11);color:var(--z-mute);text-transform:uppercase;letter-spacing:var(--track-label)}
+  .zt-track{position:relative;height:28px;background:color-mix(in srgb,var(--z-ink) 7%,var(--z-bg));border:1px solid var(--z-line)}
+  .zt-fill{position:absolute;inset:0 auto 0 0;display:flex;align-items:center;padding:0 10px;
+    font-family:var(--font-mono);font-size:var(--fs-11);font-weight:600;white-space:nowrap;
+    font-variant-numeric:tabular-nums}
+  .zt-fill.read{width:100%;background:var(--z-cmp);color:var(--z-bg)}
+  .zt-fill.xerj{width:74px;background:var(--z-accent);color:#0b0b0d}
+  .zt-note{font-family:var(--font-data);font-size:var(--fs-11);color:var(--z-mute);margin-top:var(--sp-3);
+    letter-spacing:.01em}
+  .zt-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:var(--gap-x);margin-top:var(--sp-6)}
+  @media (max-width:820px){.zt-grid{grid-template-columns:1fr}.zt-bar{grid-template-columns:96px 1fr}}
+  .zt-card h3{font-family:var(--font-data);font-size:var(--fs-13);text-transform:uppercase;
+    letter-spacing:var(--track-label);color:var(--z-ink);margin:0 0 6px}
+  .zt-card p{margin:0;color:var(--z-mute);font-size:var(--fs-13);font-family:var(--font-prose);line-height:1.55}
+  .zt-lead-q{color:var(--z-mute);font-family:var(--font-prose);max-width:60ch;margin:0 0 var(--sp-6)}
+</style>
+</head>
+<body>
+
+<!-- nav -->
+<nav class="nav" aria-label="Primary">
+  <a href="/index.html" class="brand">XERJ.AI</a>
+  <a href="/index.html">HOME</a>
+  <a href="/product.html">PRODUCT</a>
+  <span class="nav-drop active">
+    <a href="/use-cases.html" class="active">USE CASES</a>
+  </span>
+  <a href="/case-studies.html">CASE STUDIES</a>
+  <span class="spacer"></span>
+  <a href="/for-agents.html">FOR AGENTS</a>
+  <a href="/docs/index.html">DOCS</a>
+  <a href="/docs/recipes/index.html">RECIPES</a>
+  <a href="/playground.html">DASHBOARDS</a>
+  <a href="https://github.com/xerj-org/xerj" rel="external">GITHUB</a>
+  <span class="theme">
+    <button type="button" data-theme="day">DAY</button>
+    <span class="dash">·</span>
+    <button type="button" data-theme="night" class="active">NIGHT</button>
+  </span>
+</nav>
+
+<nav class="uc-subnav" aria-label="Use cases">
+  <a href="/use-cases.html">ALL USE CASES</a>
+  <a href="/use-cases/zero-token-ai-search.html" class="active">ZERO-TOKEN SEARCH</a>
+  <a href="/use-cases/ai-search-retrieval.html">AI SEARCH</a>
+  <a href="/use-cases/second-brain.html">SECOND BRAIN</a>
+  <a href="/use-cases/code-security-audit.html">CODE AUDIT</a>
+  <a href="/use-cases/elasticsearch-replacement.html">ES REPLACEMENT</a>
+</nav>
+
+<div class="uc-hero">
+  <div class="uc-eyebrow">USE CASE · ZERO-TOKEN AI SEARCH</div>
+  <h1>SEARCH YOUR<br>FILES. SPEND<br><span class="accent">ZERO TOKENS.</span></h1>
+  <p class="uc-lead">Point XERJ at a folder — source code, a stack of PDFs, a wiki of Markdown — and it indexes everything locally in seconds. Then your team, or your agent, asks in plain English and gets the exact files back. No model runs to <em>search</em>, so nothing leaves the machine and not one token is spent finding the answer. Three real runs below, same one command each time: <span class="mono accent">xerj autoindex &lt;folder&gt;</span>.</p>
+</div>
+
+<!-- ─────────────── SCENARIO 01 · CODE ─────────────── -->
+<section class="scene-section" style="border-top:0;">
+  <div class="kicker"><span>SCENARIO 01 · SOURCE CODE</span></div>
+  <h2 class="scene" style="font-size:var(--fs-32);">Ask a codebase <span class="accent">where something lives.</span></h2>
+  <p class="zt-lead-q">A new engineer, or a coding agent, needs the line that reads the API key. Instead of grepping guesses or pulling the whole tree into a model's context, ask for it.</p>
+
+  <div class="zt-term">
+    <div class="zt-head"><span class="zt-dot"></span><span class="zt-dot"></span><span class="zt-dot"></span>
+      <span class="t">the xerj indexer, searching its own source</span></div>
+    <div class="zt-body">
+      <div class="zt-run"><span class="zt-p">$ </span>xerj autoindex ./engine/crates/xerj-autoindex/src</div>
+      <div class="zt-run zt-out">phase A sniff + sample → phase B index (20 workers) → finalize</div>
+      <div class="zt-run zt-ok">done in 6.7s — 56 files, 112 records, 0 config, 0 secrets indexed</div>
+
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"read the api key from the authorization header"</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">esclient.rs</span>
+          <span class="snip">… if <b>Some(k) = &amp;self.api_key</b> { r = r.<b>header("Authorization"</b>, format!("ApiKey {k}")) …</span></div>
+        <div class="zt-hit"><span class="path">cli.rs</span>
+          <span class="snip">… --api-key &lt;K&gt;  <b>Authorization</b> header (or env XERJ_API_KEY) …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">&lt;1 ms</span><span class="zt-chip">3 files ranked</span></div>
+
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"detect the file format by sniffing the content"</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">sniff.rs</span>
+          <span class="snip">… Content-based format detection. <b>NEVER trusts file extensions</b>. Order: magic bytes … …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">&lt;1 ms</span><span class="zt-chip">exact file, first hit</span></div>
+    </div>
+  </div>
+
+  <div class="zt-cost">
+    <div class="zt-bar"><span class="lbl">read the folder</span>
+      <div class="zt-track"><div class="zt-fill read">~541,000 tokens into a model</div></div></div>
+    <div class="zt-bar"><span class="lbl">ask XERJ</span>
+      <div class="zt-track"><div class="zt-fill xerj">0 tokens</div></div></div>
+  </div>
+  <p class="zt-note">2.1 MB of Rust · reading it all into an agent to find the answer costs ~541k tokens; the query costs none.</p>
+</section>
+
+<!-- ─────────────── SCENARIO 02 · LEGAL PDFs ─────────────── -->
+<section class="scene-section">
+  <div class="kicker"><span>SCENARIO 02 · LEGAL DISCOVERY · PDF</span></div>
+  <h2 class="scene" style="font-size:var(--fs-32);">Find the case in a <span class="accent">stack of filings.</span></h2>
+  <p class="zt-lead-q">A folder of court PDFs lands on your desk. Somewhere in it is the founder who threatened to walk off with the source code. XERJ reads the PDFs — not their filenames — and ranks the ones that match the accusation.</p>
+
+  <div class="zt-term" data-slot="legal">
+    <div class="zt-head"><span class="zt-dot"></span><span class="zt-dot"></span><span class="zt-dot"></span>
+      <span class="t">a folder of court PDFs — read by content, not filename</span></div>
+    <div class="zt-body">
+      <div class="zt-run"><span class="zt-p">$ </span>xerj autoindex ./filings   <span class="zt-out"># a folder of PDFs</span></div>
+      <div class="zt-run zt-ok">done in 3.6s — 7 PDFs, 18 records, every page's text extracted and indexed</div>
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"a founder threatening to leak source code and customer data unless she is paid"</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">complaint_meridian_v_okonkwo.pdf</span>
+          <span class="snip">… has <b>threatened to leak the Company's proprietary source code</b> and its entire customer database <b>unless</b> the Company buys out her shares at a grossly inflated price …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">PDF text, not filename</span><span class="zt-chip">rank 1 · 14.1, next filing 5.7</span></div>
+
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"someone locked us out of our systems and demanded a ransom to restore access"</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">complaint_ransom_access.pdf</span>
+          <span class="snip">… who <b>deliberately locked the Company out of its own production systems</b> and then <b>demanded</b> payment to restore access … service was unavailable for eleven days …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">a different filing, same folder</span><span class="zt-chip">rank 1 · 14.2, next filing 3.4</span></div>
+    </div>
+  </div>
+  <p class="zt-note">Sample filings with fictional parties, for illustration. The PDF text is extracted and indexed locally; no document is uploaded and no model is called to search.</p>
+</section>
+
+<!-- ─────────────── SCENARIO 03 · MARKDOWN KB ─────────────── -->
+<section class="scene-section">
+  <div class="kicker"><span>SCENARIO 03 · KNOWLEDGE BASE · MARKDOWN</span></div>
+  <h2 class="scene" style="font-size:var(--fs-32);">Answer a project question from the <span class="accent">wiki.</span></h2>
+  <p class="zt-lead-q">Your team's second brain is hundreds of Markdown notes — feature requests, customer threads, release logs. "When did a customer first ask for this, and how long did it take us to ship?" is buried across three of them. XERJ finds them.</p>
+
+  <div class="zt-term" data-slot="kb">
+    <div class="zt-head"><span class="zt-dot"></span><span class="zt-dot"></span><span class="zt-dot"></span>
+      <span class="t">a 20-note team wiki, asked by meaning</span></div>
+    <div class="zt-body">
+      <div class="zt-run"><span class="zt-p">$ </span>xerj autoindex ./product-kb   <span class="zt-out"># a folder of .md notes</span></div>
+      <div class="zt-run zt-ok">done in 5.0s — 20 Markdown notes, 40 records</div>
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"when did a customer first ask for hybrid retrieval?"</span> <span class="zt-out" style="font-size:var(--fs-11)">· semantic recall</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">customers/acme-freight.md</span>
+          <span class="snip"><b>### 2025-03-12 — Hybrid retrieval ask.</b> Acme raised it on the quarterly call; logged as FR-114 …</span></div>
+        <div class="zt-hit"><span class="path">feature-requests/hybrid-retrieval.md</span>
+          <span class="snip">… <b>First requested: 2025-03-12</b> (FR-114) · requester: Acme Freight …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">meaning, not keywords</span></div>
+
+      <div class="zt-rule"></div>
+
+      <div class="zt-ask"><span class="m">?</span><span class="q">"which release shipped hybrid retrieval?"</span></div>
+      <div class="zt-hits">
+        <div class="zt-hit"><span class="path">releases/2025-q3.md</span>
+          <span class="snip">… Hybrid retrieval (RRF) <b>shipped in v2.4.0 on 2025-09-08</b> …</span></div>
+      </div>
+      <div class="zt-meta"><span class="zt-chip z">0 AI tokens</span><span class="zt-chip">1 note out of 20</span></div>
+
+      <div class="zt-answer">Stitched from notes that share no keyword: Acme Freight first asked on <b>2025-03-12</b>, shipped in v2.4.0 on <b>2025-09-08</b> — about <b>26 weeks</b> from request to release.</div>
+    </div>
+  </div>
+  <p class="zt-note">Sample product knowledge base, for illustration. Same one command, a different kind of folder.</p>
+</section>
+
+<!-- ─────────────── HOW / CTA ─────────────── -->
+<section class="scene-section">
+  <div class="kicker"><span>HOW IT WORKS</span></div>
+  <div class="zt-grid">
+    <div class="zt-card"><h3>One command, any folder</h3><p><span class="mono">xerj autoindex &lt;folder&gt;</span> sniffs each file by content, extracts text from code, PDFs, and Markdown, and indexes it — no schema, no pipeline, no config.</p></div>
+    <div class="zt-card"><h3>No model in the loop</h3><p>Search is BM25 + semantic retrieval over a local index, the same engine that speaks the <span class="mono">_search</span> API. Deterministic, private, and free — zero tokens to find an answer.</p></div>
+    <div class="zt-card"><h3>Secrets stay out</h3><p>Hidden files like <span class="mono">.env</span> and <span class="mono">.ssh</span> are skipped by construction, not by a rule you have to remember. Nothing you index leaves the machine.</p></div>
+  </div>
+
+  <h2 class="scene accent" style="font-size:var(--fs-56); margin-top:var(--sp-12);">TRY IT.</h2>
+  <div class="zt-term" style="max-width:720px;">
+    <div class="zt-body">
+      <div class="zt-run"><span class="zt-p">$ </span>curl -fsSL https://xerj.org/get | sh</div>
+      <div class="zt-run"><span class="zt-p">$ </span>xerj --insecure -d ./data &amp;</div>
+      <div class="zt-run"><span class="zt-p">$ </span>xerj autoindex ./your/folder</div>
+      <div class="zt-run zt-out"># then ask, in plain English:</div>
+      <div class="zt-run"><span class="zt-p">$ </span>curl localhost:9200/ax-*/_search -d '{"query":{"match":{"body":"…"}}}'</div>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <span>XERJ.AI · USE CASES · V0.1</span>
+  <span>SEARCH FOR THE AGENT ERA</span>
+  <span><a href="/index.html">HOME</a> · <a href="/use-cases.html">ALL USE CASES</a> · <a href="/docs/index.html">DOCS</a> · <a href="/playground.html">DASHBOARDS</a> &middot; <a href="/llms.txt">LLMS.TXT</a></span>
+</footer>
+
+<script>
+  (function () {
+    const root = document.documentElement;
+    for (const btn of document.querySelectorAll('[data-theme]')) {
+      btn.addEventListener('click', () => {
+        const t = btn.getAttribute('data-theme');
+        root.setAttribute('data-theme', t);
+        for (const b of document.querySelectorAll('[data-theme]')) {
+          b.classList.toggle('active', b.getAttribute('data-theme') === t);
+        }
+      });
+    }
+  })();
+</script>
+
+</body>
+</html>
