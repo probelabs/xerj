@@ -97,6 +97,8 @@ mod passage_wire_tests {
             id: "report-page".to_string(),
             score: 0.91,
             source: serde_json::json!({"company": "ACME"}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,

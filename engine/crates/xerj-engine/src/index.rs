@@ -10671,6 +10671,7 @@ impl Index {
             generated_embedding_companion_fields(&schema.schema)
         };
         Some(knn_result_from_scored(
+            self,
             request,
             field,
             scored,
@@ -11176,6 +11177,7 @@ impl Index {
             generated_embedding_companion_fields(&schema.schema)
         };
         let mut result = knn_result_from_scored(
+            self,
             request,
             field,
             scored,
@@ -11270,6 +11272,7 @@ impl Index {
             generated_embedding_companion_fields(&schema.schema)
         };
         let mut result = knn_result_from_scored(
+            self,
             request,
             "",
             merged,
@@ -12235,15 +12238,27 @@ impl Index {
 
         let hits: Vec<Hit> = scored
             .into_iter()
-            .map(|(id, score, source)| Hit {
-                id,
-                score,
-                source,
-                sort: Vec::new(),
-                explain: None,
-                highlight: None,
-                matched_queries: Vec::new(),
-                passage: None,
+            .map(|(id, score, source)| {
+                // Same read the final page's `_source` is served from
+                // (post-truncate, post-filter) — not a later pass (#440).
+                let (seq_no, version) = self
+                    .store
+                    .version_map
+                    .get(&id)
+                    .map(|ver| self.hit_seq_version(&id, &ver))
+                    .unwrap_or((None, None));
+                Hit {
+                    id,
+                    score,
+                    source,
+                    seq_no,
+                    version,
+                    sort: Vec::new(),
+                    explain: None,
+                    highlight: None,
+                    matched_queries: Vec::new(),
+                    passage: None,
+                }
             })
             .collect();
 
@@ -12638,6 +12653,32 @@ impl Index {
     /// The internal WAL counter starts at 1 so the first WAL op has seq=1,
     /// but ES semantics number seq_no from 0 per shard. We subtract 1 to
     /// match the ES wire format.
+    /// Same transform as [`Self::lookup_seq_no`]/[`Self::lookup_version`],
+    /// but from a `VersionEntry` the caller already has in scope — for
+    /// building a `Hit` inline with the doc's version-map entry already in
+    /// hand, so `_seq_no`/`_version` come from the SAME read as `_source`,
+    /// never a later pass over the version map (#440: a second pass lets a
+    /// concurrent write pair a stale `_source` with a live `_seq_no`, which
+    /// is a silent lost update once a caller round-trips it as `if_seq_no`).
+    fn hit_seq_version(
+        &self,
+        id: &str,
+        ver: &xerj_storage::version_map::VersionEntry,
+    ) -> (Option<u64>, Option<u64>) {
+        if ver.deleted {
+            return (None, None);
+        }
+        (
+            Some(ver.seq_no.saturating_sub(1)),
+            Some(
+                self.external_versions
+                    .get(id)
+                    .map(|v| *v)
+                    .unwrap_or(ver.version),
+            ),
+        )
+    }
+
     pub fn lookup_seq_no(&self, id: &str) -> Option<u64> {
         self.store.version_map.get(id).and_then(|entry| {
             if entry.deleted {
@@ -14470,9 +14511,16 @@ impl Index {
                                 if let Some(src) = self.memtable.get_doc_source_as_value(&hit.id) {
                                     hit.source = src;
                                 }
+                                // Resolved at the SAME moment as the deferred
+                                // `source` above, not a later pass (#440).
+                                if let Some(ver) = self.store.version_map.get(&hit.id) {
+                                    let (seq_no, version) = self.hit_seq_version(&hit.id, &ver);
+                                    hit.seq_no = seq_no;
+                                    hit.version = version;
+                                }
                             }
                             seen_ids.insert(hit.id.clone());
-                            let seq = self.lookup_seq_no(&hit.id).unwrap_or(u64::MAX);
+                            let seq = hit.seq_no.unwrap_or(u64::MAX);
                             topk.offer(hit, seq, self);
                         }
                     } else if all_hits.len() < materialisation_limit && !seen_ids.contains(&hit.id)
@@ -14509,12 +14557,22 @@ impl Index {
                             if !rejected {
                                 let source = src_arc.map(|a| (*a).clone()).unwrap_or(Value::Null);
                                 seen_ids.insert(id.clone());
-                                let seq = self.lookup_seq_no(&id).unwrap_or(u64::MAX);
+                                // Same read `source` came from — not a later
+                                // pass (#440) — and reused below for ranking.
+                                let (seq_no, version) = self
+                                    .store
+                                    .version_map
+                                    .get(&id)
+                                    .map(|ver| self.hit_seq_version(&id, &ver))
+                                    .unwrap_or((None, None));
+                                let seq = seq_no.unwrap_or(u64::MAX);
                                 topk.offer(
                                     Hit {
                                         id,
                                         score: 1.0,
                                         source,
+                                        seq_no,
+                                        version,
                                         sort: Vec::new(),
                                         explain: None,
                                         highlight: None,
@@ -14534,6 +14592,13 @@ impl Index {
                                 id,
                                 score: 1.0,
                                 source: Value::Null,
+                                // Deferred with `source`: `fill_memtable_sources`
+                                // resolves both from the SAME read once this
+                                // hit is known to be on the returned page
+                                // (#440) — not here, where most candidates
+                                // never make the final page.
+                                seq_no: None,
+                                version: None,
                                 sort: Vec::new(),
                                 explain: None,
                                 highlight: None,
@@ -15022,6 +15087,10 @@ impl Index {
                         id: doc_id,
                         score,
                         source: Value::Null, // filled in below
+                        // Deferred with `source` — see the deferred-`Hit`
+                        // comment in `admit_hit!`'s unsorted `count` arm (#440).
+                        seq_no: None,
+                        version: None,
                         sort: Vec::new(),
                         explain: None,
                         highlight: None,
@@ -15147,10 +15216,24 @@ impl Index {
                                 }
                             }
                             let score = score_doc(&source, &doc_id);
+                            // Same read `source` (above) is cloned from — not
+                            // a later pass (#440). NOT the tuple's own
+                            // `seq_no` (that's the memtable's raw arrival
+                            // ordinal, used only for the `#191` competitive
+                            // tie-break above — a different number from the
+                            // ES-wire `_seq_no`/`_version` this resolves).
+                            let (hit_seq_no, hit_version) = self
+                                .store
+                                .version_map
+                                .get(&doc_id)
+                                .map(|ver| self.hit_seq_version(&doc_id, &ver))
+                                .unwrap_or((None, None));
                             let hit = Hit {
                                 id: doc_id,
                                 score,
                                 source: (*source).clone(),
+                                seq_no: hit_seq_no,
+                                version: hit_version,
                                 sort: Vec::new(),
                                 explain: None,
                                 highlight: None,
@@ -16316,6 +16399,14 @@ impl Index {
                                                 .and_then(Value::as_str)
                                                 .unwrap_or("")
                                                 .to_string();
+                                            // Resolved here, from the SAME
+                                            // version-map entry the
+                                            // deleted/stale check below
+                                            // reads, so `_seq_no`/`_version`
+                                            // never diverge from `source`
+                                            // (#440).
+                                            let mut hit_seq_no = None;
+                                            let mut hit_version = None;
                                             if let Some(ver) = self.store.version_map.get(&id) {
                                                 // Tombstoned, or SUPERSEDED —
                                                 // the live version resides in
@@ -16336,6 +16427,9 @@ impl Index {
                                                 {
                                                     continue;
                                                 }
+                                                let (s, v) = self.hit_seq_version(&id, &ver);
+                                                hit_seq_no = s;
+                                                hit_version = v;
                                             }
                                             // Dedup against memtable/earlier
                                             // segments WITHOUT touching
@@ -16351,6 +16445,8 @@ impl Index {
                                                 id,
                                                 score: sh.score,
                                                 source,
+                                                seq_no: hit_seq_no,
+                                                version: hit_version,
                                                 sort: Vec::new(),
                                                 explain: None,
                                                 highlight: None,
@@ -16358,8 +16454,7 @@ impl Index {
                                                 passage: None,
                                             };
                                             if let Some(topk) = sort_topk.as_mut() {
-                                                let seq =
-                                                    self.lookup_seq_no(&hit.id).unwrap_or(u64::MAX);
+                                                let seq = hit_seq_no.unwrap_or(u64::MAX);
                                                 topk.offer(hit, seq, self);
                                             } else {
                                                 all_hits.push(hit);
@@ -19140,6 +19235,19 @@ impl Index {
                     // happen for FTS hits from the active memtable that were
                     // found by score but whose source was not cloned inline.
                 }
+                // Catch-all for whichever construction sites deliberately
+                // left `seq_no`/`version` unresolved alongside a deferred
+                // `source` (#440) — resolved here, at the SAME moment as the
+                // `source` fill above, only for hits that reach this final,
+                // already-bounded page. A no-op for hits already populated
+                // at construction time (the overwhelming majority).
+                if h.seq_no.is_none() {
+                    if let Some(ver) = self.store.version_map.get(&h.id) {
+                        let (seq_no, version) = self.hit_seq_version(&h.id, &ver);
+                        h.seq_no = seq_no;
+                        h.version = version;
+                    }
+                }
                 h
             })
             .collect()
@@ -20748,10 +20856,20 @@ impl Index {
                     if !seen.insert(id.clone()) {
                         continue;
                     }
+                    // Same read the winner's `_source` is hydrated from
+                    // (post-select_nth winners only) — not a later pass (#440).
+                    let (seq_no, version) = self
+                        .store
+                        .version_map
+                        .get(id)
+                        .map(|ver| self.hit_seq_version(id, &ver))
+                        .unwrap_or((None, None));
                     hits.push(Hit {
                         id: id.clone(),
                         score: 1.0,
                         source: (**source).clone(),
+                        seq_no,
+                        version,
                         sort: Vec::new(),
                         explain: None,
                         highlight: None,
@@ -20777,10 +20895,20 @@ impl Index {
                         continue;
                     }
                     let source = doc.get("_source").cloned().unwrap_or(doc);
+                    // Same read `source` was just parsed from — not a later
+                    // pass (#440).
+                    let (seq_no, version) = self
+                        .store
+                        .version_map
+                        .get(&id)
+                        .map(|ver| self.hit_seq_version(&id, &ver))
+                        .unwrap_or((None, None));
                     hits.push(Hit {
                         id,
                         score: 1.0,
                         source,
+                        seq_no,
+                        version,
                         sort: Vec::new(),
                         explain: None,
                         highlight: None,
@@ -22359,10 +22487,22 @@ impl Index {
                 continue;
             }
             let source = doc.get("_source").cloned().unwrap_or(doc);
+            // Same read `source` was just parsed from — not a later pass
+            // (#440). Not `_seq` (discarded above): that's the pre-hydration
+            // ranking key from `seg_seqs`, a different number from the
+            // ES-wire `_seq_no`/`_version` this resolves.
+            let (seq_no, version) = self
+                .store
+                .version_map
+                .get(&id)
+                .map(|ver| self.hit_seq_version(&id, &ver))
+                .unwrap_or((None, None));
             hits.push(Hit {
                 id,
                 score,
                 source,
+                seq_no,
+                version,
                 sort: Vec::new(),
                 explain: None,
                 highlight: None,
@@ -23564,6 +23704,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
+            // Captured from the SAME version-map entry the
+            // deleted/superseded check reads, so `_seq_no`/`_version` never
+            // diverge from the `source` parsed above (#440).
+            let mut hit_seq_no = None;
+            let mut hit_version = None;
             if let Some(ver) = self.store.version_map.get(id_ref) {
                 if ver.deleted {
                     continue;
@@ -23574,6 +23719,9 @@ impl Index {
                         continue;
                     }
                 }
+                let (s, v) = self.hit_seq_version(id_ref, &ver);
+                hit_seq_no = s;
+                hit_version = v;
             }
             *total_count += 1;
             if seen_ids.contains(id_ref) {
@@ -23594,12 +23742,14 @@ impl Index {
             }
             let id = id_ref.to_string();
             seen_ids.insert(id.clone());
-            let seq = self.lookup_seq_no(&id).unwrap_or(u64::MAX);
+            let seq = hit_seq_no.unwrap_or(u64::MAX);
             topk.offer_keyed(
                 Hit {
                     id,
                     score,
                     source: source_ref.clone(),
+                    seq_no: hit_seq_no,
+                    version: hit_version,
                     sort: key,
                     explain: None,
                     highlight: None,
@@ -23674,6 +23824,11 @@ impl Index {
                 Err(_) => continue,
             };
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
+            // Captured from the SAME version-map entry the
+            // deleted/superseded check reads, so `_seq_no`/`_version` never
+            // diverge from the `source` parsed above (#440).
+            let mut hit_seq_no = None;
+            let mut hit_version = None;
             if let Some(ver) = self.store.version_map.get(id_ref) {
                 if ver.deleted {
                     continue;
@@ -23684,6 +23839,9 @@ impl Index {
                         continue;
                     }
                 }
+                let (s, v) = self.hit_seq_version(id_ref, &ver);
+                hit_seq_no = s;
+                hit_version = v;
             }
             // Re-test the full query — the pre-filter is only a superset.
             let matched = if is_match_all {
@@ -23731,6 +23889,8 @@ impl Index {
                 id,
                 score,
                 source,
+                seq_no: hit_seq_no,
+                version: hit_version,
                 sort: Vec::new(),
                 explain: None,
                 highlight: None,
@@ -24202,6 +24362,11 @@ impl Index {
             };
 
             let id_ref = doc.get("_id").and_then(Value::as_str).unwrap_or("");
+            // Captured from the SAME version-map entry the
+            // deleted/superseded check reads, so `_seq_no`/`_version` never
+            // diverge from the `source` parsed above (#440).
+            let mut hit_seq_no = None;
+            let mut hit_version = None;
             if let Some(ver) = self.store.version_map.get(id_ref) {
                 if ver.deleted {
                     continue;
@@ -24216,6 +24381,9 @@ impl Index {
                         continue;
                     }
                 }
+                let (s, v) = self.hit_seq_version(id_ref, &ver);
+                hit_seq_no = s;
+                hit_version = v;
             }
 
             let matched = if is_match_all {
@@ -24291,12 +24459,14 @@ impl Index {
                 }
                 let id: String = id_ref.to_string();
                 seen_ids.insert(id.clone());
-                let seq = self.lookup_seq_no(&id).unwrap_or(u64::MAX);
+                let seq = hit_seq_no.unwrap_or(u64::MAX);
                 topk.offer_keyed(
                     Hit {
                         id,
                         score,
                         source: source_ref.clone(),
+                        seq_no: hit_seq_no,
+                        version: hit_version,
                         sort: key,
                         explain: None,
                         highlight: None,
@@ -24342,6 +24512,8 @@ impl Index {
                 id,
                 score,
                 source,
+                seq_no: hit_seq_no,
+                version: hit_version,
                 sort: Vec::new(),
                 explain: None,
                 highlight: None,
@@ -25855,6 +26027,8 @@ mod source_filter_tests {
             id: id.to_string(),
             score,
             source,
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -26054,6 +26228,8 @@ mod savings_tests {
             id: id.to_string(),
             score: 1.0,
             source,
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -29597,6 +29773,7 @@ fn apply_lexical_passages(hits: Vec<Hit>, query: &QueryNode) -> Vec<Hit> {
 /// `from`/`size`, and shape the response. Centralised so the exact and
 /// approximate paths cannot drift on hits format or total semantics.
 fn knn_result_from_scored(
+    index: &Index,
     request: &SearchRequest,
     vector_field: &str,
     mut scored: Vec<(String, f32, Value, Option<u32>)>,
@@ -29650,10 +29827,21 @@ fn knn_result_from_scored(
             .then(|| passage_match_from_source(&source, vector_field, ordinal))
             .flatten();
         strip_internal_passage_metadata(&mut source);
+        // Same read `source` was carried in from (already the bounded
+        // final page — `.skip/.take` above already applied) — not a
+        // later pass (#440).
+        let (seq_no, version) = index
+            .store
+            .version_map
+            .get(&id)
+            .map(|ver| index.hit_seq_version(&id, &ver))
+            .unwrap_or((None, None));
         Hit {
             id,
             score,
             source,
+            seq_no,
+            version,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42570,6 +42758,8 @@ mod lexical_passage_tests {
             id: "doc-1".into(),
             score: 1.0,
             source: json!({"body": body, "title": "unrelated", "page": 3}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42626,6 +42816,8 @@ mod lexical_passage_tests {
             id: "doc-1".into(),
             score: 1.0,
             source: json!({"body": body, "defs": "addReplyNull bulk"}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42661,6 +42853,8 @@ mod lexical_passage_tests {
             id: "doc-1".into(),
             score: 1.0,
             source: json!({"body": body, "language": "rust", "symbol_count": 1}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42702,6 +42896,8 @@ mod lexical_passage_tests {
             id: "doc-1".into(),
             score: 1.0,
             source: json!({"body": body}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42714,6 +42910,8 @@ mod lexical_passage_tests {
             // Same body, but with a stray `language` field and no
             // `symbol_count` — not autoindex's code-doc shape.
             source: json!({"body": body, "language": "rust"}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -42760,6 +42958,8 @@ mod lexical_passage_tests {
             id: "doc-1".into(),
             score: 1.0,
             source: json!({"body": "needle here\n"}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,

@@ -36,6 +36,8 @@ fn scroll_ctx(expires_in: i64) -> ScrollContext {
         hits: Vec::new(),
         position: 0,
         page_size: 10,
+        seq_no_primary_term: false,
+        version: false,
         created: now,
         keep_alive,
         expires_at,

@@ -10712,12 +10712,10 @@ async fn search_impl(
                 .get(&idx_name)
                 .copied()
                 .unwrap_or(u64::MAX);
-            let hit_seq = state
-                .engine
-                .get_index(&idx_name)
-                .ok()
-                .and_then(|idx| idx.lookup_seq_no(&h.id))
-                .unwrap_or(0);
+            // Read from the hit itself — resolved at construction time in
+            // the engine, from the same read as `_source` — rather than a
+            // live re-lookup here (#440).
+            let hit_seq = h.seq_no.unwrap_or(0);
             if hit_seq <= max_seq {
                 kept.push((idx_name, h));
             } else {
@@ -12070,15 +12068,12 @@ async fn search_impl(
                                 continue;
                             }
                             "_version" => {
-                                // Real per-doc `_version` via the same
-                                // resolver GET/_mget use (external-version
-                                // map wins, then the engine write counter).
-                                let v = state
-                                    .engine
-                                    .get_index(&idx_name)
-                                    .ok()
-                                    .and_then(|idx| idx.lookup_version(&h.id))
-                                    .unwrap_or(1);
+                                // Read from the hit itself — resolved at
+                                // construction time in the engine (same
+                                // external-version-map-wins resolver GET/
+                                // _mget use), not a later live re-lookup
+                                // here (#440).
+                                let v = h.version.unwrap_or(1);
                                 fmap.insert("_version".to_string(), Value::Array(vec![json!(v)]));
                                 continue;
                             }
@@ -13255,16 +13250,12 @@ async fn search_impl(
                 hit_inner_hits = Some(Value::Object(combined));
             }
 
-            // Pull the real seq_no (and a placeholder primary_term of 1)
-            // from the engine's version_map so multi-write docs surface
-            // their actual sequence number instead of a synthetic 0.
+            // Real seq_no (and a placeholder primary_term of 1), read from
+            // the hit itself — resolved at construction time in the engine,
+            // from the same read as `_source`, not a later live re-lookup
+            // here (#440).
             let (real_seq_no, real_primary_term) = if emit_seq_no {
-                let sn = state
-                    .engine
-                    .get_index(&idx_name)
-                    .ok()
-                    .and_then(|idx| idx.lookup_seq_no(&h.id))
-                    .unwrap_or(hit_idx as u64);
+                let sn = h.seq_no.unwrap_or(hit_idx as u64);
                 (Some(sn), Some(1u64))
             } else {
                 (None, None)
@@ -13288,16 +13279,13 @@ async fn search_impl(
                     None
                 },
                 version: if emit_version {
-                    // Real per-doc `_version` via the shared resolver
-                    // (external-version map wins so reindexes with
+                    // Real per-doc `_version`, read from the hit itself —
+                    // resolved at construction time in the engine (external-
+                    // version map wins so reindexes with
                     // `version_type=external[_gte]` echo the caller's
-                    // value, then the engine write counter).
-                    state
-                        .engine
-                        .get_index(&idx_name)
-                        .ok()
-                        .and_then(|idx| idx.lookup_version(&h.id))
-                        .or(Some(1))
+                    // value, then the engine write counter), not a later
+                    // live re-lookup here (#440).
+                    h.version.or(Some(1))
                 } else {
                     None
                 },
@@ -14263,6 +14251,11 @@ async fn search_impl(
             hits: snapshot,
             position: scroll_page_size,
             page_size: scroll_page_size,
+            // Captured once at open time (real ES semantics — see the
+            // field's doc comment) from the same flags that gated this
+            // first page's own `_seq_no`/`_version` emission above.
+            seq_no_primary_term: emit_seq_no,
+            version: emit_version,
             created: now,
             keep_alive,
             expires_at: now + keep_alive,
@@ -14433,42 +14426,7 @@ async fn search_impl(
     if any_disabled_seqno {
         if let Some(hits) = response_body.pointer_mut("/hits/hits") {
             if let Some(arr) = hits.as_array_mut() {
-                for hit in arr.iter_mut() {
-                    let ix = hit
-                        .get("_index")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let disabled = state
-                        .engine
-                        .index_settings
-                        .get(&ix)
-                        .map(|v| {
-                            let s = v.clone();
-                            let as_bool = |val: &Value| {
-                                val.as_bool().unwrap_or_else(|| {
-                                    val.as_str().map(|x| x == "true").unwrap_or(false)
-                                })
-                            };
-                            s.pointer("/index/disable_sequence_numbers")
-                                .map(as_bool)
-                                .unwrap_or(false)
-                                || s.get("index")
-                                    .and_then(|i| i.get("index.disable_sequence_numbers"))
-                                    .map(as_bool)
-                                    .unwrap_or(false)
-                                || s.get("index.disable_sequence_numbers")
-                                    .map(as_bool)
-                                    .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if disabled {
-                        if let Some(obj) = hit.as_object_mut() {
-                            obj.insert("_seq_no".into(), json!(-2i64));
-                            obj.insert("_primary_term".into(), json!(0));
-                        }
-                    }
-                }
+                apply_disable_seqno_sentinel(&state, arr);
             }
         }
     }
@@ -19834,17 +19792,34 @@ pub async fn search_with_scroll(
         // Index name stays paired with its hit (#414).
         let hits_only: Vec<(String, xerj_query::executor::Hit)> = all_hits.clone();
 
-        // Return first page.
+        // Control flags for meta-field emission — mirrors `search_impl`'s
+        // `emit_seq_no`/`emit_version` (es_compat.rs ~11349).
+        let emit_seq_no = body.seq_no_primary_term.unwrap_or(false);
+        let emit_version = body.version.unwrap_or(false);
+
+        // Return first page. `_seq_no`/`_version` are read from the hit
+        // itself — resolved at construction time in the engine, from the
+        // same read as `_source` — not hardcoded, and omitted entirely
+        // when not requested (#428/#440).
         let first_page: Vec<EsHit> = all_hits
             .iter()
             .take(page_size)
-            .map(|(idx_name, h)| EsHit {
+            .enumerate()
+            .map(|(hit_idx, (idx_name, h))| EsHit {
                 index: idx_name.clone(),
                 id: h.id.clone(),
                 score: Some(h.score as f64),
-                version: Some(1),
-                seq_no: Some(0),
-                primary_term: Some(1),
+                version: if emit_version {
+                    h.version.or(Some(1))
+                } else {
+                    None
+                },
+                seq_no: if emit_seq_no {
+                    Some(h.seq_no.unwrap_or(hit_idx as u64))
+                } else {
+                    None
+                },
+                primary_term: if emit_seq_no { Some(1) } else { None },
                 source: if h.source.is_null() {
                     None
                 } else {
@@ -19890,6 +19865,8 @@ pub async fn search_with_scroll(
             hits: hits_only,
             position: page_size,
             page_size,
+            seq_no_primary_term: emit_seq_no,
+            version: emit_version,
             created: now,
             keep_alive,
             expires_at: now + keep_alive,
@@ -20053,6 +20030,50 @@ pub async fn next_scroll_path(
     .await
 }
 
+/// Apply the ES `index.disable_sequence_numbers` sentinel — `_seq_no: -2`,
+/// `_primary_term: 0` — to every hit in `hits` whose own `_index` setting
+/// has it enabled. Shared by `search_impl` (plain `_search`) and
+/// `scroll_page_response` (#440: scroll had no equivalent at all, so a
+/// continuation page for such an index reported whatever `_seq_no` the
+/// snapshotted hit carried instead of the sentinel real ES uses).
+fn apply_disable_seqno_sentinel(state: &AppState, hits: &mut [Value]) {
+    for hit in hits.iter_mut() {
+        let ix = hit
+            .get("_index")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let disabled = state
+            .engine
+            .index_settings
+            .get(&ix)
+            .map(|v| {
+                let s = v.clone();
+                let as_bool = |val: &Value| {
+                    val.as_bool()
+                        .unwrap_or_else(|| val.as_str().map(|x| x == "true").unwrap_or(false))
+                };
+                s.pointer("/index/disable_sequence_numbers")
+                    .map(as_bool)
+                    .unwrap_or(false)
+                    || s.get("index")
+                        .and_then(|i| i.get("index.disable_sequence_numbers"))
+                        .map(as_bool)
+                        .unwrap_or(false)
+                    || s.get("index.disable_sequence_numbers")
+                        .map(as_bool)
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if disabled {
+            if let Some(obj) = hit.as_object_mut() {
+                obj.insert("_seq_no".into(), json!(-2i64));
+                obj.insert("_primary_term".into(), json!(0));
+            }
+        }
+    }
+}
+
 async fn scroll_page_response(
     state: &AppState,
     scroll_id: String,
@@ -20089,6 +20110,12 @@ async fn scroll_page_response(
             let page_size = ctx.page_size.max(1);
             let position = ctx.position;
             let total = ctx.hits.len() as u64;
+            // Captured once at scroll-open time (real ES semantics) — see
+            // `ScrollContext::seq_no_primary_term`/`::version`'s doc
+            // comments. Read into locals before the per-hit closure below
+            // borrows `ctx.hits`.
+            let emit_seq_no = ctx.seq_no_primary_term;
+            let emit_version = ctx.version;
 
             // Detect whether the initial search sorted by a non-score key;
             // in that case `max_score` must be null on scroll pages too.
@@ -20098,19 +20125,34 @@ async fn scroll_page_response(
                 .map(|(_, h)| !h.sort.is_empty())
                 .unwrap_or(false);
 
+            // `_seq_no`/`_version` are read from each hit itself — resolved
+            // at construction time in the engine, from the same read as
+            // `_source`, snapshotted into `ctx.hits` at scroll-open (a
+            // single request-duration window, never re-read live) — not
+            // hardcoded, and omitted when the flag wasn't requested
+            // (#428/#440).
             let page_hits: Vec<EsHit> = ctx
                 .hits
                 .iter()
                 .skip(position)
                 .take(page_size)
-                .map(|(hit_index, h)| EsHit {
+                .enumerate()
+                .map(|(hit_idx, (hit_index, h))| EsHit {
                     // Per-hit index, not the context-level one (#414).
                     index: hit_index.clone(),
                     id: h.id.clone(),
                     score: Some(h.score as f64),
-                    version: Some(1),
-                    seq_no: Some(0),
-                    primary_term: Some(1),
+                    version: if emit_version {
+                        h.version.or(Some(1))
+                    } else {
+                        None
+                    },
+                    seq_no: if emit_seq_no {
+                        Some(h.seq_no.unwrap_or(hit_idx as u64))
+                    } else {
+                        None
+                    },
+                    primary_term: if emit_seq_no { Some(1) } else { None },
                     source: if h.source.is_null() {
                         None
                     } else {
@@ -20148,6 +20190,51 @@ async fn scroll_page_response(
             } else {
                 page_hits.first().and_then(|h| h.score)
             };
+            let mut hits_json: Vec<Value> = page_hits
+                .iter()
+                .map(|h| {
+                    let mut o = serde_json::Map::new();
+                    o.insert("_index".to_string(), Value::String(h.index.clone()));
+                    o.insert("_id".to_string(), Value::String(h.id.clone()));
+                    o.insert(
+                        "_score".to_string(),
+                        match h.score {
+                            Some(s) => json!(s),
+                            None => Value::Null,
+                        },
+                    );
+                    // Previously always omitted regardless of `version`/
+                    // `seq_no_primary_term` — `EsHit` carried them but
+                    // this hand-built map never read them out (#428).
+                    if let Some(v) = h.version {
+                        o.insert("_version".to_string(), json!(v));
+                    }
+                    if let Some(sn) = h.seq_no {
+                        o.insert("_seq_no".to_string(), json!(sn));
+                    }
+                    if let Some(pt) = h.primary_term {
+                        o.insert("_primary_term".to_string(), json!(pt));
+                    }
+                    if let Some(src) = &h.source {
+                        o.insert("_source".to_string(), src.clone());
+                    }
+                    if let Some(sort) = &h.sort {
+                        o.insert("sort".to_string(), Value::Array(sort.clone()));
+                    }
+                    if let Some(fields) = &h.fields {
+                        o.insert(
+                            "fields".to_string(),
+                            serde_json::to_value(fields).unwrap_or(Value::Null),
+                        );
+                    }
+                    Value::Object(o)
+                })
+                .collect();
+            // `index.disable_sequence_numbers` sentinel (`_seq_no: -2`,
+            // `_primary_term: 0`) — scroll previously had no equivalent of
+            // `search_impl`'s handling at all (#440).
+            apply_disable_seqno_sentinel(state, &mut hits_json);
+
             let mut resp = json!({
                 "_scroll_id": scroll_id,
                 "took": 0u64,
@@ -20156,28 +20243,7 @@ async fn scroll_page_response(
                 "hits": {
                     "total": { "value": total, "relation": "eq" },
                     "max_score": max_score,
-                    "hits": page_hits.iter().map(|h| {
-                        let mut o = serde_json::Map::new();
-                        o.insert("_index".to_string(), Value::String(h.index.clone()));
-                        o.insert("_id".to_string(), Value::String(h.id.clone()));
-                        o.insert("_score".to_string(), match h.score {
-                            Some(s) => json!(s),
-                            None => Value::Null,
-                        });
-                        if let Some(src) = &h.source {
-                            o.insert("_source".to_string(), src.clone());
-                        }
-                        if let Some(sort) = &h.sort {
-                            o.insert("sort".to_string(), Value::Array(sort.clone()));
-                        }
-                        if let Some(fields) = &h.fields {
-                            o.insert(
-                                "fields".to_string(),
-                                serde_json::to_value(fields).unwrap_or(Value::Null),
-                            );
-                        }
-                        Value::Object(o)
-                    }).collect::<Vec<_>>()
+                    "hits": hits_json
                 }
             });
 
@@ -20214,6 +20280,8 @@ mod passage_scroll_tests {
             id: id.to_string(),
             score: 1.0,
             source: json!({"company": "ACME"}),
+            seq_no: None,
+            version: None,
             sort: Vec::new(),
             explain: None,
             highlight: None,
@@ -20244,6 +20312,8 @@ mod passage_scroll_tests {
                 ],
                 position: 1,
                 page_size: 1,
+                seq_no_primary_term: false,
+                version: false,
                 created: now,
                 keep_alive: Duration::from_secs(60),
                 expires_at: now + Duration::from_secs(60),
@@ -20300,6 +20370,8 @@ mod passage_scroll_tests {
                 ],
                 position: 1,
                 page_size: 1,
+                seq_no_primary_term: false,
+                version: false,
                 created: now,
                 keep_alive: Duration::from_secs(60),
                 expires_at: now + Duration::from_secs(60),
@@ -20352,6 +20424,8 @@ mod passage_scroll_tests {
                 ],
                 position: 1,
                 page_size: 1,
+                seq_no_primary_term: false,
+                version: false,
                 created: now,
                 keep_alive: Duration::from_secs(60),
                 expires_at: now + Duration::from_secs(60),
