@@ -954,8 +954,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `term` on an analysed field in a serving path.
 
   Two things this change does **not** do. It does not touch the other half of
-  #423 (which consolidated #362, closed `not_planned` for that reason) — `case_insensitive` accepted and silently dropped on
-  `prefix`/`wildcard` — so the issue's headline symptom survives:
+  #423, which consolidated #362 (closed `not_planned` for that reason) — `case_insensitive` accepted and silently dropped on
+  `prefix`/`wildcard`, the term/prefix case-folding split #362 reported:
   `{"term":{"title":"TestSegmentReader.java"}}` still answers `1` while
   `{"prefix":{"title":"TestSeg"}}` answers `0`. And it is not the narrower fix
   the issue thread proposed (dropping the lowercase retry the shortcut did on a
