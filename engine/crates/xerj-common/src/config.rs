@@ -1350,9 +1350,19 @@ impl Default for EmbeddingConfig {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Sentinel value of [`LimitsConfig::max_process_memory_mb`] meaning **AUTO**:
+/// pick the process-memory cap from the machine size in binary-GiB steps
+/// (8 / 16 / 32 GiB) rather than a flat number. It is the serde default, so an
+/// omitted field resolves to AUTO; the governor intercepts it before any budget
+/// math, so this literal never reaches a budget as a byte count. `u64::MAX` is
+/// used because no operator sets a 16-EiB cap — it is a reserved, unmistakable
+/// "not a real MiB value" marker, distinct from `0` (uncapped, the whole
+/// machine) and every plausible explicit MiB ceiling.
+pub const AUTO_PROCESS_MEMORY_MB: u64 = u64::MAX;
+
 /// Resource limits.
 ///
-/// **13 settings.**
+/// **14 settings.**
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -1441,26 +1451,34 @@ pub struct LimitsConfig {
     /// WAL. The block clears automatically once usage drops back below the
     /// threshold. Set to `0` to disable the disk watermark.
     pub disk_flood_stage_percent: u8,
-    /// Hard ceiling on the machine size every other memory budget is derived
-    /// FROM, in MiB (default: `8192` = 8 GiB; `0` disables the cap).
+    /// Ceiling on the machine size every other memory budget is derived FROM,
+    /// in MiB. **Omitted / default = AUTO** ([`AUTO_PROCESS_MEMORY_MB`]): XERJ
+    /// picks the cap from the effective (cgroup-aware) memory it can actually
+    /// see, in binary-GiB steps —
     ///
-    /// Without this, XERJ sizes itself to the machine. Every budget in
-    /// `ResourceGovernor` derives from `effective_memory_limit_bytes()`, which
-    /// is min(cgroup limit, total system RAM) — so with no cgroup, which is the
-    /// normal laptop and macOS case, the derivation base is the whole machine:
+    ///   effective < 64 GiB             → 8 GiB cap
+    ///   64 GiB ≤ effective < 128 GiB   → 16 GiB cap
+    ///   effective ≥ 128 GiB            → 32 GiB cap
     ///
-    ///   64 GiB host   memtables 25% = 16 GiB, hydration 20% = 12.8 GiB,
-    ///                 RSS watermark 95% = 60.8 GiB
+    /// so a laptop is never sized for ~20 GiB of memtables and a big server is
+    /// no longer starved by a flat 8 GiB. Every budget in `ResourceGovernor`
+    /// derives from `effective_memory_limit_bytes()` = min(cgroup limit, total
+    /// system RAM); capping that ONE base is what makes every dependent budget
+    /// shrink coherently instead of each growing its own ceiling.
     ///
-    /// A bigger machine therefore bought a hungrier XERJ rather than a faster
-    /// one, and users reported ~20 GiB resident for two indexed projects. This
-    /// caps the derivation base itself, so every dependent budget shrinks
-    /// coherently instead of each one growing its own ceiling.
+    /// The cap only ever LOWERS the base — `min(machine, cap)`, never invented
+    /// headroom: on a 40 GiB box the 8 GiB tier still yields 8, and under a
+    /// smaller cgroup limit the smaller value wins. Two explicit escape hatches:
     ///
-    /// The cap only ever LOWERS the base: on a machine smaller than the cap, or
-    /// under a smaller cgroup limit, the smaller value still wins. Raise it if
-    /// you are running a dedicated box and want the old machine-proportional
-    /// behaviour, or set `0` to remove the ceiling entirely.
+    ///   * `0`  → NO cap: derive every budget from the whole machine (the old
+    ///     machine-proportional behaviour; a 64 GiB host then asks for
+    ///     ~16 GiB of memtables before anything else allocates).
+    ///   * `N`  (N > 0) → force a fixed ceiling of exactly N MiB, still min'd
+    ///     with the machine.
+    ///
+    /// Override at runtime without editing config via the environment:
+    /// `XERJ_MAX_PROCESS_MEMORY_MB=auto|off|<MiB>` (env wins over this value;
+    /// `off`/`unlimited` == `0`; a bare `0` is ambiguous and falls back here).
     pub max_process_memory_mb: u64,
 }
 
@@ -1480,7 +1498,9 @@ impl Default for LimitsConfig {
             max_segment_hydration_cache_mb: 0, // 0 = 20% effective memory, no floor
             memory_watermark_percent: 95,
             disk_flood_stage_percent: 95,
-            max_process_memory_mb: 8192, // 8 GiB; 0 = derive from the machine
+            // AUTO: tier the cap (8/16/32 GiB) off the machine at governor
+            // build time. 0 = uncapped (whole machine); N = a fixed MiB cap.
+            max_process_memory_mb: AUTO_PROCESS_MEMORY_MB,
         }
     }
 }
