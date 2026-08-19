@@ -208,9 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original run gave — there is no signal that anything is now recoverable.
 
   With `--no-graph` the file is re-sniffed and then has to be re-admitted, which
-  is decided by four gates in `classify_new` (`reconcile_plan.rs:279-323`): the
+  is decided by four gates in `classify_new` (`reconcile_plan.rs:279-323`) — the
   family/group filter, `ensure_compatible`, a field-overlap threshold, and a
-  refusal when two frozen datasets match equally well. All three outcomes are
+  refusal when two frozen datasets match equally well — which between them select
+  one of three outcomes. All three are
   reachable — the file is recovered in place, or the run aborts naming it, or it
   stays junk — and which one you get depends on what the other files in the
   corpus froze into the plan. This entry deliberately does not predict it: six

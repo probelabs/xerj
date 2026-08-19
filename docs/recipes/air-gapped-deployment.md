@@ -148,10 +148,15 @@ this was measured:
   dropped session leaves the tree". Also false, and the interesting part is how:
   the measurement behind it signalled the wrapping `bash script.sh` process
   instead of the forked subshell that actually owns the trap, so the trap was
-  never asked to run. Signal the subshell and it runs — `SIGTERM`, `SIGHUP` and
-  `SIGINT` all clean, verified in a real pty with the signal landing provably
-  mid-`tar`. Three of this page's wrong sentences now trace to a harness that
-  measured the wrong thing rather than to the shell behaving unexpectedly.
+  never asked to run. Signal the subshell alone and it runs — `SIGTERM`,
+  `SIGHUP` and `SIGINT` all clean, verified in a real pty with the signal
+  landing provably mid-`tar`. The exception, and the reason the lead singles it
+  out, is `SIGTERM` to the whole process group — how `timeout`, a CI runner and
+  systemd deliver it — where `rm -rf` is killed alongside the shell and the tree
+  survives. Three of this page's wrong sentences trace to a harness that measured
+  the wrong thing rather than to the shell behaving unexpectedly; this last
+  distinction is a fourth thing the harness could not see, because it never
+  signalled the group.
 
 Hence the form above: the body is `"$STAGE"`, relative to the directory the
 block already `cd`-ed into and never leaves, and the `trap` is installed
