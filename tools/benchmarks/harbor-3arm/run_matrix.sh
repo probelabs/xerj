@@ -28,10 +28,15 @@ case "$ARM" in
   *) echo "unknown arm: $ARM" >&2; exit 2 ;;
 esac
 CELL="$BENCH.$MODEL.$ARM"; JOB_DIR="$JOBS_ROOT/$CELL"; mkdir -p "$JOBS_ROOT"
+# One driver per cell, ever: a second harbor process on the same job dir
+# corrupts trials (measured 2026-08-19, duplicate-runner incident).
+exec 9>"$JOBS_ROOT/.$CELL.lock"
+flock -n 9 || { echo "cell $CELL already has a running driver — refusing"; exit 3; }
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
-AUTH_ARGS=(--ae "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN" --ae "CLAUDE_FORCE_OAUTH=true")
+export CLAUDE_FORCE_OAUTH="${CLAUDE_FORCE_OAUTH:-true}"
+AUTH_ARGS=(--ae "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN" --ae "CLAUDE_FORCE_OAUTH=$CLAUDE_FORCE_OAUTH")
 [ -n "${ANTHROPIC_API_KEY:-}" ] && AUTH_ARGS+=(--ae "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
-if [ -d "$JOB_DIR" ]; then echo "== resuming $CELL"; exec "$HARBOR" job resume "$JOB_DIR" "$@"; fi
+if [ -d "$JOB_DIR" ]; then echo "== resuming $CELL"; exec "$HARBOR" job resume -p "$JOB_DIR" -f ApiRateLimitError; fi
 echo "== starting $CELL (agent=$AGENT)"
 exec "$HARBOR" run "${DATASET[@]}" -a "$AGENT" -m "$MODEL" \
   --jobs-dir "$JOBS_ROOT" --job-name "$CELL" -n "${CONCURRENT:-4}" -y \
