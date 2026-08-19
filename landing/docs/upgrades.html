@@ -127,18 +127,37 @@ $ curl -sXPOST -H "Authorization: ApiKey $XERJ_API_KEY" \
     http://127.0.0.1:8080/v1/admin/backup \
     -d '{"destination":"s3://my-backups/xerj/pre-upgrade"}'
 
-# 2. Fetch the new release
-$ curl -sLO https://xerj.org/releases/xerj-0.2.0-linux-x86_64.tar.gz
-$ tar xzf xerj-0.2.0-linux-x86_64.tar.gz
+# 2. Fetch and verify the new release — extraction is chained to the checksum,
+#    so an archive that fails to verify is never unpacked over the running node
+$ (
+    ver=1.0.0-rc.18                             # the release you are upgrading to
+    target=x86_64-unknown-linux-musl            # your platform's target triple
+    stage="xerj-${ver}-${target}"
+    asset="${stage}.tar.gz"
+    base="https://github.com/xerj-org/xerj/releases/download/v${ver}"
 
-# 3. Replace the binary in place
+    curl -fsSLO "$base/$asset"
+    curl -fsSLO "$base/$asset.sha256"
+
+    want=$( { sha256sum "$asset" 2&gt;/dev/null || shasum -a 256 "$asset"; } | cut -d ' ' -f 1 )
+    printf %s "$want" | LC_ALL=C grep -qE '^[0-9a-f]{64}$' \
+      || { echo "no working SHA-256 tool — refusing to install an unverified $asset" &gt;&amp;2; exit 1; }
+
+    tr -d '\r' &lt; "$asset.sha256" \
+      | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
+      || { echo "CHECKSUM MISMATCH for $asset — do not install it" &gt;&amp;2; exit 1; }
+
+    tar xzf "$asset"
+  )
+
+# 3. Replace the binary in place (reached only when step 2 verified and unpacked)
 $ sudo systemctl stop xerj
-$ sudo install -m 0755 xerj /usr/local/bin/xerj
+$ sudo install -m 0755 "xerj-1.0.0-rc.18-x86_64-unknown-linux-musl/xerj" /usr/local/bin/xerj
 $ sudo systemctl start xerj
 
-# 4. Confirm
+# 4. Confirm the node reports the version you just installed
 $ curl -s http://127.0.0.1:8080/v1/health | jq .version
-"0.2.0"</pre>
+"1.0.0-rc.18"</pre>
 
   <p>Downtime is the time it takes the WAL to replay — usually a few seconds for workloads in the low millions of live docs.</p>
 

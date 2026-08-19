@@ -349,8 +349,25 @@ footer .links { display: flex; gap: 28px; flex-wrap: wrap; }
     is already running on port 9200.
   </p>
 
-  <pre class="cmd"><span class="prompt">$ </span>curl -L -o xerj.tar.gz https://github.com/xerj-org/xerj/releases/download/v1.0.0-rc.1/xerj-1.0.0-rc.1-x86_64-unknown-linux-gnu.tar.gz
-<span class="prompt">$ </span>tar xzf xerj.tar.gz
+  <pre class="cmd"><span class="prompt">$ </span>(
+    ver=1.0.0-rc.1                              # this demo was captured on rc.1
+    stage="xerj-${ver}-x86_64-unknown-linux-gnu"
+    asset="${stage}.tar.gz"
+    base="https://github.com/xerj-org/xerj/releases/download/v${ver}"
+
+    curl -fsSLO "$base/$asset"
+    curl -fsSLO "$base/$asset.sha256"
+
+    want=$( { sha256sum "$asset" 2&gt;/dev/null || shasum -a 256 "$asset"; } | cut -d ' ' -f 1 )
+    printf %s "$want" | LC_ALL=C grep -qE '^[0-9a-f]{64}$' \
+      || { echo "no working SHA-256 tool — refusing to run an unverified $asset" &gt;&amp;2; exit 1; }
+
+    tr -d '\r' &lt; "$asset.sha256" \
+      | LC_ALL=C grep -qxF -e "$want  $asset" -e "$want *$asset" \
+      || { echo "CHECKSUM MISMATCH for $asset — do not run it" &gt;&amp;2; exit 1; }
+
+    tar xzf "$asset" &amp;&amp; mv "$stage/xerj" ./xerj
+  )
 <span class="prompt">$ </span>./xerj --insecure --data-dir ./data
 <span class="out">2026-04-27T19:11:41.6Z  INFO xerj: xerj v1.0.0-rc.1 starting
 2026-04-27T19:11:41.6Z  WARN xerj: --insecure: TLS and auth disabled
