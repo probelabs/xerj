@@ -2361,17 +2361,21 @@ mod tests {
         assert_eq!(base.must.len(), CLAUSE_POLL_INTERVAL);
 
         // Precondition: without the excluding conjunct the document survives,
-        // so a later empty result can only come from the guard.
-        let control = FtsSearcher::new(Arc::clone(&reader), Arc::clone(&registry))
-            .with_deadline(Some(std::time::Instant::now() + budget));
+        // so a later empty result can only come from the guard. This control
+        // runs with NO deadline on purpose — it only has to prove the base
+        // query matches doc 0. Sharing the real arm's tight budget here made
+        // the precondition itself load-sensitive: under CI load the control's
+        // deadline expired before the intersection finished and this assertion
+        // tripped spuriously (#510). The deadline belongs only on the arm below,
+        // which is the one that actually tests deadline behaviour.
+        let control = FtsSearcher::new(Arc::clone(&reader), Arc::clone(&registry));
         let control_hits = control
             .search(&Query::Bool(Box::new(base.clone())), 10, false)
             .unwrap();
         assert_eq!(
             control_hits.len(),
             1,
-            "precondition: the must clauses must have intersected to the \
-             document before the budget ({budget:?}) ran out"
+            "precondition: the base must clauses must intersect to the document"
         );
 
         // `zebrafish` is in no document, so a FULL evaluation excludes doc 0.
