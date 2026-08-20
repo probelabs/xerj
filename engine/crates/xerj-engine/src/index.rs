@@ -11287,6 +11287,72 @@ impl Index {
         Ok(result)
     }
 
+    /// True iff at least one indexed document carries a numeric-array vector at
+    /// `field` — the execution-truth signal that a field CAN answer a vector
+    /// query even when it was never declared `dense_vector`. This is the case a
+    /// schema-only (or `hnsw_field`) check gets wrong: a field seeded with, say,
+    /// 256 undeclared vectors is below `HNSW_MIN_DOCS`, so no graph exists and
+    /// `hnsw_field` is `None`, yet the field is fully brute-force answerable
+    /// (#498/#529). Early-exits on the first hit and is only invoked on an empty
+    /// knn result, so it never runs on the hot path.
+    async fn index_has_any_vector_at(&self, field: &str) -> bool {
+        for (_id, source) in self.memtable.all_docs_with_sources() {
+            if extract_numeric_vector(&source, field).is_some() {
+                return true;
+            }
+        }
+        let snap = self.store.snapshot();
+        for meta in snap.segments.iter() {
+            if let Some(docs) = self.stored_values_for_async(&meta.id).await {
+                for doc in docs.iter() {
+                    let src = doc.get("_source").unwrap_or(doc);
+                    if extract_numeric_vector(src, field).is_some() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// #498: reject a `knn`/`semantic` clause naming a field the index cannot
+    /// answer with a `400`, instead of the silent empty `200` it used to return.
+    /// "Cannot answer" is execution truth: the field is neither declared
+    /// `dense_vector`/`semantic_text` NOR does any indexed document carry a
+    /// vector for it. A declared-but-empty vector field, and an undeclared field
+    /// that nonetheless holds indexed vectors, both legitimately return an empty
+    /// result — only a genuinely non-vector field is rejected (the distinction
+    /// #529's mapping-only gate got wrong). Called only on an empty, non-timed-
+    /// out result, so the extra scan never touches the hot path.
+    async fn reject_unanswerable_knn_field(&self, field: &str) -> Result<()> {
+        {
+            let schema = self.schema.read().await;
+            if collect_dense_vector_fields(&schema.schema)
+                .iter()
+                .any(|f| f == field)
+            {
+                return Ok(());
+            }
+            if schema
+                .schema
+                .field(field)
+                .is_some_and(|fc| fc.embedding.is_some())
+            {
+                return Ok(());
+            }
+        }
+        if self.index_has_any_vector_at(field).await {
+            return Ok(());
+        }
+        Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+            format!(
+                "[knn] query field [{field}] is not a vector field: it is absent from the \
+                 mapping and carries no indexed vector data. Map it as [dense_vector] (or \
+                 [semantic_text]) before running vector search."
+            ),
+        )))
+    }
+
     /// Brute-force nested KNN: score each parent by the best (max)
     /// similarity among its `<nested_path>` array elements.
     ///
@@ -13984,39 +14050,50 @@ impl Index {
             // SET can differ slightly from exact; aggregations over that set
             // must be exact (analytics counts, not ranked hits), so we do not
             // let ANN approximation leak into agg buckets.
-            if filter_opt.is_none()
+            let plain = filter_opt.is_none()
                 && boost.is_none()
                 && min_similarity.is_none()
-                && request.aggs.is_none()
-            {
-                if let Some(result) = self
-                    .run_knn_hnsw(
-                        request,
-                        search_deadline,
-                        &field,
-                        &query_vec,
-                        k,
-                        num_candidates,
-                        &similarity,
-                    )
-                    .await
-                {
-                    return Ok(result);
-                }
-            }
-            return self
-                .run_knn_brute_force_with_deadline(
+                && request.aggs.is_none();
+            let hnsw = if plain {
+                self.run_knn_hnsw(
                     request,
                     search_deadline,
                     &field,
                     &query_vec,
                     k,
-                    filter_opt,
+                    num_candidates,
                     &similarity,
-                    boost,
-                    min_similarity,
                 )
-                .await;
+                .await
+            } else {
+                None
+            };
+            let result = match hnsw {
+                Some(result) => result,
+                None => {
+                    self.run_knn_brute_force_with_deadline(
+                        request,
+                        search_deadline,
+                        &field,
+                        &query_vec,
+                        k,
+                        filter_opt,
+                        &similarity,
+                        boost,
+                        min_similarity,
+                    )
+                    .await?
+                }
+            };
+            // #498: a knn naming a field the index cannot answer must fail with a
+            // 400, not return a silent empty 200. Checked only on a genuinely
+            // empty, non-timed-out result, so the hot path is untouched and a
+            // declared-but-empty (or indexed-but-undeclared) vector field still
+            // returns its real empty result.
+            if result.hits.is_empty() && !result.timed_out {
+                self.reject_unanswerable_knn_field(&field).await?;
+            }
+            return Ok(result);
         }
         // PURE multi-KNN (the ES `knn: [...]` array form): every clause runs
         // its own exact top-k, scores are SUMMED for docs found by more than
