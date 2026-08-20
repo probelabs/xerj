@@ -1146,6 +1146,7 @@ pub async fn create_index(
                     .engine
                     .index_alias_metadata
                     .insert(index.clone(), Value::Object(resolved_aliases));
+                state.engine.flush_alias_metadata();
             }
 
             // ES-shape lifecycle attach: `index.lifecycle.name` in create-time
@@ -19574,6 +19575,7 @@ pub async fn put_alias(
                 .engine
                 .index_alias_metadata
                 .insert(idx_name.to_string(), existing);
+            state.engine.flush_alias_metadata();
         }
         Ok(())
     };

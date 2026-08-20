@@ -988,6 +988,10 @@ impl Engine {
             // restart, mistaking a missing-alias 404 for a still-in-progress
             // migration by another instance).
             engine.load_persisted_aliases();
+            // …and the alias filter metadata that pairs with that topology, or
+            // a filtered alias comes back unfiltered — wrong reads, and a
+            // by-query that empties the whole backing index (#524).
+            engine.load_alias_metadata();
 
             // Restore the cluster-level management state — index templates,
             // legacy templates, component templates, ingest pipelines, data
@@ -1752,6 +1756,73 @@ impl Engine {
             }
             Err(e) => {
                 warn!(error = %e, "ignoring corrupt aliases.json");
+            }
+        }
+    }
+
+    // ── Alias filter metadata durability (issue #524) ───────────────────────
+
+    /// Path of the persisted alias-metadata sidecar
+    /// (`<data_dir>/alias_metadata.json`).
+    ///
+    /// A SEPARATE file from `aliases.json` (which persists only the
+    /// alias→members topology) on purpose. Each alias's `filter` (and the
+    /// other create-time metadata) lived only in the in-memory
+    /// `index_alias_metadata` map and evaporated on restart, so a filtered
+    /// alias came back with its members but no filter — wrong `_search` /
+    /// `_count` results, and once the by-query paths honour the filter, a
+    /// `_delete_by_query` that empties the whole backing index instead of the
+    /// slice the filter names (#524). A separate file keeps `aliases.json`'s
+    /// shape unchanged; an older binary simply ignores this one, the same
+    /// downgrade-safe call the ingest-pipeline-refusals sidecar makes.
+    fn alias_metadata_path(&self) -> PathBuf {
+        self.data_dir.join("alias_metadata.json")
+    }
+
+    /// Serialize `index_alias_metadata` to disk atomically (temp-file +
+    /// rename), mirroring [`Engine::flush_aliases`]. Called after every
+    /// mutation of the map; a write failure is logged but non-fatal (the
+    /// filter still applies in-memory until the next restart).
+    pub fn flush_alias_metadata(&self) {
+        let snapshot: std::collections::HashMap<String, serde_json::Value> = self
+            .index_alias_metadata
+            .iter()
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+        let bytes = match serde_json::to_vec_pretty(&snapshot) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize alias metadata for persistence");
+                return;
+            }
+        };
+        if let Err(e) = crate::index::write_file_atomic(&self.alias_metadata_path(), &bytes) {
+            warn!(error = %e, "failed to persist alias_metadata.json (alias filters work until restart)");
+        }
+    }
+
+    /// Load persisted alias metadata from `<data_dir>/alias_metadata.json` into
+    /// the in-memory map on boot. A missing file is normal (fresh node, or a
+    /// node whose aliases were all created by a build that predates this
+    /// sidecar); a corrupt file is logged and ignored.
+    fn load_alias_metadata(&self) {
+        let path = self.alias_metadata_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        match serde_json::from_slice::<std::collections::HashMap<String, serde_json::Value>>(&bytes)
+        {
+            Ok(map) => {
+                let n = map.len();
+                for (index, meta) in map {
+                    self.index_alias_metadata.insert(index, meta);
+                }
+                if n > 0 {
+                    info!(count = n, "restored persisted alias metadata");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "ignoring corrupt alias_metadata.json");
             }
         }
     }
@@ -2958,6 +3029,7 @@ impl Engine {
         self.index_settings.remove(name);
         self.index_mappings.remove(name);
         self.index_alias_metadata.remove(name);
+        self.flush_alias_metadata();
 
         // The WAL tap's cursor is a byte offset into a WAL stream that has
         // just ceased to exist. Dropping it HERE, rather than waiting for a
