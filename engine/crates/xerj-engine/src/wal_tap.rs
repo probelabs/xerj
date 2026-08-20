@@ -84,7 +84,11 @@
 //! included. On an index that has been running long enough to prune, at the
 //! end: the surviving generations are an arbitrary recent slice, and shipping
 //! them would look like a backfill without being one. **There is no backfill.**
-//! Seed the target with snapshot/restore if it needs the existing documents.
+//! Seed the target with the existing documents first if it needs them.
+//! snapshot/restore only seeds another XERJ node — XERJ's snapshot format
+//! (WAL + segments) is engine-specific and cannot be restored into an
+//! Elasticsearch/OpenSearch target; seed a cross-engine target with an
+//! external scan-and-push of the current documents (`_search`/PIT -> `_bulk`).
 //!
 //! **4b. What falling behind costs.** WAL retention is *not* coupled to the
 //! tap, deliberately: `IndexStore::wal_maintain_all_verified` deletes a
