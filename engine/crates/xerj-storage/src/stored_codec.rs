@@ -6,9 +6,13 @@
 //! |----------|---------|----------------------------------------------------|
 //! | `LZ4\0`  | v1      | LZ4 over a flat JSON array `[{_id,_seq_no,_source}]`|
 //! | `ZBS2`   | v2      | Columnar block — per-column codec, cross-col dep, dict+bitpack |
+//! | `ZBS3`   | v3      | A sparse present-null sidecar wrapping a `ZBS2` blob (#415) |
 //!
 //! The decoder detects the magic and returns a canonical JSON-array payload
-//! for both, so callers upstream do not need to change.
+//! for all three, so callers upstream do not need to change. `ZBS3` is
+//! emitted only for segments that carry a *present* explicit `_source` null
+//! (see [`wrap_stored_v3`]); every null-free segment stays byte-identical
+//! `ZBS2`.
 //!
 //! V2 format exists because v1 LZ4 over flat JSON leaves structural
 //! redundancy on the table: every row repeats the schema keys, and numeric
@@ -122,6 +126,21 @@ pub fn encode_stored_lz4(uncompressed: &[u8]) -> Vec<u8> {
 
 /// Magic prefix for the V2 columnar format.
 pub const STORED_V2_MAGIC: &[u8; 4] = b"ZBS2";
+
+/// Magic prefix for the V3 wrapper (issue #415): a plain ZBS2 blob preceded
+/// by a sparse present-null sidecar. The columnar V2 form stores an absent
+/// field and a *present* explicit `null` identically (a NULL column slot),
+/// so decode alone cannot tell them apart and drops both. V3 records the
+/// `(doc_ord, col_ix)` positions that were a present explicit null so decode
+/// re-inserts exactly those keys. Emitted ONLY for segments that actually
+/// contain an explicit `_source` null — every other segment stays
+/// byte-identical ZBS2, so the flush-parity contract and downgrade blast
+/// radius are unchanged for the common case. See [`wrap_stored_v3`].
+pub const STORED_V3_MAGIC: &[u8; 4] = b"ZBS3";
+
+/// The parsed contents of a ZBS3 wrapper: the present-null `(doc_ord, col_ix)`
+/// positions and the inner ZBS2 blob (which still carries its own magic).
+type StoredV3Parts<'a> = (Vec<(u32, u32)>, &'a [u8]);
 
 /// Minimum document count to bother with the columnar path.  Below this,
 /// the per-column header overhead dominates and flat LZ4 wins.
@@ -258,24 +277,36 @@ pub fn encode_stored_v2_at_level(stored_docs_json: &[u8], level: i32) -> Vec<u8>
     let mut columns: Vec<Vec<&serde_json::Value>> =
         vec![Vec::with_capacity(num_docs); col_order.len()];
 
-    for doc in &docs {
+    // Present explicit `_source` nulls (issue #415): recorded as
+    // `(doc_ord, col_ix)` so decode can distinguish them from absent fields
+    // (both encode to a NULL column slot). Must match the set discovered by
+    // `encode_stored_v2_from_values_inner` for the same docs — `wrap_stored_v3`
+    // sorts, so discovery order is irrelevant to the flush-parity contract.
+    let mut present_nulls: Vec<(u32, u32)> = Vec::new();
+    for (doc_idx, doc) in docs.iter().enumerate() {
         // __id and __seq_no
         columns[0].push(doc.get("_id").unwrap_or(&NULL));
         columns[1].push(doc.get("_seq_no").unwrap_or(&NULL));
 
         let src_obj = doc.get("_source").and_then(|s| s.as_object());
         for (cix, cname) in col_order.iter().enumerate().skip(2) {
-            let val = src_obj.and_then(|m| m.get(cname)).unwrap_or(&NULL);
-            columns[cix].push(val);
+            let looked = src_obj.and_then(|m| m.get(cname));
+            if looked.is_some_and(serde_json::Value::is_null) {
+                present_nulls.push((doc_idx as u32, cix as u32));
+            }
+            columns[cix].push(looked.unwrap_or(&NULL));
         }
     }
 
-    encode_v2_columns(
-        num_docs,
-        &col_order,
-        &columns,
-        Some(stored_docs_json),
-        level,
+    wrap_stored_v3(
+        encode_v2_columns(
+            num_docs,
+            &col_order,
+            &columns,
+            Some(stored_docs_json),
+            level,
+        ),
+        present_nulls,
     )
 }
 
@@ -373,6 +404,10 @@ fn encode_stored_v2_from_values_inner(
     // ~2× the map lookups — measured at ~115 ms per 31k-doc flush.
     let mut columns: Vec<Vec<&serde_json::Value>> =
         vec![Vec::with_capacity(num_docs), Vec::with_capacity(num_docs)];
+    // Present explicit `_source` nulls (issue #415) — see the sibling
+    // collection in `encode_stored_v2_at_level`. `wrap_stored_v3` sorts, so
+    // this path's per-doc key iteration order need not match that path's.
+    let mut present_nulls: Vec<(u32, u32)> = Vec::new();
     for (i, (_, _, src)) in docs.iter().enumerate() {
         columns[0].push(&ids[i]);
         columns[1].push(&seqs[i]);
@@ -397,6 +432,9 @@ fn encode_stored_v2_from_values_inner(
                         cix
                     }
                 };
+                if val.is_null() {
+                    present_nulls.push((i as u32, cix as u32));
+                }
                 let col = &mut columns[cix];
                 // A duplicate key inside one object is impossible
                 // (serde Map), so len == i here means every earlier pad
@@ -423,12 +461,15 @@ fn encode_stored_v2_from_values_inner(
     // Flush-only entry point — pinned to the flush level, never the
     // operator's (#318): raising the level here is the ingest regression
     // documented on `STORED_ZSTD_LEVEL`.
-    encode_v2_columns(
-        num_docs,
-        &col_order,
-        &columns,
-        stored_docs_json,
-        STORED_ZSTD_LEVEL,
+    wrap_stored_v3(
+        encode_v2_columns(
+            num_docs,
+            &col_order,
+            &columns,
+            stored_docs_json,
+            STORED_ZSTD_LEVEL,
+        ),
+        present_nulls,
     )
 }
 
@@ -602,13 +643,80 @@ fn encode_v2_columns(
     out
 }
 
+/// Wrap a freshly-encoded ZBS2 blob with a sparse present-null sidecar
+/// (issue #415), producing a ZBS3 blob. Returns `zbs2` **unchanged** when
+/// there are no present explicit nulls, or when the blob is not ZBS2 — the
+/// LZ4/v1 fallback (`encode_v2_columns`'s "never make things worse" net)
+/// stores `_source` verbatim and therefore never drops nulls. This keeps
+/// every null-free segment byte-identical ZBS2 (flush-parity contract).
+///
+/// Layout: `[b"ZBS3"][u32 count][ (u32 doc_ord, u32 col_ix) × count ][ ZBS2 blob ]`.
+/// `present_nulls` is sorted here so the two V2 encoders — which discover
+/// nulls in different orders — emit byte-identical bytes.
+fn wrap_stored_v3(zbs2: Vec<u8>, mut present_nulls: Vec<(u32, u32)>) -> Vec<u8> {
+    if present_nulls.is_empty() || zbs2.len() < 4 || &zbs2[..4] != STORED_V2_MAGIC {
+        return zbs2;
+    }
+    present_nulls.sort_unstable();
+    let mut out = Vec::with_capacity(zbs2.len() + 8 + present_nulls.len() * 8);
+    out.extend_from_slice(STORED_V3_MAGIC);
+    out.extend_from_slice(&(present_nulls.len() as u32).to_le_bytes());
+    for (doc, col) in &present_nulls {
+        out.extend_from_slice(&doc.to_le_bytes());
+        out.extend_from_slice(&col.to_le_bytes());
+    }
+    out.extend_from_slice(&zbs2);
+    out
+}
+
+/// Parse a ZBS3 wrapper into its `(present_nulls, inner_zbs2_blob)`. The
+/// caller must have verified `bytes[..4] == STORED_V3_MAGIC`. The returned
+/// inner slice still carries its own `ZBS2` magic.
+fn split_stored_v3(bytes: &[u8]) -> Result<StoredV3Parts<'_>> {
+    let count = bytes
+        .get(4..8)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v3 present-null count truncated")))
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)?;
+    let entries_start = 8usize;
+    let entries_len = count
+        .checked_mul(8)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v3 present-null count overflow")))?;
+    let inner_start = entries_start
+        .checked_add(entries_len)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v3 present-null section overflow")))?;
+    let entries = bytes
+        .get(entries_start..inner_start)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v3 present-null section truncated")))?;
+    let mut present_nulls = Vec::with_capacity(count);
+    // `entries` is exactly `count * 8` bytes, so `as_chunks::<8>()` yields
+    // `count` chunks with an empty remainder (clippy 1.98 `chunks_exact_to_as_chunks`).
+    for pair in entries.as_chunks::<8>().0 {
+        let doc = u32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let col = u32::from_le_bytes(pair[4..8].try_into().unwrap());
+        present_nulls.push((doc, col));
+    }
+    let inner = bytes
+        .get(inner_start..)
+        .ok_or_else(|| StorageError::Other(anyhow::anyhow!("v3 inner blob missing")))?;
+    if inner.len() < 4 || &inner[..4] != STORED_V2_MAGIC {
+        return Err(StorageError::Other(anyhow::anyhow!(
+            "v3 inner blob is not ZBS2"
+        )));
+    }
+    Ok((present_nulls, inner))
+}
+
 /// Decode a stored section written by any supported codec version.
 ///
 /// Returns the canonical JSON-array payload that every upstream caller
 /// expects (`[{"_id", "_seq_no", "_source": {...}}, ...]`).
 pub fn decode_stored(bytes: &[u8]) -> Result<Vec<u8>> {
+    if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        let (present_nulls, inner) = split_stored_v3(bytes)?;
+        return decode_stored_v2(&inner[4..], &present_nulls);
+    }
     if bytes.len() >= 4 && &bytes[..4] == STORED_V2_MAGIC {
-        return decode_stored_v2(&bytes[4..]);
+        return decode_stored_v2(&bytes[4..], &[]);
     }
     if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
         return lz4_flex::decompress_size_prepended(&bytes[4..])
@@ -1646,7 +1754,11 @@ where
     ))
 }
 
-fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
+fn decode_stored_v2(body: &[u8], present_nulls: &[(u32, u32)]) -> Result<Vec<u8>> {
+    // Positions that were a *present* explicit `_source` null (issue #415).
+    // Empty for plain ZBS2 segments; populated by `split_stored_v3` for ZBS3.
+    let present_null_set: std::collections::HashSet<(u32, u32)> =
+        present_nulls.iter().copied().collect();
     let mut cur = Cursor::new(body);
     let num_docs = cur
         .read_u32::<LittleEndian>()
@@ -1812,6 +1924,10 @@ fn decode_stored_v2(body: &[u8]) -> Result<Vec<u8>> {
                 .unwrap_or(serde_json::Value::Null);
             if !v.is_null() {
                 source_map.insert(name.clone(), v);
+            } else if present_null_set.contains(&(d as u32, cix as u32)) {
+                // Present explicit null (#415): re-insert in column order, as
+                // opposed to an absent field, which stays dropped.
+                source_map.insert(name.clone(), serde_json::Value::Null);
             }
         }
         let mut doc = serde_json::Map::new();
@@ -2535,6 +2651,105 @@ mod tests {
         let raw = br#"[{"_id":"a"}]"#;
         let decoded = decode_stored(raw).unwrap();
         assert_eq!(&decoded, raw);
+    }
+
+    /// #415: an explicit `null` in `_source` must survive the ZBS2 columnar
+    /// round-trip, and an absent key must NOT be resurrected as null. The
+    /// encoder collapses a present-null (`Some(&Null)`) and an absent field
+    /// (`None`) to the same column NULL, and the decoder drops every null, so
+    /// on a columnar/merged segment `{"a":..,"b":null}` silently loses `b`.
+    #[test]
+    fn v2_columnar_preserves_explicit_null_source_keys() {
+        // Low-cardinality docs so the columnar codec wins over the LZ4 fallback
+        // and we exercise the ZBS2 path where the loss happens. doc-0 carries a
+        // *present* explicit null `b`; the rest omit `b` entirely.
+        let mut docs: Vec<serde_json::Value> = Vec::new();
+        docs.push(json!({ "_id": "0", "_seq_no": 0, "_source": { "a": "x", "b": null } }));
+        for i in 1..400u64 {
+            docs.push(json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x" } }));
+        }
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let encoded = encode_stored_v2(&raw);
+        assert_eq!(
+            &encoded[..4],
+            STORED_V3_MAGIC,
+            "a segment with a present explicit null must be wrapped as ZBS3 (#415)"
+        );
+
+        let decoded = decode_stored(&encoded).unwrap();
+        let got: Vec<serde_json::Value> = serde_json::from_slice(&decoded).unwrap();
+
+        assert_eq!(
+            got[0]["_source"].get("b"),
+            Some(&serde_json::Value::Null),
+            "explicit null key `b` must survive the columnar round-trip: {}",
+            String::from_utf8_lossy(&decoded)
+        );
+        assert!(
+            got[1]["_source"].get("b").is_none(),
+            "an absent key must not be resurrected as null: {}",
+            String::from_utf8_lossy(&decoded)
+        );
+
+        // Bounded-wrap contract: an otherwise-identical segment with NO present
+        // nulls must stay byte-identical ZBS2 (no downgrade impact, flush parity).
+        let null_free: Vec<serde_json::Value> = (0..400u64)
+            .map(|i| json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x" } }))
+            .collect();
+        let encoded_free = encode_stored_v2(&serde_json::to_vec(&null_free).unwrap());
+        assert_eq!(
+            &encoded_free[..4],
+            STORED_V2_MAGIC,
+            "a null-free segment must NOT be wrapped as ZBS3"
+        );
+    }
+
+    #[test]
+    fn v3_present_null_encoders_are_byte_identical() {
+        // #415 flush-parity: the JSON re-parse path and the from-values path
+        // must emit byte-identical ZBS3, including the sorted present-null
+        // sidecar, even though they discover the nulls in different orders.
+        let docs: Vec<serde_json::Value> = (0..400u64)
+            .map(|i| {
+                if i % 7 == 0 {
+                    // Two present nulls whose source key order (`z` before `b`)
+                    // differs from column order to exercise the sort.
+                    json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x", "z": null, "b": null } })
+                } else {
+                    json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x" } })
+                }
+            })
+            .collect();
+        let raw = serde_json::to_vec(&docs).unwrap();
+        let from_json = encode_stored_v2(&raw);
+        assert_eq!(&from_json[..4], STORED_V3_MAGIC);
+
+        let values: Vec<(&str, u64, serde_json::Value)> = docs
+            .iter()
+            .map(|d| {
+                (
+                    d["_id"].as_str().unwrap(),
+                    d["_seq_no"].as_u64().unwrap(),
+                    d["_source"].clone(),
+                )
+            })
+            .collect();
+        let refs: Vec<(&str, u64, &serde_json::Value)> = values
+            .iter()
+            .map(|(id, seq, src)| (*id, *seq, src))
+            .collect();
+        let from_values = encode_stored_v2_from_values(&raw, &refs);
+        assert_eq!(
+            from_json, from_values,
+            "the two ZBS3 encoders must be byte-identical (flush parity)"
+        );
+
+        // And the present nulls round-trip through both.
+        let got: Vec<serde_json::Value> =
+            serde_json::from_slice(&decode_stored(&from_values).unwrap()).unwrap();
+        assert_eq!(got[0]["_source"].get("z"), Some(&serde_json::Value::Null));
+        assert_eq!(got[0]["_source"].get("b"), Some(&serde_json::Value::Null));
+        assert!(got[1]["_source"].get("z").is_none());
     }
 
     fn projection_fixture() -> (Vec<serde_json::Value>, Vec<u8>) {
