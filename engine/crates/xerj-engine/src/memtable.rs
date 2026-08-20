@@ -2161,7 +2161,7 @@ impl FtsMemtable {
     pub fn drain_with_sources_raw(
         &mut self,
     ) -> Vec<(u64, (String, HashMap<String, String>, Value))> {
-        let mut drained: Vec<MemEntry> = self.docs.drain(..).collect();
+        let mut drained: Vec<MemEntry> = std::mem::take(&mut self.docs);
         drained.sort_by_key(|e| e.seq_no);
         let result: Vec<_> = drained
             .into_iter()
@@ -2188,7 +2188,7 @@ impl FtsMemtable {
     }
 
     pub fn drain_raw(&mut self) -> Vec<(u64, (String, HashMap<String, String>))> {
-        let mut drained: Vec<MemEntry> = self.docs.drain(..).collect();
+        let mut drained: Vec<MemEntry> = std::mem::take(&mut self.docs);
         drained.sort_by_key(|e| e.seq_no);
         let result: Vec<_> = drained
             .into_iter()
@@ -3078,7 +3078,7 @@ impl FtsMemtable {
     /// RSS grows monotonically until OOM.  See CAPPED_RAM_BATTLE for the bug.
     pub fn drain(&mut self) -> Vec<(String, HashMap<String, String>)> {
         // Sort by seq_no — see `drain_with_sources` for the rationale.
-        let mut drained: Vec<MemEntry> = self.docs.drain(..).collect();
+        let mut drained: Vec<MemEntry> = std::mem::take(&mut self.docs);
         drained.sort_by_key(|e| e.seq_no);
         let result = drained
             .into_iter()
@@ -3123,7 +3123,7 @@ impl FtsMemtable {
         // get canonicalised here.  For workloads where all entries
         // carry `seq_no = 0` (the legacy `insert` path), `sort_by_key`
         // is stable so existing insertion order is preserved.
-        let mut drained: Vec<MemEntry> = self.docs.drain(..).collect();
+        let mut drained: Vec<MemEntry> = std::mem::take(&mut self.docs);
         drained.sort_by_key(|e| e.seq_no);
         let result = drained
             .into_iter()

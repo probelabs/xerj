@@ -198,7 +198,7 @@ fn bulk(body: &[u8], docs: &Arc<Mutex<Docs>>) -> Value {
     let mut locked = docs.lock().unwrap();
     let mut items = Vec::new();
     let mut errors = false;
-    for pair in lines.chunks_exact(2) {
+    for pair in lines.as_chunks::<2>().0 {
         let action: Value = serde_json::from_slice(pair[0]).unwrap();
         let doc: Value = serde_json::from_slice(pair[1]).unwrap();
         let (op, meta) = if let Some(m) = action.get("index") {

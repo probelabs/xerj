@@ -91,10 +91,13 @@ fn corrupt(msg: &str) -> XerjError {
 #[inline]
 fn dot_unrolled(a: &[f32], b: &[f32]) -> f32 {
     let mut acc = [0.0f32; 8];
-    let ca = a.chunks_exact(8);
-    let cb = b.chunks_exact(8);
-    let (ra, rb) = (ca.remainder(), cb.remainder());
-    for (x, y) in ca.zip(cb) {
+    // `as_chunks::<8>()` yields the same 8-wide windows + remainder as
+    // `chunks_exact(8)` (the `x`/`y` are now `&[f32; 8]`, so the fixed
+    // indexing below is bounds-check-free); required by clippy 1.98's
+    // `chunks_exact_to_as_chunks`.
+    let (ca, ra) = a.as_chunks::<8>();
+    let (cb, rb) = b.as_chunks::<8>();
+    for (x, y) in ca.iter().zip(cb.iter()) {
         acc[0] += x[0] * y[0];
         acc[1] += x[1] * y[1];
         acc[2] += x[2] * y[2];
@@ -1328,8 +1331,11 @@ mod tests {
     fn checked_in_pre_view_v2_fixture() -> Vec<u8> {
         let hex = include_str!("../tests/fixtures/hnsw-v2-pre-storage-view.hex").trim();
         assert_eq!(hex.len() % 2, 0);
-        hex.as_bytes()
-            .chunks_exact(2)
+        // `as_chunks::<2>()` over `chunks_exact(2)` (clippy 1.98); the
+        // `% 2 == 0` assert above guarantees an empty remainder.
+        let (pairs, _rem) = hex.as_bytes().as_chunks::<2>();
+        pairs
+            .iter()
             .map(|pair| {
                 let digit = |byte: u8| match byte {
                     b'0'..=b'9' => byte - b'0',

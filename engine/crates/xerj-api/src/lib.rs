@@ -56,6 +56,13 @@
 //! ports via `Router::merge`. Engine API and Xerj Console API are decoupled —
 //! xerj-api itself does not depend on xerj-console-api.
 
+// `ApiError` (~152 B) and axum's `Response` are the crate's standard error
+// types, returned pervasively; a handful of small-`Ok` helpers therefore trip
+// clippy 1.98's `result_large_err`. Boxing these core types is a separate,
+// crate-wide refactor, not a lint fix — suppress the lint here (cf. the
+// crate-level allows in xerj-engine and xerj-console-api).
+#![allow(clippy::result_large_err)]
+
 pub mod audit_mw;
 pub mod auth;
 pub mod authz;
