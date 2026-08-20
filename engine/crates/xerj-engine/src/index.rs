@@ -27567,6 +27567,33 @@ fn embed_backend_error(e: anyhow::Error, ctx: &str) -> xerj_common::XerjError {
 
 const EMBEDDING_IDENTITY_FILE: &str = "embedding_identity.json";
 
+/// Which embedder produced this index's vectors, as its resolved EXECUTION
+/// identity — not the `embedding.mode` string that was requested.
+///
+/// A SEPARATE file from [`EMBEDDING_IDENTITY_FILE`] on purpose. Widening that
+/// one breaks downgrade: an older binary parses it, sees a record whose ONNX
+/// fields are empty, and concludes the index contains ONNX vectors — so a
+/// rollback would leave every index the new binary had touched red and
+/// unopenable. This repo has already made that call once; the CHANGELOG records
+/// a sidecar being chosen elsewhere for exactly this reason. An older binary
+/// simply never opens this file.
+///
+/// Keyed on `identity_sha256` from [`embedding_execution_identity`] because the
+/// mode string is not the embedder. `auto` with no endpoint, `proxy` with no
+/// endpoint, `neural` in a build without the `neural` feature, and any
+/// unrecognised value all resolve to the SAME lexical embedder, so keying on
+/// the string refuses an index over a change that cannot alter a single vector.
+/// The resolved identity also moves when the mode string does not — a different
+/// proxy endpoint or neural model — which is the half a mode check cannot see.
+const EMBEDDING_EXECUTION_FILE: &str = "embedding_execution.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedEmbeddingExecution {
+    version: u32,
+    backend: String,
+    identity_sha256: String,
+}
+
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct PersistedEmbeddingIdentity {
     version: u32,
@@ -27869,6 +27896,13 @@ fn validate_embedding_identity(
             ))),
         };
     }
+    // After the ONNX branch, deliberately. When an ONNX marker exists and ONNX
+    // is configured, that branch has already returned with a message naming the
+    // model and tokenizer digests — strictly more useful than this one, which
+    // can only say the backend changed. Running first made the generic message
+    // preempt the specific one, which `changed_onnx_assets_are_rejected`
+    // caught.
+    validate_embedding_execution(index_dir, cfg, new_index, has_documents)?;
     let Some(identity) = configured else {
         return Ok(());
     };
@@ -27888,10 +27922,83 @@ fn validate_embedding_identity(
     Ok(())
 }
 
+/// Refuse to open an index whose vectors were produced by a DIFFERENT embedder.
+///
+/// The gap this closes (#434): `configured_onnx_identity` returns `None` for
+/// every mode except `onnx-experimental`, so the ONNX identity check
+/// short-circuits and never sees a lexical/neural swap. The dimension check
+/// cannot see it either — the lexical embedder is 384 wide to match
+/// all-MiniLM-L6-v2 on purpose. Measured on a lexical index reopened as neural:
+/// status green, no error, and the same query reordering with the score spread
+/// collapsing from 0.6303..0.4783 to 0.5496..0.5107, which is what comparing
+/// two embedders' vectors looks like — near-uniform similarity, i.e. noise.
+///
+/// Three boundaries, each of which a previous version of this function got
+/// wrong:
+///
+///   * the record is the RESOLVED identity, so `auto` and the mode it resolves
+///     to are one space and a changed proxy endpoint is a different one;
+///   * it is REFRESHED while the index is empty rather than written once, so a
+///     mode change made while empty (which this permits) cannot leave a stale
+///     record that refuses the next restart under the very config that wrote
+///     the vectors;
+///   * a missing record means UNKNOWN, never mismatched. An index built before
+///     this existed is unprotected until it is rebuilt, which is the honest
+///     limit — the alternative is inventing a history for it.
+fn validate_embedding_execution(
+    index_dir: &Path,
+    cfg: &xerj_common::config::EmbeddingConfig,
+    new_index: bool,
+    has_documents: bool,
+) -> Result<()> {
+    let path = index_dir.join(EMBEDDING_EXECUTION_FILE);
+    let current = embedding_execution_identity(cfg)?;
+    if path.exists() {
+        let persisted: PersistedEmbeddingExecution = serde_json::from_slice(&std::fs::read(&path)?)
+            .map_err(|e| {
+                EngineError::Common(xerj_common::XerjError::embedding(format!(
+                    "cannot read {}: {e}; remove it to re-record, or reindex",
+                    path.display()
+                )))
+            })?;
+        if persisted.identity_sha256 != current.identity_sha256 && has_documents {
+            return Err(EngineError::Common(xerj_common::XerjError::embedding(
+                format!(
+                    "index {} holds vectors produced by embedding backend {:?} but this server resolves embedding.mode={:?} to backend {:?}. Query vectors from one embedder scored against document vectors from another are silently wrong rather than visibly wrong: the widths can agree, so no dimension check fires, and the scores stay plausible while the ranking degrades toward noise. Restore the previous embedding configuration, or reindex into a new index under this one.",
+                    index_dir.display(),
+                    persisted.backend,
+                    cfg.mode.trim(),
+                    current.backend
+                ),
+            )));
+        }
+    }
+    if new_index || !has_documents {
+        write_file_atomic(
+            &path,
+            &serde_json::to_vec_pretty(&PersistedEmbeddingExecution {
+                version: 1,
+                backend: current.backend.clone(),
+                identity_sha256: current.identity_sha256.clone(),
+            })?,
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_embedding_identity_for_new_field(
     index_dir: &Path,
     cfg: &xerj_common::config::EmbeddingConfig,
 ) -> Result<()> {
+    // The execution record covers this path too. An index created WITHOUT a
+    // semantic field writes no record, so #434 reproduced verbatim through
+    // `PUT /_mapping`: the field arrives later, vectors are written under
+    // whatever mode is configured then, and nothing had ever recorded which
+    // embedder made them. `new_index` is false here and the caller only reaches
+    // this before the first write to the new field, so the record is written
+    // when the index has no documents and compared when it does.
+    // The new field has no vectors yet, so this records rather than compares.
+    validate_embedding_execution(index_dir, cfg, false, false)?;
     let Some(configured) = configured_onnx_identity(cfg)? else {
         return Ok(());
     };
