@@ -124,6 +124,22 @@ if [ -n "${VERSION:-}" ]; then
   else
     pass "version stamps match v$VERSION"
   fi
+
+  # The agent-facing llms*.txt carry a prose "Current release: **vX.Y.Z**"
+  # line. That is a claim about the current release, not measurement
+  # provenance, and it drifted three releases behind (rc.17 while rc.19 had
+  # shipped) exactly the way the footers used to — an agent that reads llms.txt
+  # is handed the wrong version (#515 / #520). Hold it to the newest tag too.
+  # Snapshot-marked lines stay exempt.
+  bad_llms="$(grep -rniE 'current release:[^<]*v1\.0\.0-rc\.?[0-9]+' "$LANDING" --include='llms*.txt' 2>/dev/null \
+              | grep -viE "v${vre}([^0-9]|$)" \
+              | grep -v '<!-- snapshot:' || true)"
+  if [ -n "$bad_llms" ]; then
+    fail "llms*.txt 'Current release' disagrees with the newest released tag (v$VERSION)"
+    echo "$bad_llms" | while IFS= read -r l; do note "${l:0:160}"; done
+  else
+    pass "llms 'Current release' matches v$VERSION"
+  fi
 else
   note "skipped version check: no v1.0.0-rc.* tag found"
 fi
