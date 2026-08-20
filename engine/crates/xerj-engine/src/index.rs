@@ -28137,6 +28137,52 @@ mod embedding_identity_tests {
         }
     }
 
+    /// #522: the #434 guard (`validate_embedding_execution`) was unit-tested at
+    /// the identity level but never end to end. A populated index must REFUSE
+    /// to reopen under a genuinely different embedder, and must NOT refuse a
+    /// config change that resolves to the same embedder.
+    #[test]
+    fn a_populated_index_refuses_reopen_under_a_different_embedder() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_dir = dir.path();
+        let lexical = xerj_common::config::EmbeddingConfig::default();
+
+        // Genesis under lexical (new, empty) records the execution identity;
+        // reopening under the SAME embedder with documents is fine.
+        validate_embedding_execution(index_dir, &lexical, true, false).unwrap();
+        validate_embedding_execution(index_dir, &lexical, false, true).unwrap();
+
+        // Reopening a POPULATED index under a genuinely different embedder
+        // (proxy with a real endpoint → backend "proxy") must refuse: querying
+        // lexical vectors against proxy vectors is silently wrong.
+        let proxy = xerj_common::config::EmbeddingConfig {
+            mode: "proxy".into(),
+            default_endpoint: "https://vectors.example/v1".into(),
+            default_model: "text-embedding-x".into(),
+            ..Default::default()
+        };
+        let err = validate_embedding_execution(index_dir, &proxy, false, true)
+            .expect_err("a lexical->proxy swap over a populated index must be refused");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("holds vectors produced by embedding backend")
+                && msg.contains("lexical")
+                && msg.contains("proxy"),
+            "the refusal must name both the recorded and the current backend: {msg}"
+        );
+
+        // Over-refusal guard: a proxy config with NO endpoint falls back to the
+        // lexical embedder, so its resolved identity is unchanged and reopening
+        // must NOT be refused.
+        let proxy_without_endpoint = xerj_common::config::EmbeddingConfig {
+            mode: "proxy".into(),
+            default_endpoint: String::new(),
+            ..Default::default()
+        };
+        validate_embedding_execution(index_dir, &proxy_without_endpoint, false, true)
+            .expect("a proxy that falls back to lexical must not be refused");
+    }
+
     #[cfg(feature = "onnx-experimental")]
     #[test]
     fn onnx_execution_identity_changes_with_asset_content() {
