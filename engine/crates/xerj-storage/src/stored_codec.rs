@@ -742,6 +742,17 @@ pub fn stored_slices_retained_upper_bound(bytes: &[u8], expected_docs: u64) -> R
         .and_then(|size| size.checked_add(STORED_SLICES_STRUCT_OVERHEAD))
         .ok_or_else(|| StorageError::Other(anyhow::anyhow!("stored retained bound overflow")))?;
 
+    // ZBS3 (#538): a present-null sidecar wrapping an unchanged ZBS2 blob.
+    // Route it through the columnar estimator on the inner ZBS2 blob rather than
+    // the compressed-bytes fallback below (which would badly UNDER-estimate the
+    // re-inflated JSON). The inner ZBS2 bound already over-counts every row's
+    // key name (`rows × (name+2)`) and a >=4-byte value per row, so the sparse
+    // `"<name>":null` cells that ZBS3 decode re-inserts are already within it.
+    if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        let (_present_nulls, inner) = split_stored_v3(bytes)?;
+        return stored_slices_retained_upper_bound(inner, expected_docs);
+    }
+
     let (decoded_bound, offsets_bound) = if bytes.len() >= 4 && &bytes[..4] == STORED_LZ4_MAGIC {
         let payload = bytes
             .get(4..8)
@@ -2750,6 +2761,51 @@ mod tests {
         assert_eq!(got[0]["_source"].get("z"), Some(&serde_json::Value::Null));
         assert_eq!(got[0]["_source"].get("b"), Some(&serde_json::Value::Null));
         assert!(got[1]["_source"].get("z").is_none());
+    }
+
+    #[test]
+    fn v3_retained_bound_routes_through_inner_zbs2_estimator() {
+        // #538: a null-bearing segment is ZBS3. Its retained upper bound must be
+        // computed via the columnar estimator on the inner ZBS2 blob — NOT the
+        // compressed-bytes fallback (which would badly under-estimate the
+        // re-inflated JSON). Assert the ZBS3 bound equals the inner ZBS2 bound;
+        // this fails-before with the pre-#538 code, where a ZBS3 blob hit the
+        // else branch and returned ~compressed bytes.len(). Robust whether the
+        // estimator is finite or fails closed (Some==Some or None==None).
+        let docs: Vec<serde_json::Value> = (0..400u64)
+            .map(|i| {
+                if i % 5 == 0 {
+                    json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x", "nullable_field": null } })
+                } else {
+                    json!({ "_id": i.to_string(), "_seq_no": i, "_source": { "a": "x" } })
+                }
+            })
+            .collect();
+        let encoded = encode_stored_v2(&serde_json::to_vec(&docs).unwrap());
+        assert_eq!(
+            &encoded[..4],
+            STORED_V3_MAGIC,
+            "must exercise the ZBS3 path"
+        );
+
+        let (_present_nulls, inner) = split_stored_v3(&encoded).unwrap();
+        let zbs3_bound = stored_slices_retained_upper_bound(&encoded, docs.len() as u64).unwrap();
+        let inner_bound = stored_slices_retained_upper_bound(inner, docs.len() as u64).unwrap();
+        assert_eq!(
+            zbs3_bound, inner_bound,
+            "ZBS3 retained bound must route through the inner ZBS2 estimator (#538)"
+        );
+
+        // When the estimator is finite it must remain a true UPPER bound over the
+        // re-inflated JSON that re-inserts the present-null keys.
+        if let Some(bound) = zbs3_bound {
+            let decoded = decode_stored(&encoded).unwrap();
+            assert!(
+                bound >= decoded.len() as u64,
+                "retained bound {bound} must be >= actual decoded length {} (#538)",
+                decoded.len()
+            );
+        }
     }
 
     fn projection_fixture() -> (Vec<serde_json::Value>, Vec<u8>) {
