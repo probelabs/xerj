@@ -669,9 +669,19 @@ pub fn decode_stored_v2_rows_projected_controlled<F>(
 where
     F: FnMut(StoredDecodeCheckpoint) -> std::ops::ControlFlow<()>,
 {
+    // #415: a ZBS3 wrapper carries a sparse present-null sidecar around an
+    // inner ZBS2 blob. Strip it so the hydration below runs on the ZBS2 body,
+    // and re-insert the present explicit nulls for hydrated rows (see the
+    // assembly loop). A plain ZBS2 segment yields an empty sidecar.
+    let (present_nulls, bytes) = if bytes.len() >= 4 && &bytes[..4] == STORED_V3_MAGIC {
+        split_stored_v3(bytes)?
+    } else {
+        (Vec::new(), bytes)
+    };
     if bytes.len() < 4 || &bytes[..4] != STORED_V2_MAGIC {
         return Ok(StoredDecodeRun::Complete(StoredV2RowHydrationResult::NotV2));
     }
+    let present_null_set: HashSet<(u32, u32)> = present_nulls.iter().copied().collect();
     let directory = parse_v2_directory(&bytes[4..])?;
     let id_index = directory
         .columns
@@ -759,6 +769,10 @@ where
             let value = values[selected_index].clone();
             if !value.is_null() {
                 source.insert(column.name.to_string(), value);
+                stats.output_values_cloned += 1;
+            } else if present_null_set.contains(&(ordinal as u32, column_index as u32)) {
+                // Present explicit null (#415) — re-insert, unlike an absent field.
+                source.insert(column.name.to_string(), serde_json::Value::Null);
                 stats.output_values_cloned += 1;
             }
         }
@@ -1274,7 +1288,9 @@ mod tests {
             .map(|i| (ids[i].as_str(), i as u64, &sources[i]))
             .collect();
         let encoded = encode_stored_v2_from_values_nojson(&docs);
-        assert_eq!(&encoded[..4], STORED_V2_MAGIC);
+        // The `nullable` field is a present explicit null on some rows, so the
+        // segment is wrapped as ZBS3 (#415); hydration must still match canonical.
+        assert_eq!(&encoded[..4], STORED_V3_MAGIC);
         let full: Vec<serde_json::Value> =
             serde_json::from_slice(&decode_stored(&encoded).unwrap()).unwrap();
         let selected = [0, 7, 42, 128, 255];
