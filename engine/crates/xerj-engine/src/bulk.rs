@@ -2987,13 +2987,13 @@ mod semantic_lifecycle_tests {
         assert!(embedded.load(std::sync::atomic::Ordering::Relaxed));
         let observations = observations.lock().unwrap();
         assert_eq!(observations.len(), 6);
-        for pair in observations.chunks_exact(2) {
+        for pair in observations.as_chunks::<2>().0 {
             assert_eq!(pair[0].0, SemanticLifecyclePoint::BeforePublication);
             assert_eq!(pair[1].0, SemanticLifecyclePoint::AfterPublication);
             assert!(pair[0].1 > pair[1].1);
             assert!(pair[0].2 > pair[1].2);
         }
-        for pair in observations.chunks_exact(2) {
+        for pair in observations.as_chunks::<2>().0 {
             assert!(pair[0].1 > 0);
             assert!(pair[0].2 > 0);
             assert_eq!(pair[1].1, 0, "published document ownership stayed charged");

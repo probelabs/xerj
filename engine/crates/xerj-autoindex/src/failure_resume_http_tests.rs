@@ -442,7 +442,9 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     if locked.block_writes {
         // Explicit write block: per-item 403 (never 429/5xx), nothing applied.
         let items: Vec<Value> = lines
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|_| {
                 json!({"index": {
                     "status": 403,
@@ -461,7 +463,7 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
     }
     if locked.reject_first_data_item {
         let mut items = Vec::new();
-        for (nth, pair) in lines.chunks_exact(2).enumerate() {
+        for (nth, pair) in lines.as_chunks::<2>().0.iter().enumerate() {
             if nth == 0 {
                 items.push(json!({"index": {
                     "status": 400,
@@ -481,9 +483,9 @@ fn bulk_response(body: &[u8], state: &Arc<Mutex<MockState>>) -> Value {
         return json!({"errors": true, "items": items});
     }
     let fail = !locked.failed_once && locked.data_bulk_number == locked.fail_data_bulk;
-    let pairs = lines.chunks_exact(2);
+    let (pairs, _) = lines.as_chunks::<2>();
     let visible = if fail { pairs.len() / 2 } else { pairs.len() };
-    for pair in lines.chunks_exact(2).take(visible) {
+    for pair in pairs.iter().take(visible) {
         let action: Value = serde_json::from_slice(pair[0]).unwrap();
         let doc: Value = serde_json::from_slice(pair[1]).unwrap();
         let id = action.pointer("/index/_id").unwrap().as_str().unwrap();
