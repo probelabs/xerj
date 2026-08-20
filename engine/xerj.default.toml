@@ -518,8 +518,11 @@ access_log = false
 # Before turning it on, three behaviours you are agreeing to:
 #
 #  * No backfill. A new index (nothing pruned from its WAL yet) is shipped
-#    whole; an established one starts from the moment it is allowlisted. Seed
-#    the target with snapshot/restore first if it needs the existing documents.
+#    whole; an established one starts from the moment it is allowlisted. If it
+#    needs the pre-existing documents, seed the target first: snapshot/restore
+#    only works when the target is another XERJ node (the snapshot format is
+#    engine-specific). For an Elasticsearch/OpenSearch target, seed with an
+#    external scan-and-push of the current documents (_search/PIT -> _bulk).
 #  * At-least-once. Each action carries `version_type=external` with the WAL
 #    seq_no, so redelivery is a no-op on a target that honours it.
 #  * Retention never waits for the target. WAL generations are pruned once they
