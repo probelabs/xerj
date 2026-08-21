@@ -24363,19 +24363,125 @@ pub struct DeleteByQueryBody {
     pub query: Value,
 }
 
+/// Resolve a by-query selector to the concrete member indices it must touch and
+/// the effective query to run against each.
+///
+/// The destructive by-query handlers used to call `Engine::get_index`, which
+/// resolves an alias to `aliased.first()` — one member. A `_delete_by_query`
+/// through a 3-member alias therefore deleted a third of the corpus and
+/// reported a clean success (#450). This fans the selector out to every member
+/// the read paths already see (`resolve_index_selector`, #433) and — crucially
+/// for a destructive path — ANDs in any alias `filter` the way `search_impl`
+/// does, so a *filtered* alias deletes only its slice, not the whole backing
+/// index (the #524 hazard).
+async fn resolve_by_query_targets(
+    state: &AppState,
+    spec: &str,
+    user_query: Value,
+) -> std::result::Result<(Vec<std::sync::Arc<xerj_engine::Index>>, Value), xerj_common::XerjError> {
+    let member_names = resolve_index_selector(state, spec).await;
+
+    // Alias filters are keyed on the name AS WRITTEN (the alias, not its
+    // expanded members) — mirror `search_impl`'s alias-filter path exactly.
+    let mut alias_filters: Vec<Value> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(entry) = state.engine.aliases.get(part) {
+            for backing in entry.value().iter() {
+                if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                    if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned() {
+                        alias_filters.push(filter);
+                    }
+                }
+            }
+        }
+    }
+    let effective_query = if alias_filters.is_empty() {
+        user_query
+    } else {
+        json!({ "bool": { "must": [user_query], "filter": alias_filters } })
+    };
+
+    let mut indices = Vec::with_capacity(member_names.len());
+    for name in &member_names {
+        indices.push(
+            state
+                .engine
+                .get_index(name)
+                .map_err(xerj_common::XerjError::from)?,
+        );
+    }
+    Ok((indices, effective_query))
+}
+
+/// Combine the per-member results of a fanned-out by-query into one response.
+///
+/// A single member (the common case: a plain index, or a one-member alias) is
+/// returned byte-for-byte unchanged so the existing wire format never drifts.
+/// Multiple members are summed field-by-field with their `failures` arrays
+/// concatenated; if any member produced an error body (it carries a `status`),
+/// that error is surfaced rather than a clean aggregate — a destructive
+/// by-query that partially failed must not report success.
+fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value {
+    if results.len() == 1 {
+        return results.pop().unwrap();
+    }
+    if let Some(err) = results.iter().find(|v| v.get("status").is_some()) {
+        return err.clone();
+    }
+    let mut took = 0u64;
+    let mut timed_out = false;
+    let mut total = 0u64;
+    let mut affected = 0u64;
+    let mut batches = 0u64;
+    let mut version_conflicts = 0u64;
+    let mut noops = 0u64;
+    let mut failures: Vec<Value> = Vec::new();
+    for r in &results {
+        took += r.get("took").and_then(Value::as_u64).unwrap_or(0);
+        timed_out |= r.get("timed_out").and_then(Value::as_bool).unwrap_or(false);
+        total += r.get("total").and_then(Value::as_u64).unwrap_or(0);
+        affected += r.get(count_key).and_then(Value::as_u64).unwrap_or(0);
+        batches += r.get("batches").and_then(Value::as_u64).unwrap_or(0);
+        version_conflicts += r
+            .get("version_conflicts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        noops += r.get("noops").and_then(Value::as_u64).unwrap_or(0);
+        if let Some(f) = r.get("failures").and_then(Value::as_array) {
+            failures.extend(f.iter().cloned());
+        }
+    }
+    let mut out = serde_json::Map::new();
+    out.insert("took".into(), json!(took));
+    out.insert("timed_out".into(), json!(timed_out));
+    out.insert("total".into(), json!(total));
+    out.insert(count_key.to_string(), json!(affected));
+    out.insert("batches".into(), json!(batches));
+    out.insert("version_conflicts".into(), json!(version_conflicts));
+    out.insert("noops".into(), json!(noops));
+    out.insert("failures".into(), json!(failures));
+    out.insert("throttled_millis".into(), json!(0));
+    out.insert("requests_per_second".into(), json!(-1));
+    out.insert("throttled_until_millis".into(), json!(0));
+    Value::Object(out)
+}
+
 pub async fn delete_by_query(
     State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<HashMap<String, String>>,
     Json(body): Json<DeleteByQueryBody>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
+    // Fan the selector out to every member of a multi-index alias (#450), with
+    // any alias filter already ANDed into the query.
+    let (indices, effective_query) =
+        match resolve_by_query_targets(&state, &index, body.query.clone()).await {
+            Ok(t) => t,
+            Err(e) => return ApiError::new(e).into_response(),
+        };
 
     // Run a match-all-sized search using the provided query.
-    let search_body_val = json!({ "query": body.query, "size": 10000, "from": 0 });
+    let search_body_val = json!({ "query": effective_query, "size": 10000, "from": 0 });
     let search_req = match xerj_query::parse_request(&search_body_val)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
     {
@@ -24396,21 +24502,27 @@ pub async fn delete_by_query(
         let spawned_key = task_key.clone();
         let tasks = state.tasks.clone();
         // Detached, so no `index_guard` rule — and none is needed: the task
-        // owns `idx`, the single already-authorized `Index` handle this request
-        // resolved, and an `Index` cannot name another index (it holds no
-        // `Engine`). See `xerj_engine::index_guard` for the contract a spawn
-        // that *can* reach `Engine::get_index` has to follow instead.
+        // owns the already-authorized `Index` handles this request resolved,
+        // and an `Index` cannot name another index (it holds no `Engine`). See
+        // `xerj_engine::index_guard` for the contract a spawn that *can* reach
+        // `Engine::get_index` has to follow instead.
         tokio::spawn(async move {
-            let response = run_delete_by_query(&idx, &search_req).await;
-            tasks.complete(&spawned_key, response);
+            let mut results = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                results.push(run_delete_by_query(idx, &search_req).await);
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "deleted"));
             drop(handle);
         });
         return Json(json!({ "task": task_key })).into_response();
     }
 
-    let response = run_delete_by_query(&idx, &search_req).await;
+    let mut results = Vec::with_capacity(indices.len());
+    for idx in &indices {
+        results.push(run_delete_by_query(idx, &search_req).await);
+    }
     drop(handle);
-    by_query_response(response)
+    by_query_response(aggregate_by_query_results(results, "deleted"))
 }
 
 /// Give a `_delete_by_query` / `_update_by_query` result the HTTP status its
@@ -24504,13 +24616,15 @@ pub async fn update_by_query(
     Query(params): Query<HashMap<String, String>>,
     Json(body): Json<UpdateByQueryBody>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
-
     let query_val = body.query.clone().unwrap_or(json!({ "match_all": {} }));
-    let search_body_val = json!({ "query": query_val, "size": 10000, "from": 0 });
+    // Fan the selector out to every member of a multi-index alias (#450), with
+    // any alias filter already ANDed into the query.
+    let (indices, effective_query) = match resolve_by_query_targets(&state, &index, query_val).await
+    {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let search_body_val = json!({ "query": effective_query, "size": 10000, "from": 0 });
     let search_req = match xerj_query::parse_request(&search_body_val)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
     {
@@ -24572,18 +24686,26 @@ pub async fn update_by_query(
         let spawned_key = task_key.clone();
         let tasks = state.tasks.clone();
         // Same reasoning as the `_delete_by_query` spawn above: the task owns
-        // one already-authorized `Index` handle and can reach no other index.
+        // the already-authorized `Index` handles and can reach no other index.
         tokio::spawn(async move {
-            let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
-            tasks.complete(&spawned_key, response);
+            let mut results = Vec::with_capacity(indices.len());
+            for idx in &indices {
+                results.push(
+                    run_update_by_query(idx, &search_req, script.clone(), pipeline.clone()).await,
+                );
+            }
+            tasks.complete(&spawned_key, aggregate_by_query_results(results, "updated"));
             drop(handle);
         });
         return Json(json!({ "task": task_key })).into_response();
     }
 
-    let response = run_update_by_query(&idx, &search_req, script, pipeline).await;
+    let mut results = Vec::with_capacity(indices.len());
+    for idx in &indices {
+        results.push(run_update_by_query(idx, &search_req, script.clone(), pipeline.clone()).await);
+    }
     drop(handle);
-    by_query_response(response)
+    by_query_response(aggregate_by_query_results(results, "updated"))
 }
 
 /// Wall-clock ceiling for the Painless work one scripted-update request may
