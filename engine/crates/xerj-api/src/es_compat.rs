@@ -29239,29 +29239,25 @@ pub async fn cat_segments(
     // index  shard  prirep  ip           segment  generation  docs.count  docs.deleted  size  size.memory  committed  searchable  version  compound
     let node = state.engine.node_id.as_str();
     let mut rows: Vec<(String, u64, u64)> = Vec::new();
-    let indices_to_list: Vec<String> = if index == "_all" || index == "*" {
-        state
-            .engine
-            .list_indices()
-            .await
-            .into_iter()
-            .map(|i| i.name)
-            .collect()
-    } else {
-        vec![index.clone()]
-    };
-    for idx_name in &indices_to_list {
-        if let Ok(idx) = state.engine.get_index(idx_name) {
-            let stats = idx.stats().await;
-            // Real on-disk size: recursive byte sum of the index's data_dir.
-            let size = dir_size_bytes(idx.data_dir());
-            // Represent the index's durable data as one logical segment.
-            // generation 0; committed + searchable are true (data is queryable
-            // and persisted). We do NOT fabricate a Lucene version string —
-            // xerj has no Lucene segments — so we report the xerj build version.
-            let _ = node; // segments output has no node column in ES; kept for parity
-            rows.push((idx_name.clone(), stats.doc_count, size));
-        }
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member (`get_index` collapsed it to `aliased.first()`, so an
+    // alias listed a single row under the alias name), and `_all` / `*` / glob /
+    // comma forms resolve uniformly. A cat endpoint lists what exists rather
+    // than 404ing, so an unknown selector is an empty listing.
+    let members = resolve_selector_with_filters(&state, &index)
+        .await
+        .map(|(m, _filters)| m)
+        .unwrap_or_default();
+    for (idx_name, idx) in &members {
+        let stats = idx.stats().await;
+        // Real on-disk size: recursive byte sum of the index's data_dir.
+        let size = dir_size_bytes(idx.data_dir());
+        // Represent the index's durable data as one logical segment.
+        // generation 0; committed + searchable are true (data is queryable
+        // and persisted). We do NOT fabricate a Lucene version string —
+        // xerj has no Lucene segments — so we report the xerj build version.
+        let _ = node; // segments output has no node column in ES; kept for parity
+        rows.push((idx_name.clone(), stats.doc_count, size));
     }
 
     if params.format.as_deref() == Some("json") {
