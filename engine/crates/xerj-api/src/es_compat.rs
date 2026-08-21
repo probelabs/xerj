@@ -8923,23 +8923,41 @@ async fn search_impl(
             // hybrid request's clothes, which is a wire-compat divergence from
             // ES 8.x and not merely an internal limitation.
             //
-            // `hybrid` is the shape this engine actually combines: it fans each
-            // sub-query out as its own search and fuses the ranked lists, which
-            // is what ES does for `knn` beside `query`. Scores are RRF rather
-            // than a score sum, so absolute `_score` values differ from ES —
-            // that is a visible difference, and it is strictly better than
-            // returning the wrong documents in silence. The sibling branch
-            // above already refuses multi-knn-plus-query loudly rather than
-            // dropping it; this is the same principle applied to the case that
-            // was quietly wrong instead of loudly unsupported.
-            json!({
-                "hybrid": {
-                    "queries": [
-                        { "query": existing_q },
-                        { "query": knn_query_json }
-                    ]
-                }
-            })
+            // `hybrid` is the shape this engine actually combines (it fans each
+            // sub-query out and RRF-fuses the ranked lists), so it dispatches
+            // the kNN half correctly. BUT the hybrid executor REJECTS
+            // aggregations (returns 400) and ignores sort/collapse/search_after.
+            // Folding EVERY knn-beside-query request to hybrid would therefore
+            // turn a valid faceted request (knn + query + aggs) from 200 into a
+            // 400, and silently drop a caller's sort/collapse — trading one
+            // wrong answer for another. So fold to `hybrid` only when the
+            // request carries none of those; otherwise keep the lexical
+            // `bool.should`. Its kNN-dropped hits are the PRE-EXISTING behaviour
+            // (strictly no worse than before this fix), and it still honours
+            // aggs/sort/collapse and returns 200. In the hybrid case scores are
+            // RRF, not a BM25 sum — a visible, documented difference, still
+            // better than silently returning the wrong documents.
+            let hybrid_safe = body.aggs.is_none()
+                && body.aggregations.is_none()
+                && body.sort.is_none()
+                && body.collapse.is_none()
+                && body.search_after.is_none()
+                // A BM25-tuned `min_score` (e.g. 2.0) applied post-fusion to RRF
+                // micro-scores (~1/61) would drop EVERY hit — keep bool.should,
+                // where min_score compares against the BM25 sum it was tuned for.
+                && body.min_score.is_none();
+            if hybrid_safe {
+                json!({
+                    "hybrid": {
+                        "queries": [
+                            { "query": existing_q },
+                            { "query": knn_query_json }
+                        ]
+                    }
+                })
+            } else {
+                json!({ "bool": { "should": [existing_q, knn_query_json] } })
+            }
         } else {
             knn_query_json
         };
