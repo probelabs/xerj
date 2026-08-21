@@ -14005,7 +14005,10 @@ impl Index {
         // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            let resolved = rewrite_query_aliases(&request.query, &schema.schema);
+            let resolved = rewrite_keyword_full_text_to_term(
+                &rewrite_query_aliases(&request.query, &schema.schema),
+                &schema.schema,
+            );
             if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
                 return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
                     format!(
@@ -32011,6 +32014,121 @@ mod lexically_typeless_lowering_tests {
             lower_lexically_typeless_clauses(&q, &std::collections::HashSet::new()),
             q
         );
+    }
+}
+
+/// #354: `match`/`multi_match` on a `keyword` field must take the query text
+/// WHOLE (keyword analyzer), not whitespace-tokenise + OR it. The flushed
+/// segment path already does this (per-field analyzer), but the memtable's
+/// schema-less `doc_matches_query`/`score_query_against_doc` tokenise, so the
+/// answer flipped at `_flush`. Rewrite keyword-targeted `Match`/`MultiMatch`
+/// clauses to whole-value `Term`s once here — where the schema is in scope — so
+/// BOTH paths agree. Analyzed-`text` fields are left untouched; a mixed
+/// `multi_match` splits into `Term`s for the keyword fields plus a `multi_match`
+/// over the remaining text fields. Same traversal coverage as
+/// `rewrite_query_aliases`, and applied after it so field names are canonical.
+fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNode {
+    fn is_keyword(schema: &Schema, field: &str) -> bool {
+        schema
+            .fields
+            .iter()
+            .any(|f| f.name == field && matches!(f.field_type, FieldType::Keyword))
+    }
+    match q {
+        QueryNode::Match {
+            field,
+            query,
+            boost,
+            ..
+        } if is_keyword(schema, field) => QueryNode::Term {
+            field: field.clone(),
+            value: Value::String(query.clone()),
+            boost: *boost,
+        },
+        QueryNode::MultiMatch {
+            fields,
+            query,
+            boost,
+            ..
+        } if fields
+            .iter()
+            .any(|f| is_keyword(schema, parse_field_boost(f).0)) =>
+        {
+            // A multi_match field spec may carry a `^boost` suffix ("tags^2");
+            // strip it before consulting the mapping (otherwise a boosted
+            // keyword field escapes the rewrite and keeps flipping at flush),
+            // and fold that field boost into the rewritten keyword `Term`.
+            let (kw, text): (Vec<String>, Vec<String>) = fields
+                .iter()
+                .cloned()
+                .partition(|f| is_keyword(schema, parse_field_boost(f).0));
+            let mut should: Vec<QueryNode> = kw
+                .into_iter()
+                .map(|f| {
+                    let (name, fboost) = parse_field_boost(&f);
+                    // No `^boost` suffix → preserve the clause boost verbatim
+                    // (keeps the common unboosted case byte-identical); with a
+                    // suffix, combine it with the clause boost as ES does.
+                    let boost = if name.len() == f.len() {
+                        *boost
+                    } else {
+                        Some(fboost * (*boost).unwrap_or(1.0))
+                    };
+                    QueryNode::Term {
+                        field: name.to_string(),
+                        value: Value::String(query.clone()),
+                        boost,
+                    }
+                })
+                .collect();
+            if !text.is_empty() {
+                // Preserve match_type/operator/etc. (and each text field's own
+                // `^boost`, which the text matcher strips) by cloning and
+                // swapping only the field list.
+                let mut text_mm = q.clone();
+                if let QueryNode::MultiMatch { fields: mmf, .. } = &mut text_mm {
+                    *mmf = text;
+                }
+                should.push(text_mm);
+            }
+            if should.len() == 1 {
+                should.into_iter().next().unwrap()
+            } else {
+                QueryNode::Bool {
+                    must: Vec::new(),
+                    should,
+                    must_not: Vec::new(),
+                    filter: Vec::new(),
+                    minimum_should_match: Some(MinShouldMatch::Fixed(1)),
+                }
+            }
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match,
+        } => QueryNode::Bool {
+            must: must
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            should: should
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            must_not: must_not
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            filter: filter
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            minimum_should_match: minimum_should_match.clone(),
+        },
+        other => other.clone(),
     }
 }
 
