@@ -39941,12 +39941,13 @@ mod script_guard_symmetry_tests {
     }
 
     /// Why top-level `knn` is not a `GuardedField`: `_msearch` never executes
-    /// it, so a script parked there reaches no executor. The discriminator is
-    /// a `knn.filter` that matches nothing — `_search` honours it and returns
-    /// zero hits, `_msearch` ignores the whole clause and returns the doc.
-    ///
-    /// If this ever starts failing because `_msearch` grew knn support, that
-    /// path gained a script sink and `knn` must become a guarded field.
+    /// it, so a script parked there reaches no executor. The discriminator is a
+    /// `knn` naming the field `vec`, which the seed index does not have: since
+    /// #498 `_search` EXECUTES the clause and rejects the unanswerable field
+    /// with a `400`, while `_msearch` ignores the whole clause and returns the
+    /// doc (`200`, one hit). If `_msearch` ever grew knn support it would 400
+    /// here too — that path would have gained a script sink and `knn` must
+    /// become a guarded field.
     #[tokio::test]
     async fn msearch_does_not_execute_top_level_knn() {
         let state = test_state();
@@ -39968,12 +39969,18 @@ mod script_guard_symmetry_tests {
             "`_msearch` must be ignoring the knn clause entirely: {msearch_item}"
         );
 
+        // `_search` executes the knn, so it validates the field — `vec` is
+        // absent from the mapping and carries no vectors, which is a 400 since
+        // #498 (a silent empty 200 hid "this index cannot do vector search").
         let (search_status, search_body) = search_verdict(state, &body).await;
-        assert_eq!(search_status, 200, "{search_body}");
-        assert_eq!(
-            search_body["hits"]["total"]["value"],
-            json!(0),
-            "`_search` must be executing the knn filter: {search_body}"
+        assert_eq!(search_status, 400, "{search_body}");
+        assert!(
+            search_body
+                .pointer("/error/reason")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("vec"),
+            "the 400 must name the unanswerable field: {search_body}"
         );
     }
 }
