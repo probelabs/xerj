@@ -208,20 +208,32 @@ RESULT: 5/5 semantic retrievals returned the right doc at rank 1</pre>
    match    top -&gt; NO HITS
    semantic top -&gt; kb-2 Refund policy</pre>
 
-  <h2>Honest limitation: the built-in embedder is <em>lexical</em>, not neural</h2>
-  <p>The zero-config embedder is a <strong>lexical</strong> model — it maps overlapping and related vocabulary into vector space. It shines when the question and the answer share <em>some</em> terms (a synonym here, a rephrase there), which covers a lot of real support/FAQ traffic. It is <strong>not</strong> a neural sentence embedder and won't capture deep semantics with no lexical bridge.</p>
-
-  <p>Concretely, from this same KB:</p>
-<pre class="code">Q: 'how do I rotate my API key'
-   semantic top -&gt; kb-5 Rate limits   (expected kb-1)</pre>
-
-  <p>The doc is <em>titled</em> "Rotating an API key," but only its <strong>body</strong> is embedded, and the body never uses the word "rotate" — so a pure "rotate" paraphrase misses. Two honest takeaways:</p>
+  <h2>Three embedding backends: lexical (default), built-in neural, or bring-your-own</h2>
+  <p>The <code class="inline">semantic_text</code> mapping and the <code class="inline">semantic</code> query above are <strong>identical</strong> across all three backends. You choose the backend once, at the server, with <code class="inline">--embed-mode</code> (or <code class="inline">embedding.mode</code> in config, or <code class="inline">XERJ_EMBED_MODE</code>):</p>
   <ul>
-    <li><strong>Embed the text that carries the meaning.</strong> If titles matter, index them into the <code class="inline">semantic_text</code> field too (or add a second <code class="inline">semantic_text</code> field and combine with <code class="inline">hybrid</code>), so the vocabulary the user might use is actually in the vector.</li>
-    <li><strong>For production-grade semantics, wire an external embeddings endpoint.</strong> XERJ will call any OpenAI-compatible <code class="inline">/v1/embeddings</code> service. Set <code class="inline">embedding.default_endpoint</code> in config, or point a field at it in the mapping via <code class="inline">inference_endpoint</code> / <code class="inline">inference_id</code>. The <code class="inline">semantic</code> query and the ingest path are identical — you just get neural-quality vectors instead of the built-in lexical ones. (Anomaly-style continuous re-embedding isn't a thing here; embedding happens at ingest time.)</li>
+    <li><strong><code class="inline">lexical</code> (default)</strong> — built-in feature-hash embedder. Offline, deterministic, zero download. Maps overlapping and related vocabulary into vector space.</li>
+    <li><strong><code class="inline">neural</code></strong> — built-in BERT sentence encoder (<code class="inline">all-MiniLM-L6-v2</code>) running in-process via <code class="inline">candle</code>. Pure Rust, no Python, no external service. The model auto-downloads (~90&nbsp;MB) once on first use, or point <code class="inline">embedding.local_model_dir</code> at a pre-staged copy for a fully <strong>air-gapped</strong> install.</li>
+    <li><strong><code class="inline">proxy</code></strong> — bring your own model: XERJ calls any OpenAI-compatible <code class="inline">/v1/embeddings</code> service (OpenAI, Cohere, a local vLLM). Set <code class="inline">embedding.default_endpoint</code> in config, or point a field at it in the mapping via <code class="inline">inference_endpoint</code> / <code class="inline">inference_id</code>.</li>
   </ul>
 
-  <p>Everything above is <code class="inline">semantic_text</code> + the built-in embedder — no external service was configured for this recipe.</p>
+  <h3>The default is lexical — know where it stops</h3>
+  <p>The zero-config embedder is a <strong>lexical</strong> model. It shines when the question and the answer share <em>some</em> terms (a synonym here, a rephrase there), which covers a lot of real support/FAQ traffic. It is <strong>not</strong> a neural sentence embedder and won't capture deep semantics with no lexical bridge. Concretely, from this same KB:</p>
+<pre class="code">Q: 'how do I rotate my API key'
+   semantic top -&gt; kb-5 Rate limits   (expected kb-1)   # --embed-mode lexical</pre>
+  <p>The doc is <em>titled</em> "Rotating an API key," but only its <strong>body</strong> is embedded, and the body never uses the word "rotate" — so a pure "rotate" paraphrase misses in lexical mode.</p>
+
+  <h3>Upgrade to real neural semantics — still one binary, still in place</h3>
+<pre class="code"># Built-in neural embedder — ships in the binary, no external service.
+# Downloads all-MiniLM-L6-v2 (~90 MB) once on first use, then runs in-process.
+xerj --insecure --data-dir ./data --embed-mode neural</pre>
+  <p>With <code class="inline">--embed-mode neural</code>, that "rotate" paraphrase lands on <code class="inline">kb-1</code>: the BERT encoder captures that <em>rotate&nbsp;≈&nbsp;regenerate&nbsp;≈&nbsp;replace</em> even with no shared term. The mapping and query don't change — only the server flag does.</p>
+  <p>Two honest takeaways that apply in every mode:</p>
+  <ul>
+    <li><strong>Embed the text that carries the meaning.</strong> If titles matter, index them into the <code class="inline">semantic_text</code> field too (or add a second <code class="inline">semantic_text</code> field and combine with <code class="inline">hybrid</code>), so the vocabulary the user might use is actually in the vector.</li>
+    <li><strong>Bring your own model when you need a specific one.</strong> <code class="inline">--embed-mode proxy</code> with <code class="inline">embedding.default_endpoint</code> reaches any OpenAI-compatible endpoint. Embedding happens at ingest time (there is no continuous re-embedding).</li>
+  </ul>
+
+  <p>Everything shown above the "Upgrade" step is <code class="inline">semantic_text</code> + the built-in lexical embedder — no external service was configured for this recipe.</p>
 
   <hr>
 
