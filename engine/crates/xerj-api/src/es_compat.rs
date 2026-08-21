@@ -22518,6 +22518,44 @@ async fn msearch_impl(
             }
         }
 
+        // AND in any alias `filter` before parsing (#451 class C). msearch
+        // resolved the alias to its members and searched them directly, never
+        // reading `index_alias_metadata`, so a filtered alias — the standard
+        // poor-man's document boundary — leaked the documents it exists to hide
+        // (`_search` through the same alias honours it). Gathered keyed on the
+        // written alias name, exactly as `search_impl` and
+        // `resolve_by_query_targets` do.
+        {
+            let mut alias_filters: Vec<Value> = Vec::new();
+            for part in index_name
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(entry) = state.engine.aliases.get(part) {
+                    for backing in entry.value().iter() {
+                        if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                            if let Some(filter) =
+                                meta.get(part).and_then(|v| v.get("filter")).cloned()
+                            {
+                                alias_filters.push(filter);
+                            }
+                        }
+                    }
+                }
+            }
+            if !alias_filters.is_empty() {
+                let existing = effective_body.get("query").cloned();
+                let merged = match existing {
+                    None => json!({ "bool": { "filter": alias_filters } }),
+                    Some(q) => json!({ "bool": { "must": [q], "filter": alias_filters } }),
+                };
+                if let Some(obj) = effective_body.as_object_mut() {
+                    obj.insert("query".to_string(), merged);
+                }
+            }
+        }
+
         // Strip _index constraints BEFORE parsing so downstream FTS
         // doesn't try to score on a metadata field.
         let mut idx_constraints: Vec<String> = Vec::new();
@@ -25128,10 +25166,43 @@ pub async fn cat_count(
     // is scoped to wildcard resolution, not to making a bad literal name a
     // hard error the way the JSON `_count` endpoint does).
     let names = resolve_index_selector(&state, &index).await;
+
+    // A filtered alias must count only the slice its filter admits (#451 class
+    // C) — `stats().doc_count` is the whole backing index, so a filtered alias
+    // leaked a count including the documents it exists to hide. Gathered keyed
+    // on the written alias name, as the other read paths do.
+    let mut alias_filters: Vec<Value> = Vec::new();
+    for part in index.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(entry) = state.engine.aliases.get(part) {
+            for backing in entry.value().iter() {
+                if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                    if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned() {
+                        alias_filters.push(filter);
+                    }
+                }
+            }
+        }
+    }
+
     let mut count: u64 = 0;
     for name in &names {
         if let Ok(idx) = state.engine.get_index(name) {
-            count += idx.stats().await.doc_count;
+            if alias_filters.is_empty() {
+                count += idx.stats().await.doc_count;
+            } else {
+                // Count only the filter-admitted documents.
+                let filter_query = if alias_filters.len() == 1 {
+                    alias_filters[0].clone()
+                } else {
+                    json!({ "bool": { "filter": alias_filters.clone() } })
+                };
+                let body = json!({ "query": filter_query, "size": 0, "track_total_hits": true });
+                if let Ok(req) = xerj_query::parse_request(&body) {
+                    if let Ok(res) = idx.search(&req).await {
+                        count += res.total.value;
+                    }
+                }
+            }
         }
     }
 
@@ -30560,7 +30631,7 @@ async fn msearch_template_impl(
             .unwrap_or_else(|| "*".to_string());
 
         let params = tmpl_body.params.unwrap_or_default();
-        let search_body_val: Value = if let Some(source_val) = tmpl_body.source {
+        let mut search_body_val: Value = if let Some(source_val) = tmpl_body.source {
             let source_str = match &source_val {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string(other).unwrap_or_default(),
@@ -30596,6 +30667,40 @@ async fn msearch_template_impl(
             );
             continue;
         };
+
+        // AND in any alias filter before parsing (#451 class C), same as
+        // `_msearch`: a filtered alias's document boundary must apply to the
+        // rendered template search too.
+        {
+            let mut alias_filters: Vec<Value> = Vec::new();
+            for part in index_name
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(entry) = state.engine.aliases.get(part) {
+                    for backing in entry.value().iter() {
+                        if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                            if let Some(filter) =
+                                meta.get(part).and_then(|v| v.get("filter")).cloned()
+                            {
+                                alias_filters.push(filter);
+                            }
+                        }
+                    }
+                }
+            }
+            if !alias_filters.is_empty() {
+                let existing = search_body_val.get("query").cloned();
+                let merged = match existing {
+                    None => json!({ "bool": { "filter": alias_filters } }),
+                    Some(q) => json!({ "bool": { "must": [q], "filter": alias_filters } }),
+                };
+                if let Some(obj) = search_body_val.as_object_mut() {
+                    obj.insert("query".to_string(), merged);
+                }
+            }
+        }
 
         // Same request-time script guard as `_search`/`_msearch`, over the
         // same `GuardedField` set; the rendered template is user input and
