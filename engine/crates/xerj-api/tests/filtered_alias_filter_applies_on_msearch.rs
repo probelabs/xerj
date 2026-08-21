@@ -252,3 +252,53 @@ async fn cat_count_through_a_filtered_alias_honours_the_filter() {
          not the whole backing index (#451 class C): {body}"
     );
 }
+
+/// `_msearch/template` through a filtered alias must honour the filter.
+#[tokio::test]
+async fn msearch_template_through_a_filtered_alias_honours_the_filter() {
+    let (app, _dir) = app().await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a",
+        json!({"mappings": {"properties": {"status": {"type": "keyword"}}}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create index");
+    for (id, status) in [("active", "active"), ("archived", "archived")] {
+        let (st, _) = call(
+            &app,
+            "PUT",
+            &format!("/idx-a/_doc/{id}"),
+            json!({ "status": status }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "index {id}");
+    }
+    let (_s, _b) = call(&app, "POST", "/idx-a/_refresh", Value::Null).await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a/_alias/hot",
+        json!({ "filter": { "term": { "status": "active" } } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create filtered alias");
+
+    let nd = format!(
+        "{}\n{}\n",
+        json!({ "index": "hot" }),
+        json!({ "source": "{\"query\":{\"match_all\":{}},\"track_total_hits\":true}", "params": {} })
+    );
+    let (status, body) = ndjson(&app, "/_msearch/template", nd).await;
+    assert_eq!(status, StatusCode::OK, "_msearch/template status: {body}");
+    let total = body
+        .pointer("/responses/0/hits/total/value")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        total, 1,
+        "_msearch/template through a filtered alias must honour the filter, not leak the \
+         out-of-slice doc (#451 class C): {body}"
+    );
+}

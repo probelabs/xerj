@@ -30631,7 +30631,7 @@ async fn msearch_template_impl(
             .unwrap_or_else(|| "*".to_string());
 
         let params = tmpl_body.params.unwrap_or_default();
-        let search_body_val: Value = if let Some(source_val) = tmpl_body.source {
+        let mut search_body_val: Value = if let Some(source_val) = tmpl_body.source {
             let source_str = match &source_val {
                 Value::String(s) => s.clone(),
                 other => serde_json::to_string(other).unwrap_or_default(),
@@ -30667,6 +30667,40 @@ async fn msearch_template_impl(
             );
             continue;
         };
+
+        // AND in any alias filter before parsing (#451 class C), same as
+        // `_msearch`: a filtered alias's document boundary must apply to the
+        // rendered template search too.
+        {
+            let mut alias_filters: Vec<Value> = Vec::new();
+            for part in index_name
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(entry) = state.engine.aliases.get(part) {
+                    for backing in entry.value().iter() {
+                        if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                            if let Some(filter) =
+                                meta.get(part).and_then(|v| v.get("filter")).cloned()
+                            {
+                                alias_filters.push(filter);
+                            }
+                        }
+                    }
+                }
+            }
+            if !alias_filters.is_empty() {
+                let existing = search_body_val.get("query").cloned();
+                let merged = match existing {
+                    None => json!({ "bool": { "filter": alias_filters } }),
+                    Some(q) => json!({ "bool": { "must": [q], "filter": alias_filters } }),
+                };
+                if let Some(obj) = search_body_val.as_object_mut() {
+                    obj.insert("query".to_string(), merged);
+                }
+            }
+        }
 
         // Same request-time script guard as `_search`/`_msearch`, over the
         // same `GuardedField` set; the rendered template is user input and
