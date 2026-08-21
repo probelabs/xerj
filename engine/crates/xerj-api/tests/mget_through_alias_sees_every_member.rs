@@ -109,7 +109,10 @@ async fn mget_through_a_multi_index_alias_finds_docs_in_every_member() {
     // Both ids exist — one per member. Collapsing the alias to its first member
     // makes the other member's doc report found:false (#451 class B).
     for (i, want_id) in ["1", "2"].iter().enumerate() {
-        let found = docs[i].get("found").and_then(Value::as_bool).unwrap_or(false);
+        let found = docs[i]
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         assert!(
             found,
             "_mget through the alias must find doc {want_id} (it lives in a real member), \
