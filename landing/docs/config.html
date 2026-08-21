@@ -218,11 +218,12 @@ timeout_ms       = 5000
 # default_model    = "nomic-embed-text"</pre>
 
   <h2 id="limits-section">[limits]</h2>
-  <p>Hard caps to protect the server from runaway queries and mapping explosions. Lower these on shared nodes, raise <code class="inline">max_query_memory_mb</code> for aggregation-heavy workloads.</p>
+  <p>Hard caps to protect the server from runaway queries and mapping explosions. Lower these on shared nodes, raise <code class="inline">max_query_memory_mb</code> for aggregation-heavy workloads. Leave <code class="inline">max_process_memory_mb</code> out to auto-size the process-wide cap from the machine (8 / 16 / 32 GiB tiers); set an explicit MiB ceiling only to raise headroom on a large host — for example if a big <code class="inline">xerj autoindex</code> trips <code class="inline">429 circuit_breaking_exception</code>.</p>
 <pre class="code">[limits]
 max_query_memory_mb     = 512
 max_concurrent_searches = 64
-max_fields_per_index    = 500</pre>
+max_fields_per_index    = 500
+# max_process_memory_mb = 0   # omit → AUTO (8/16/32 GiB by machine); 0 = whole machine</pre>
 
   <h2 id="indexing-section">[indexing]</h2>
   <p>Turbo mode knobs. Turbo is opt-in per-request via <code class="inline">POST /v1/indices/:name/turbo-ingest</code> or the <code class="inline">X-Turbo: true</code> header on <code class="inline">_bulk</code>; these settings only apply when turbo is active.</p>

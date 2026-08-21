@@ -121,6 +121,18 @@
 
   <p>XERJ stores your vectors in full at <strong>ingest</strong> time and maintains a <strong>persisted HNSW graph</strong> alongside them. An unfiltered <code class="inline">knn</code> on a full-precision cosine field (≥1,024 docs) is served by an approximate HNSW beam search whose candidates are <strong>exact-rescored</strong>, so returned scores match the exact path bit-for-bit — measured recall@10 1.00 on the official bench query, 100-probe mean 0.976 (ES 8.13.4 same protocol: 0.937). <code class="inline">num_candidates</code> sets the beam width (floored at 800 to match Elasticsearch's per-segment candidate semantics). A <code class="inline">filter</code>, non-cosine similarity, SQ8 quantization, a small index, or a stale graph falls back to the <strong>exact brute-force</strong> scan: every candidate is scored and the true nearest neighbours returned (recall 1.00; latency scales with vectors scanned). Distance metric and quantization are set in config. See <a href="#knn-query">KNN query</a> below.</p>
 
+  <h2 id="embedders">Embedding backends — how vectors get made</h2>
+  <p>Everything above assumes a vector already exists on the doc. XERJ can produce that vector for you from a <code class="inline">semantic_text</code> field, and you pick <em>how</em> once at the server with <code class="inline">--embed-mode</code> (or <code class="inline">embedding.mode</code> in config, or <code class="inline">XERJ_EMBED_MODE</code>). The mapping and the <code class="inline">semantic</code> query are identical across all three:</p>
+  <div class="cfg" style="grid-template-columns: 1fr 1.2fr 3fr;">
+    <div class="head">MODE</div><div class="head">SHIPS / NEEDS</div><div class="head">WHAT IT IS</div>
+    <div class="cell k">lexical</div><div class="cell t">built-in · default</div><div class="cell dsc">Feature-hash embedder. Offline, deterministic, zero download. Maps overlapping and related vocabulary into vector space — strong when question and answer share terms, not a neural sentence encoder.</div>
+    <div class="cell k">neural</div><div class="cell t">built-in · ~90 MB on first use</div><div class="cell dsc">BERT sentence encoder (<code class="inline">all-MiniLM-L6-v2</code>) running in-process via <code class="inline">candle</code> — pure Rust, no Python, no external service. The model auto-downloads (~90 MB) once, or point <code class="inline">embedding.local_model_dir</code> at a pre-staged copy for a fully <strong>air-gapped</strong> install. Captures meaning with no shared term (<em>rotate ≈ regenerate</em>).</div>
+    <div class="cell k">proxy</div><div class="cell t">external endpoint</div><div class="cell dsc">Bring your own model: XERJ calls any OpenAI-compatible <code class="inline">/v1/embeddings</code> (OpenAI, Cohere, a local vLLM). Set <code class="inline">embedding.default_endpoint</code>. Embedding happens at ingest time.</div>
+  </div>
+  <p>Turn on the built-in neural embedder with a single server flag — no mapping or query change:</p>
+<pre class="code">xerj --insecure --data-dir ./data --embed-mode neural</pre>
+  <p>See the <a href="/docs/recipes/semantic-search-rag.html">Semantic search &amp; RAG recipe</a> for the end-to-end walkthrough.</p>
+
   <h2 id="hnsw">hnsw_* config keys — accepted, no effect on search</h2>
   <div class="cfg" style="grid-template-columns: 1.5fr 1fr 1fr 2.5fr;">
     <div class="head">KEY</div>
