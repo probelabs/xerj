@@ -24456,6 +24456,13 @@ fn aggregate_by_query_results(mut results: Vec<Value>, count_key: &str) -> Value
     out.insert("timed_out".into(), json!(timed_out));
     out.insert("total".into(), json!(total));
     out.insert(count_key.to_string(), json!(affected));
+    // `_update_by_query` bodies also carry a `"deleted": 0` field (an update
+    // never deletes); the single-member response includes it, so the aggregate
+    // does too — otherwise the 2+-member update body drops a field the
+    // 1-member body has (#553 nit).
+    if count_key == "updated" {
+        out.insert("deleted".into(), json!(0));
+    }
     out.insert("batches".into(), json!(batches));
     out.insert("version_conflicts".into(), json!(version_conflicts));
     out.insert("noops".into(), json!(noops));
