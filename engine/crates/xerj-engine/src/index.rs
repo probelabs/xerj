@@ -14100,9 +14100,21 @@ impl Index {
         // one clause, and `hits.total` is the size of the deduplicated union
         // — matching ES 8.13 multi-kNN semantics (live-verified 2026-07-12).
         if let Some(clauses) = peel_multi_knn_query(query) {
-            return self
+            let fields: Vec<String> = clauses.iter().map(|c| c.field.clone()).collect();
+            let result = self
                 .run_multi_knn_brute_force(request, search_deadline, clauses)
-                .await;
+                .await?;
+            // #542: each knn clause validates its own field. On an empty,
+            // non-timed-out union, reject the first clause naming an
+            // unanswerable field — the same execution-truth check the single-knn
+            // arm uses (#498), so declared-but-empty and indexed-but-undeclared
+            // fields still return their real empty result.
+            if result.hits.is_empty() && !result.timed_out {
+                for field in &fields {
+                    self.reject_unanswerable_knn_field(field).await?;
+                }
+            }
+            return Ok(result);
         }
         // Nested `knn` query: `nested { path: P, query: { knn { field: P.vec } } }`.
         // ES scores each parent by the best-matching nested element and
