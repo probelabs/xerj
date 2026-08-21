@@ -18403,30 +18403,42 @@ pub async fn mget_index(
 
     let mut docs: Vec<Value> = Vec::with_capacity(entries.len());
     for (ix, id) in &entries {
-        match state.engine.get_index(ix) {
-            Ok(idx) => match idx.get_document(id).await {
-                Ok(Some(source)) => {
-                    // Real per-doc `_seq_no` / `_version` (were hardcoded
-                    // 0 / 1) — matches the `_search` hit metadata path.
-                    let seq_no = idx.lookup_seq_no(id).unwrap_or(0);
-                    let version = idx.lookup_version(id).unwrap_or(1);
-                    docs.push(json!({
-                        "_index": ix,
-                        "_id": id,
-                        "_version": version,
-                        "_seq_no": seq_no,
-                        "_primary_term": 1,
-                        "found": true,
-                        "_source": source,
-                    }))
-                }
-                _ => docs.push(json!({
-                    "_index": ix,
+        // Resolve the entry's index through the shared resolver (#451): an
+        // alias expands to every member, so a doc in any member is found — not
+        // just the first. `get_index` collapsed an alias to `aliased.first()`,
+        // so a non-first member's doc reported `found:false` (class B).
+        let members = match resolve_selector_with_filters(&state, ix).await {
+            Ok((m, _filters)) => m,
+            Err(_) => {
+                docs.push(json!({ "_index": ix, "_id": id, "found": false }));
+                continue;
+            }
+        };
+        let mut hit = None;
+        for (mname, midx) in &members {
+            if let Ok(Some(source)) = midx.get_document(id).await {
+                hit = Some((mname.clone(), midx.clone(), source));
+                break;
+            }
+        }
+        match hit {
+            Some((mname, midx, source)) => {
+                // Real per-doc `_seq_no` / `_version` (were hardcoded 0 / 1) —
+                // matches the `_search` hit metadata path. `_index` reports the
+                // concrete member the doc lives in, not the alias.
+                let seq_no = midx.lookup_seq_no(id).unwrap_or(0);
+                let version = midx.lookup_version(id).unwrap_or(1);
+                docs.push(json!({
+                    "_index": mname,
                     "_id": id,
-                    "found": false,
-                })),
-            },
-            Err(_) => docs.push(json!({
+                    "_version": version,
+                    "_seq_no": seq_no,
+                    "_primary_term": 1,
+                    "found": true,
+                    "_source": source,
+                }));
+            }
+            None => docs.push(json!({
                 "_index": ix,
                 "_id": id,
                 "found": false,
@@ -19402,6 +19414,52 @@ pub async fn get_aliases(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Resolve an index spec (single name, comma list, wildcard, `_all`, `*`)
 /// into the concrete set of existing index names, in stable order.
+/// The single index-selector resolver (#451). Every endpoint that used to
+/// call `Engine::get_index` directly — collapsing an alias to `aliased.first()`
+/// (class B) — or had no alias branch at all (class A) should resolve through
+/// here instead, so all sites agree on what a selector means.
+///
+/// Returns each concrete member the selector names (an alias expands to ALL its
+/// members, #433) paired with its `Arc<Index>`, plus any alias `filter` clauses
+/// to AND into a query — the same shape `resolve_by_query_targets` uses on the
+/// write path (#450). A missing name propagates `index_not_found`, matching
+/// ES's default `ignore_unavailable=false`.
+async fn resolve_selector_with_filters(
+    state: &AppState,
+    spec: &str,
+) -> std::result::Result<
+    (
+        Vec<(String, std::sync::Arc<xerj_engine::Index>)>,
+        Vec<Value>,
+    ),
+    xerj_common::XerjError,
+> {
+    let names = resolve_index_selector(state, spec).await;
+    let mut alias_filters: Vec<Value> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(entry) = state.engine.aliases.get(part) {
+            for backing in entry.value().iter() {
+                if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                    if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned() {
+                        alias_filters.push(filter);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for name in &names {
+        out.push((
+            name.clone(),
+            state
+                .engine
+                .get_index(name)
+                .map_err(xerj_common::XerjError::from)?,
+        ));
+    }
+    Ok((out, alias_filters))
+}
+
 async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
     let all: Vec<String> = state
         .engine
@@ -29303,29 +29361,25 @@ pub async fn cat_segments(
     // index  shard  prirep  ip           segment  generation  docs.count  docs.deleted  size  size.memory  committed  searchable  version  compound
     let node = state.engine.node_id.as_str();
     let mut rows: Vec<(String, u64, u64)> = Vec::new();
-    let indices_to_list: Vec<String> = if index == "_all" || index == "*" {
-        state
-            .engine
-            .list_indices()
-            .await
-            .into_iter()
-            .map(|i| i.name)
-            .collect()
-    } else {
-        vec![index.clone()]
-    };
-    for idx_name in &indices_to_list {
-        if let Ok(idx) = state.engine.get_index(idx_name) {
-            let stats = idx.stats().await;
-            // Real on-disk size: recursive byte sum of the index's data_dir.
-            let size = dir_size_bytes(idx.data_dir());
-            // Represent the index's durable data as one logical segment.
-            // generation 0; committed + searchable are true (data is queryable
-            // and persisted). We do NOT fabricate a Lucene version string —
-            // xerj has no Lucene segments — so we report the xerj build version.
-            let _ = node; // segments output has no node column in ES; kept for parity
-            rows.push((idx_name.clone(), stats.doc_count, size));
-        }
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member (`get_index` collapsed it to `aliased.first()`, so an
+    // alias listed a single row under the alias name), and `_all` / `*` / glob /
+    // comma forms resolve uniformly. A cat endpoint lists what exists rather
+    // than 404ing, so an unknown selector is an empty listing.
+    let members = resolve_selector_with_filters(&state, &index)
+        .await
+        .map(|(m, _filters)| m)
+        .unwrap_or_default();
+    for (idx_name, idx) in &members {
+        let stats = idx.stats().await;
+        // Real on-disk size: recursive byte sum of the index's data_dir.
+        let size = dir_size_bytes(idx.data_dir());
+        // Represent the index's durable data as one logical segment.
+        // generation 0; committed + searchable are true (data is queryable
+        // and persisted). We do NOT fabricate a Lucene version string —
+        // xerj has no Lucene segments — so we report the xerj build version.
+        let _ = node; // segments output has no node column in ES; kept for parity
+        rows.push((idx_name.clone(), stats.doc_count, size));
     }
 
     if params.format.as_deref() == Some("json") {
@@ -33345,15 +33399,31 @@ pub async fn explain_doc(
     Path((index, id)): Path<(String, String)>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member, so the document is explained against the member that
+    // actually holds it. `get_index` collapsed an alias to `aliased.first()`,
+    // so a non-first member's doc reported `matched:false` / "document not
+    // found" (class B).
+    let (members, _filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
     };
-
-    // Fetch the document.
-    let doc_source = match idx.get_document(&id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    let mut resolved = None;
+    for (mname, midx) in &members {
+        match midx.get_document(&id).await {
+            Ok(Some(s)) => {
+                resolved = Some((mname.clone(), midx.clone(), s));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    }
+    // On a hit, `index` is rebound to the concrete member (reported in
+    // `_index`); the not-found arm still names the selector the caller wrote.
+    let (index, idx, doc_source) = match resolved {
+        Some((mname, midx, s)) => (mname, midx, s),
+        None => {
             return Json(json!({
                 "_index": index,
                 "_id": id,
@@ -33366,7 +33436,6 @@ pub async fn explain_doc(
             }))
             .into_response();
         }
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
     // Parse the query from the body (default to match_all if absent).
@@ -35824,56 +35893,65 @@ pub async fn index_segments(
     Path(index): Path<String>,
 ) -> impl IntoResponse {
     let index = strip_remote_cluster_prefix(&index);
-    match state.engine.get_index(&index) {
-        Ok(idx) => {
-            let stats = idx.stats().await;
-            let snap = idx.store_snapshot();
-            let num_segments = snap.segments.len();
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member (`get_index` collapsed it to `aliased.first()`, so
+    // `_segments` reported one entry under the alias name). One `indices` entry
+    // per concrete member; `_shards` counts one shard per member.
+    let (members, _filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let mut indices_map = serde_json::Map::new();
+    for (name, idx) in &members {
+        let stats = idx.stats().await;
+        let snap = idx.store_snapshot();
+        let num_segments = snap.segments.len();
 
-            let mut segments_map = serde_json::Map::new();
-            for (i, seg) in snap.segments.iter().enumerate() {
-                segments_map.insert(
-                    i.to_string(),
-                    json!({
-                        "generation": seg.min_seq_no,
-                        "num_docs": seg.doc_count,
-                        "deleted_docs": 0,
-                        "size_in_bytes": seg.size_bytes,
-                        "memory_in_bytes": 0,
-                        "committed": true,
-                        "search": true,
-                        "version": "9.10.0",
-                        "compound": false,
-                        "merges": { "merges": [] }
-                    }),
-                );
-            }
-
-            Json(json!({
-                "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                "indices": {
-                    index: {
-                        "shards": {
-                            "0": [{
-                                "routing": {
-                                    "state": "STARTED",
-                                    "primary": true,
-                                    "node": "xerj-node-1"
-                                },
-                                "num_committed_segments": num_segments,
-                                "num_search_segments": num_segments,
-                                "segments": segments_map,
-                                "num_docs": stats.doc_count,
-                                "size_in_bytes": snap.segments.iter().map(|s| s.size_bytes).sum::<u64>()
-                            }]
-                        }
-                    }
-                }
-            }))
-            .into_response()
+        let mut segments_map = serde_json::Map::new();
+        for (i, seg) in snap.segments.iter().enumerate() {
+            segments_map.insert(
+                i.to_string(),
+                json!({
+                    "generation": seg.min_seq_no,
+                    "num_docs": seg.doc_count,
+                    "deleted_docs": 0,
+                    "size_in_bytes": seg.size_bytes,
+                    "memory_in_bytes": 0,
+                    "committed": true,
+                    "search": true,
+                    "version": "9.10.0",
+                    "compound": false,
+                    "merges": { "merges": [] }
+                }),
+            );
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+
+        indices_map.insert(
+            name.clone(),
+            json!({
+                "shards": {
+                    "0": [{
+                        "routing": {
+                            "state": "STARTED",
+                            "primary": true,
+                            "node": "xerj-node-1"
+                        },
+                        "num_committed_segments": num_segments,
+                        "num_search_segments": num_segments,
+                        "segments": segments_map,
+                        "num_docs": stats.doc_count,
+                        "size_in_bytes": snap.segments.iter().map(|s| s.size_bytes).sum::<u64>()
+                    }]
+                }
+            }),
+        );
     }
+    let n = members.len();
+    Json(json!({
+        "_shards": { "total": n, "successful": n, "failed": 0 },
+        "indices": indices_map
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
