@@ -8942,6 +8942,14 @@ async fn search_impl(
                 && body.sort.is_none()
                 && body.collapse.is_none()
                 && body.search_after.is_none()
+                // The fusion executor also hard-drops rescore and highlight and
+                // ignores explain/profile (run_hybrid_with_deadline zeroes them on
+                // every sub-query) — keep bool.should when any is present so they
+                // are honoured rather than silently dropped (#458).
+                && body.rescore.is_none()
+                && body.highlight.is_none()
+                && !body.explain
+                && !body.profile
                 // A BM25-tuned `min_score` (e.g. 2.0) applied post-fusion to RRF
                 // micro-scores (~1/61) would drop EVERY hit — keep bool.should,
                 // where min_score compares against the BM25 sum it was tuned for.

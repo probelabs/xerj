@@ -189,3 +189,72 @@ async fn knn_beside_query_returns_the_vector_only_document() {
         "the lexical match must still be present: hits={ids:?} body={body}"
     );
 }
+
+/// A hybrid-incompatible feature (here `rescore`, which the fusion executor
+/// silently drops) must keep the request on the lexical `bool.should` path where
+/// rescore is honoured — NOT route it to `hybrid`. Observable proxy: the
+/// vector-only document that ONLY the hybrid path surfaces must be ABSENT, so a
+/// present-`rescore` request is provably not on the hybrid branch.
+#[tokio::test]
+async fn knn_beside_query_with_rescore_stays_on_the_lexical_path() {
+    let (app, _dir) = app().await;
+
+    let (st, b) = json_req(
+        &app,
+        "PUT",
+        "/r",
+        json!({ "mappings": { "properties": {
+            "body": { "type": "text" },
+            "v": { "type": "dense_vector", "dims": 3 }
+        } } }),
+    )
+    .await;
+    assert!(st.is_success(), "create index: {st} {b}");
+    for (id, body, vec) in [
+        ("lex", "alpha beta", [1.0_f32, 0.0, 0.0]),
+        ("vec", "zzz qqq", [0.1_f32, 0.2, 0.3]),
+    ] {
+        let (st, b) = json_req(
+            &app,
+            "POST",
+            &format!("/r/_doc/{id}"),
+            json!({ "body": body, "v": vec }),
+        )
+        .await;
+        assert!(st.is_success(), "index {id}: {st} {b}");
+    }
+    let (_s, _b) = json_req(&app, "POST", "/r/_refresh", json!({})).await;
+
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/r/_search",
+        json!({
+            "query": { "match": { "body": "alpha" } },
+            "knn": { "field": "v", "query_vector": [0.1, 0.2, 0.3], "k": 2, "num_candidates": 10 },
+            "rescore": { "window_size": 10, "query": { "rescore_query": { "match": { "body": "alpha" } } } }
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "knn+query+rescore status: {status} {body}"
+    );
+
+    let ids: Vec<String> = body
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .map(|hits| {
+            hits.iter()
+                .filter_map(|h| h.get("_id").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        !ids.iter().any(|id| id == "vec"),
+        "#458: knn+query+rescore must stay on bool.should (rescore honoured), not route to the \
+         hybrid executor that silently drops rescore — the hybrid-only vector doc must be \
+         absent: hits={ids:?} body={body}"
+    );
+}
