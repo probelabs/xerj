@@ -97,7 +97,9 @@ async fn seed(app: &axum::Router) {
 
 async fn count(app: &axum::Router, index: &str) -> u64 {
     let (_, body) = call(app, "GET", &format!("/{index}/_count"), Value::Null).await;
-    body.get("count").and_then(Value::as_u64).unwrap_or(u64::MAX)
+    body.get("count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX)
 }
 
 /// The #450 bug: a `_delete_by_query` through a 3-member alias must delete
@@ -139,6 +141,43 @@ async fn delete_by_query_through_a_multi_index_alias_deletes_every_member() {
             count(&app, member).await,
             0,
             "member {member} still holds documents after _delete_by_query through the alias (#450)"
+        );
+    }
+}
+
+/// The `_update_by_query` sibling: it shares the same `get_index → first`
+/// defect, so an update through the alias must reindex every member's matching
+/// documents, not just the first member's.
+#[tokio::test]
+async fn update_by_query_through_a_multi_index_alias_updates_every_member() {
+    let (app, _dir) = app().await;
+    seed(&app).await;
+
+    let total = (MEMBERS.len() * PER_INDEX) as u64;
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/tri/_update_by_query",
+        json!({"query": {"match_all": {}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "_update_by_query status: {body}");
+    assert_eq!(
+        body.get("updated").and_then(Value::as_u64),
+        Some(total),
+        "_update_by_query through a {}-member alias must touch every member's docs, \
+         not just the first member's (#450): {body}",
+        MEMBERS.len()
+    );
+
+    // Every member is still fully present (update reindexes in place; nothing
+    // is lost) — the point is that the count is honest about the whole corpus.
+    for member in MEMBERS {
+        assert_eq!(
+            count(&app, member).await,
+            PER_INDEX as u64,
+            "member {member} document count changed unexpectedly after _update_by_query"
         );
     }
 }
