@@ -14005,7 +14005,10 @@ impl Index {
         // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            let resolved = rewrite_query_aliases(&request.query, &schema.schema);
+            let resolved = rewrite_keyword_full_text_to_term(
+                &rewrite_query_aliases(&request.query, &schema.schema),
+                &schema.schema,
+            );
             if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
                 return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
                     format!(
@@ -32011,6 +32014,100 @@ mod lexically_typeless_lowering_tests {
             lower_lexically_typeless_clauses(&q, &std::collections::HashSet::new()),
             q
         );
+    }
+}
+
+/// #354: `match`/`multi_match` on a `keyword` field must take the query text
+/// WHOLE (keyword analyzer), not whitespace-tokenise + OR it. The flushed
+/// segment path already does this (per-field analyzer), but the memtable's
+/// schema-less `doc_matches_query`/`score_query_against_doc` tokenise, so the
+/// answer flipped at `_flush`. Rewrite keyword-targeted `Match`/`MultiMatch`
+/// clauses to whole-value `Term`s once here — where the schema is in scope — so
+/// BOTH paths agree. Analyzed-`text` fields are left untouched; a mixed
+/// `multi_match` splits into `Term`s for the keyword fields plus a `multi_match`
+/// over the remaining text fields. Same traversal coverage as
+/// `rewrite_query_aliases`, and applied after it so field names are canonical.
+fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNode {
+    fn is_keyword(schema: &Schema, field: &str) -> bool {
+        schema
+            .fields
+            .iter()
+            .any(|f| f.name == field && matches!(f.field_type, FieldType::Keyword))
+    }
+    match q {
+        QueryNode::Match {
+            field,
+            query,
+            boost,
+            ..
+        } if is_keyword(schema, field) => QueryNode::Term {
+            field: field.clone(),
+            value: Value::String(query.clone()),
+            boost: *boost,
+        },
+        QueryNode::MultiMatch {
+            fields,
+            query,
+            boost,
+            ..
+        } if fields.iter().any(|f| is_keyword(schema, f)) => {
+            let (kw, text): (Vec<String>, Vec<String>) =
+                fields.iter().cloned().partition(|f| is_keyword(schema, f));
+            let mut should: Vec<QueryNode> = kw
+                .into_iter()
+                .map(|f| QueryNode::Term {
+                    field: f,
+                    value: Value::String(query.clone()),
+                    boost: *boost,
+                })
+                .collect();
+            if !text.is_empty() {
+                // Preserve match_type/operator/etc. by cloning and swapping only
+                // the field list.
+                let mut text_mm = q.clone();
+                if let QueryNode::MultiMatch { fields: mmf, .. } = &mut text_mm {
+                    *mmf = text;
+                }
+                should.push(text_mm);
+            }
+            if should.len() == 1 {
+                should.into_iter().next().unwrap()
+            } else {
+                QueryNode::Bool {
+                    must: Vec::new(),
+                    should,
+                    must_not: Vec::new(),
+                    filter: Vec::new(),
+                    minimum_should_match: Some(MinShouldMatch::Fixed(1)),
+                }
+            }
+        }
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            minimum_should_match,
+        } => QueryNode::Bool {
+            must: must
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            should: should
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            must_not: must_not
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            filter: filter
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            minimum_should_match: minimum_should_match.clone(),
+        },
+        other => other.clone(),
     }
 }
 
