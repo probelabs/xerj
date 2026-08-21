@@ -11466,13 +11466,17 @@ impl Index {
         } else if is_semantic_text {
             xerj_ai::local::local_embed(text, dims)
         } else {
+            // #530: name the offending field, symmetric with the knn 400 (#498).
             return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
-                "semantic query requires either a `semantic_text` field (auto-embedded \
-                     with the built-in lexical embedder) or an active embedding backend \
-                     (`embedding.mode = \"neural\"`; `\"proxy\"` with \
-                     `embedding.default_endpoint` set to an OpenAI-compatible endpoint; \
-                     or `\"onnx-experimental\"` in an ONNX-enabled build with explicit \
-                     model and tokenizer paths).",
+                format!(
+                    "semantic query on field [{field}]: it is not a `semantic_text` field, so \
+                     there is no comparable stored vector to match. A `semantic` query requires \
+                     either a `semantic_text` field (auto-embedded with the built-in lexical \
+                     embedder) or an active embedding backend (`embedding.mode = \"neural\"`; \
+                     `\"proxy\"` with `embedding.default_endpoint` set to an OpenAI-compatible \
+                     endpoint; or `\"onnx-experimental\"` in an ONNX-enabled build with explicit \
+                     model and tokenizer paths)."
+                ),
             )));
         };
         drop(embedder);
