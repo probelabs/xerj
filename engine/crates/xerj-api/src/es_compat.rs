@@ -25188,22 +25188,35 @@ pub async fn cat_count(
 
     let mut count: u64 = 0;
     for name in &names {
-        if let Ok(idx) = state.engine.get_index(name) {
-            if alias_filters.is_empty() {
-                count += idx.stats().await.doc_count;
+        // #563: a per-member get_index / parse / search error must NOT silently
+        // contribute 0 — that made `_cat/count` quietly UNDER-report a filtered
+        // alias (the safe direction, but still a wrong number with no signal).
+        // Propagate it, like the scroll fan-out above does, so the caller gets a
+        // loud error instead of a plausible undercount.
+        let idx = match state.engine.get_index(name) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        };
+        if alias_filters.is_empty() {
+            count += idx.stats().await.doc_count;
+        } else {
+            // Count only the filter-admitted documents.
+            let filter_query = if alias_filters.len() == 1 {
+                alias_filters[0].clone()
             } else {
-                // Count only the filter-admitted documents.
-                let filter_query = if alias_filters.len() == 1 {
-                    alias_filters[0].clone()
-                } else {
-                    json!({ "bool": { "filter": alias_filters.clone() } })
-                };
-                let body = json!({ "query": filter_query, "size": 0, "track_total_hits": true });
-                if let Ok(req) = xerj_query::parse_request(&body) {
-                    if let Ok(res) = idx.search(&req).await {
-                        count += res.total.value;
-                    }
+                json!({ "bool": { "filter": alias_filters.clone() } })
+            };
+            let body = json!({ "query": filter_query, "size": 0, "track_total_hits": true });
+            let req = match xerj_query::parse_request(&body) {
+                Ok(r) => r,
+                Err(e) => {
+                    return ApiError::new(xerj_common::XerjError::invalid_query(e.to_string()))
+                        .into_response()
                 }
+            };
+            match idx.search(&req).await {
+                Ok(res) => count += res.total.value,
+                Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
             }
         }
     }
