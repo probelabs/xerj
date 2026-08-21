@@ -18403,30 +18403,42 @@ pub async fn mget_index(
 
     let mut docs: Vec<Value> = Vec::with_capacity(entries.len());
     for (ix, id) in &entries {
-        match state.engine.get_index(ix) {
-            Ok(idx) => match idx.get_document(id).await {
-                Ok(Some(source)) => {
-                    // Real per-doc `_seq_no` / `_version` (were hardcoded
-                    // 0 / 1) — matches the `_search` hit metadata path.
-                    let seq_no = idx.lookup_seq_no(id).unwrap_or(0);
-                    let version = idx.lookup_version(id).unwrap_or(1);
-                    docs.push(json!({
-                        "_index": ix,
-                        "_id": id,
-                        "_version": version,
-                        "_seq_no": seq_no,
-                        "_primary_term": 1,
-                        "found": true,
-                        "_source": source,
-                    }))
-                }
-                _ => docs.push(json!({
-                    "_index": ix,
+        // Resolve the entry's index through the shared resolver (#451): an
+        // alias expands to every member, so a doc in any member is found — not
+        // just the first. `get_index` collapsed an alias to `aliased.first()`,
+        // so a non-first member's doc reported `found:false` (class B).
+        let members = match resolve_selector_with_filters(&state, ix).await {
+            Ok((m, _filters)) => m,
+            Err(_) => {
+                docs.push(json!({ "_index": ix, "_id": id, "found": false }));
+                continue;
+            }
+        };
+        let mut hit = None;
+        for (mname, midx) in &members {
+            if let Ok(Some(source)) = midx.get_document(id).await {
+                hit = Some((mname.clone(), midx.clone(), source));
+                break;
+            }
+        }
+        match hit {
+            Some((mname, midx, source)) => {
+                // Real per-doc `_seq_no` / `_version` (were hardcoded 0 / 1) —
+                // matches the `_search` hit metadata path. `_index` reports the
+                // concrete member the doc lives in, not the alias.
+                let seq_no = midx.lookup_seq_no(id).unwrap_or(0);
+                let version = midx.lookup_version(id).unwrap_or(1);
+                docs.push(json!({
+                    "_index": mname,
                     "_id": id,
-                    "found": false,
-                })),
-            },
-            Err(_) => docs.push(json!({
+                    "_version": version,
+                    "_seq_no": seq_no,
+                    "_primary_term": 1,
+                    "found": true,
+                    "_source": source,
+                }));
+            }
+            None => docs.push(json!({
                 "_index": ix,
                 "_id": id,
                 "found": false,
@@ -19402,6 +19414,52 @@ pub async fn get_aliases(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Resolve an index spec (single name, comma list, wildcard, `_all`, `*`)
 /// into the concrete set of existing index names, in stable order.
+/// The single index-selector resolver (#451). Every endpoint that used to
+/// call `Engine::get_index` directly — collapsing an alias to `aliased.first()`
+/// (class B) — or had no alias branch at all (class A) should resolve through
+/// here instead, so all sites agree on what a selector means.
+///
+/// Returns each concrete member the selector names (an alias expands to ALL its
+/// members, #433) paired with its `Arc<Index>`, plus any alias `filter` clauses
+/// to AND into a query — the same shape `resolve_by_query_targets` uses on the
+/// write path (#450). A missing name propagates `index_not_found`, matching
+/// ES's default `ignore_unavailable=false`.
+async fn resolve_selector_with_filters(
+    state: &AppState,
+    spec: &str,
+) -> std::result::Result<
+    (
+        Vec<(String, std::sync::Arc<xerj_engine::Index>)>,
+        Vec<Value>,
+    ),
+    xerj_common::XerjError,
+> {
+    let names = resolve_index_selector(state, spec).await;
+    let mut alias_filters: Vec<Value> = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(entry) = state.engine.aliases.get(part) {
+            for backing in entry.value().iter() {
+                if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                    if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned() {
+                        alias_filters.push(filter);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(names.len());
+    for name in &names {
+        out.push((
+            name.clone(),
+            state
+                .engine
+                .get_index(name)
+                .map_err(xerj_common::XerjError::from)?,
+        ));
+    }
+    Ok((out, alias_filters))
+}
+
 async fn resolve_index_selector(state: &AppState, spec: &str) -> Vec<String> {
     let all: Vec<String> = state
         .engine
