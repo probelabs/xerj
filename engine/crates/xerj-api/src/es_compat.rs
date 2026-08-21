@@ -33191,7 +33191,25 @@ pub async fn eql_search(
     // Translate EQL -> xerj DSL, then run it through the normal search path.
     let inner_query = eql_to_query(&eql);
     let size = body.get("size").and_then(Value::as_u64).unwrap_or(10);
-    let search_body = json!({ "query": inner_query, "size": size, "from": 0 });
+
+    // Fan out to every member of a multi-index alias (#451 `_eql` arm):
+    // eql_search used Engine::get_index -> aliased.first(), silently returning
+    // only the first member's events. Search each member and merge the event
+    // lists, reporting the concrete member in `_index`. Resolve BEFORE building
+    // the request so any alias `filter` is ANDed into the query: a *filtered*
+    // alias is a document boundary (#451 class C, commit 170f41f2 closed this
+    // exact leak for _search/_msearch), so EQL must honour it too — fanning out
+    // unfiltered would leak the hidden members' rows.
+    let (members, filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let effective_query = if filters.is_empty() {
+        inner_query
+    } else {
+        json!({ "bool": { "must": [inner_query], "filter": filters } })
+    };
+    let search_body = json!({ "query": effective_query, "size": size, "from": 0 });
 
     let req = match xerj_query::parse_request(&search_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
@@ -33199,46 +33217,42 @@ pub async fn eql_search(
         Ok(r) => r,
         Err(e) => return ApiError::new(e).into_response(),
     };
-
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
-
-    match idx.search(&req).await {
-        Ok(result) => {
-            let took_ms = started.elapsed().as_millis() as u64;
-            let total = result.total.value;
-            let events: Vec<Value> = result
-                .hits
-                .into_iter()
-                .map(|h| {
+    let mut events: Vec<Value> = Vec::new();
+    let mut total: u64 = 0;
+    for (mname, midx) in &members {
+        match midx.search(&req).await {
+            Ok(result) => {
+                total += result.total.value;
+                for h in result.hits {
                     let source = if h.source.is_null() {
                         Value::Null
                     } else {
                         h.source
                     };
-                    json!({
-                        "_index": &index,
+                    events.push(json!({
+                        "_index": mname,
                         "_id": h.id,
                         "_source": source,
-                    })
-                })
-                .collect();
-            Json(json!({
-                "is_partial": false,
-                "is_running": false,
-                "took": took_ms,
-                "timed_out": false,
-                "hits": {
-                    "total": { "value": total, "relation": "eq" },
-                    "events": events,
-                },
-            }))
-            .into_response()
+                    }));
+                }
+            }
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     }
+    // Apply the EQL `size` limit across the merged member results.
+    events.truncate(size as usize);
+    let took_ms = started.elapsed().as_millis() as u64;
+    Json(json!({
+        "is_partial": false,
+        "is_running": false,
+        "took": took_ms,
+        "timed_out": false,
+        "hits": {
+            "total": { "value": total, "relation": "eq" },
+            "events": events,
+        },
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
