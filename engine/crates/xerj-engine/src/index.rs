@@ -25446,6 +25446,13 @@ fn apply_collapse_with_inner(
                         "_score": h.score,
                         "_source": h.source,
                         "sort": h.sort,
+                        // Carry the snapshotted seq_no/version so the renderer
+                        // does not do a live lookup + positional index (#506):
+                        // a collapse + scroll must hand inner hits the doc's real
+                        // sequence number, not the array index, and a snapshot
+                        // version, not one re-read at render time.
+                        "_seq_no": h.seq_no,
+                        "_version": h.version,
                     })
                 })
                 .collect();

@@ -13192,19 +13192,21 @@ async fn search_impl(
                                 hit_obj.insert("_score".to_string(), score);
                             }
                             if emit_version_ih {
-                                // Real per-doc `_version` (external map
-                                // wins) so inner_hits match top-level hits.
-                                let id_str = m.get("_id").and_then(Value::as_str).unwrap_or("");
-                                let v = state
-                                    .engine
-                                    .get_index(&idx_name)
-                                    .ok()
-                                    .and_then(|idx| idx.lookup_version(id_str))
-                                    .unwrap_or(1);
+                                // Snapshotted `_version` carried in the collapse
+                                // group (#506) — NOT a render-time live lookup,
+                                // which could pair a live `_version` with the
+                                // snapshot `_source` on a collapsed scroll.
+                                let v = m.get("_version").and_then(Value::as_u64).unwrap_or(1);
                                 hit_obj.insert("_version".to_string(), json!(v));
                             }
                             if emit_seq_no_ih {
-                                hit_obj.insert("_seq_no".to_string(), json!(i as u64));
+                                // The doc's real snapshotted seq_no, not the
+                                // array index (#506).
+                                let sn = m
+                                    .get("_seq_no")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(i as u64);
+                                hit_obj.insert("_seq_no".to_string(), json!(sn));
                                 hit_obj.insert("_primary_term".to_string(), json!(1));
                             }
                             if let Some(src) = m.get("_source").cloned() {
