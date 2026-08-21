@@ -221,3 +221,52 @@ async fn multi_knn_on_absent_field_is_400_not_silent_empty() {
         "the 400 must name the field: {body}"
     );
 }
+
+/// #542 (nested-knn arm): a `nested` knn naming a vector field absent from the
+/// nested mapping must 400, not return a silent empty 200. The nested arm is a
+/// separate dispatch from the single/multi-knn arms fixed in #498/#543.
+#[tokio::test]
+async fn nested_knn_on_absent_field_is_400_not_silent_empty() {
+    let (app, _dir) = app().await;
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/docs",
+        json!({ "mappings": { "properties": {
+            "items": { "type": "nested", "properties": { "name": { "type": "text" } } }
+        } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create index: {status} {body}");
+    let (_s, _b) = json_req(
+        &app,
+        "POST",
+        "/docs/_doc/1",
+        json!({ "items": [ { "name": "sniff" }, { "name": "detect" } ] }),
+    )
+    .await;
+    let (_s, _b) = json_req(&app, "POST", "/docs/_refresh", json!({})).await;
+
+    // Nested knn on `items.vector`, which the nested mapping does not have.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/docs/_search",
+        json!({ "query": { "nested": { "path": "items", "query": { "knn": {
+            "field": "items.vector", "query_vector": [0.1, 0.2, 0.3], "k": 5, "num_candidates": 50
+        } } } } }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "nested knn on an absent field must be 400, not a silent empty 200 (#542): got {status} {body}"
+    );
+    assert!(
+        body.pointer("/error/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("items.vector"),
+        "the 400 must name the field: {body}"
+    );
+}
