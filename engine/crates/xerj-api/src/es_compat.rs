@@ -33281,15 +33281,31 @@ pub async fn explain_doc(
     Path((index, id)): Path<(String, String)>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
-    let idx = match state.engine.get_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member, so the document is explained against the member that
+    // actually holds it. `get_index` collapsed an alias to `aliased.first()`,
+    // so a non-first member's doc reported `matched:false` / "document not
+    // found" (class B).
+    let (members, _filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
     };
-
-    // Fetch the document.
-    let doc_source = match idx.get_document(&id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => {
+    let mut resolved = None;
+    for (mname, midx) in &members {
+        match midx.get_document(&id).await {
+            Ok(Some(s)) => {
+                resolved = Some((mname.clone(), midx.clone(), s));
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    }
+    // On a hit, `index` is rebound to the concrete member (reported in
+    // `_index`); the not-found arm still names the selector the caller wrote.
+    let (index, idx, doc_source) = match resolved {
+        Some((mname, midx, s)) => (mname, midx, s),
+        None => {
             return Json(json!({
                 "_index": index,
                 "_id": id,
@@ -33302,7 +33318,6 @@ pub async fn explain_doc(
             }))
             .into_response();
         }
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
     // Parse the query from the body (default to match_all if absent).
