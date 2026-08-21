@@ -140,3 +140,64 @@ async fn msearch_through_a_filtered_alias_honours_the_filter() {
          boundary) was dropped on the msearch path (#451 class C): {body}"
     );
 }
+
+/// The scroll path (`_search?scroll=`) must also honour a filtered alias.
+#[tokio::test]
+async fn scroll_through_a_filtered_alias_honours_the_filter() {
+    let (app, _dir) = app().await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a",
+        json!({"mappings": {"properties": {"status": {"type": "keyword"}}}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create index");
+    for (id, status) in [("active", "active"), ("archived", "archived")] {
+        let (st, _) = call(
+            &app,
+            "PUT",
+            &format!("/idx-a/_doc/{id}"),
+            json!({ "status": status }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "index {id}");
+    }
+    let (_s, _b) = call(&app, "POST", "/idx-a/_refresh", Value::Null).await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a/_alias/hot",
+        json!({ "filter": { "term": { "status": "active" } } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create filtered alias");
+
+    // Open a scroll through the filtered alias.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/hot/_search?scroll=1m",
+        json!({ "query": { "match_all": {} }, "track_total_hits": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "scroll open status: {body}");
+    let total = body
+        .pointer("/hits/total/value")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let returned = body
+        .pointer("/hits/hits")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(usize::MAX);
+    assert_eq!(
+        total, 1,
+        "scroll through a filtered alias must see only the in-slice doc, not leak the \
+         out-of-slice document (#451 class C): {body}"
+    );
+    assert_eq!(
+        returned, 1,
+        "scroll first page must return only the in-slice doc: {body}"
+    );
+}
