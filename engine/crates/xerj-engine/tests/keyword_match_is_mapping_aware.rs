@@ -82,6 +82,20 @@ async fn keyword_match_takes_the_query_whole_in_both_phases() {
             &[],
             "multi_match 'red blue' on scalar keyword",
         ),
+        // A field spec carrying a `^boost` ("tags^2") must be recognised as
+        // keyword too — the boost suffix is stripped before consulting the
+        // mapping — so it takes the query whole and flips NEITHER phase.
+        (
+            json!({ "multi_match": { "query": "red blue", "fields": ["tags^2"] } }),
+            &[],
+            "multi_match 'red blue' on BOOSTED scalar keyword (tags^2)",
+        ),
+        // Positive control for the boosted spec: the whole value still matches.
+        (
+            json!({ "multi_match": { "query": "red", "fields": ["tags^2"] } }),
+            &["2"],
+            "multi_match 'red' on BOOSTED scalar keyword matches whole value",
+        ),
         (
             json!({ "match": { "tags": "red blue" } }),
             &[],

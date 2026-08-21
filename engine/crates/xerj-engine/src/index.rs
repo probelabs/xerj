@@ -32050,20 +32050,41 @@ fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNod
             query,
             boost,
             ..
-        } if fields.iter().any(|f| is_keyword(schema, f)) => {
-            let (kw, text): (Vec<String>, Vec<String>) =
-                fields.iter().cloned().partition(|f| is_keyword(schema, f));
+        } if fields
+            .iter()
+            .any(|f| is_keyword(schema, parse_field_boost(f).0)) =>
+        {
+            // A multi_match field spec may carry a `^boost` suffix ("tags^2");
+            // strip it before consulting the mapping (otherwise a boosted
+            // keyword field escapes the rewrite and keeps flipping at flush),
+            // and fold that field boost into the rewritten keyword `Term`.
+            let (kw, text): (Vec<String>, Vec<String>) = fields
+                .iter()
+                .cloned()
+                .partition(|f| is_keyword(schema, parse_field_boost(f).0));
             let mut should: Vec<QueryNode> = kw
                 .into_iter()
-                .map(|f| QueryNode::Term {
-                    field: f,
-                    value: Value::String(query.clone()),
-                    boost: *boost,
+                .map(|f| {
+                    let (name, fboost) = parse_field_boost(&f);
+                    // No `^boost` suffix → preserve the clause boost verbatim
+                    // (keeps the common unboosted case byte-identical); with a
+                    // suffix, combine it with the clause boost as ES does.
+                    let boost = if name.len() == f.len() {
+                        *boost
+                    } else {
+                        Some(fboost * (*boost).unwrap_or(1.0))
+                    };
+                    QueryNode::Term {
+                        field: name.to_string(),
+                        value: Value::String(query.clone()),
+                        boost,
+                    }
                 })
                 .collect();
             if !text.is_empty() {
-                // Preserve match_type/operator/etc. by cloning and swapping only
-                // the field list.
+                // Preserve match_type/operator/etc. (and each text field's own
+                // `^boost`, which the text matcher strips) by cloning and
+                // swapping only the field list.
                 let mut text_mm = q.clone();
                 if let QueryNode::MultiMatch { fields: mmf, .. } = &mut text_mm {
                     *mmf = text;
