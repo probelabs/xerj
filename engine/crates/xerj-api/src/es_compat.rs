@@ -25166,10 +25166,43 @@ pub async fn cat_count(
     // is scoped to wildcard resolution, not to making a bad literal name a
     // hard error the way the JSON `_count` endpoint does).
     let names = resolve_index_selector(&state, &index).await;
+
+    // A filtered alias must count only the slice its filter admits (#451 class
+    // C) — `stats().doc_count` is the whole backing index, so a filtered alias
+    // leaked a count including the documents it exists to hide. Gathered keyed
+    // on the written alias name, as the other read paths do.
+    let mut alias_filters: Vec<Value> = Vec::new();
+    for part in index.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(entry) = state.engine.aliases.get(part) {
+            for backing in entry.value().iter() {
+                if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                    if let Some(filter) = meta.get(part).and_then(|v| v.get("filter")).cloned() {
+                        alias_filters.push(filter);
+                    }
+                }
+            }
+        }
+    }
+
     let mut count: u64 = 0;
     for name in &names {
         if let Ok(idx) = state.engine.get_index(name) {
-            count += idx.stats().await.doc_count;
+            if alias_filters.is_empty() {
+                count += idx.stats().await.doc_count;
+            } else {
+                // Count only the filter-admitted documents.
+                let filter_query = if alias_filters.len() == 1 {
+                    alias_filters[0].clone()
+                } else {
+                    json!({ "bool": { "filter": alias_filters.clone() } })
+                };
+                let body = json!({ "query": filter_query, "size": 0, "track_total_hits": true });
+                if let Ok(req) = xerj_query::parse_request(&body) {
+                    if let Ok(res) = idx.search(&req).await {
+                        count += res.total.value;
+                    }
+                }
+            }
         }
     }
 

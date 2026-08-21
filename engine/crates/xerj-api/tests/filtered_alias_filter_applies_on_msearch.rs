@@ -201,3 +201,54 @@ async fn scroll_through_a_filtered_alias_honours_the_filter() {
         "scroll first page must return only the in-slice doc: {body}"
     );
 }
+
+/// `_cat/count` through a filtered alias must count only the in-slice docs.
+#[tokio::test]
+async fn cat_count_through_a_filtered_alias_honours_the_filter() {
+    let (app, _dir) = app().await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a",
+        json!({"mappings": {"properties": {"status": {"type": "keyword"}}}}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create index");
+    for (id, status) in [("active", "active"), ("archived", "archived")] {
+        let (st, _) = call(
+            &app,
+            "PUT",
+            &format!("/idx-a/_doc/{id}"),
+            json!({ "status": status }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "index {id}");
+    }
+    let (_s, _b) = call(&app, "POST", "/idx-a/_refresh", Value::Null).await;
+    let (st, _) = call(
+        &app,
+        "PUT",
+        "/idx-a/_alias/hot",
+        json!({ "filter": { "term": { "status": "active" } } }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create filtered alias");
+
+    let (status, body) = call(&app, "GET", "/_cat/count/hot?format=json", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "_cat/count status: {body}");
+    let count: u64 = body
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|r| r.get("count"))
+        .and_then(|c| {
+            c.as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| c.as_u64())
+        })
+        .unwrap_or(u64::MAX);
+    assert_eq!(
+        count, 1,
+        "_cat/count through a filtered alias must count only the in-slice (active) doc, \
+         not the whole backing index (#451 class C): {body}"
+    );
+}
