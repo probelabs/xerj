@@ -35771,56 +35771,65 @@ pub async fn index_segments(
     Path(index): Path<String>,
 ) -> impl IntoResponse {
     let index = strip_remote_cluster_prefix(&index);
-    match state.engine.get_index(&index) {
-        Ok(idx) => {
-            let stats = idx.stats().await;
-            let snap = idx.store_snapshot();
-            let num_segments = snap.segments.len();
+    // Resolve the selector through the shared resolver (#451): an alias expands
+    // to every member (`get_index` collapsed it to `aliased.first()`, so
+    // `_segments` reported one entry under the alias name). One `indices` entry
+    // per concrete member; `_shards` counts one shard per member.
+    let (members, _filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let mut indices_map = serde_json::Map::new();
+    for (name, idx) in &members {
+        let stats = idx.stats().await;
+        let snap = idx.store_snapshot();
+        let num_segments = snap.segments.len();
 
-            let mut segments_map = serde_json::Map::new();
-            for (i, seg) in snap.segments.iter().enumerate() {
-                segments_map.insert(
-                    i.to_string(),
-                    json!({
-                        "generation": seg.min_seq_no,
-                        "num_docs": seg.doc_count,
-                        "deleted_docs": 0,
-                        "size_in_bytes": seg.size_bytes,
-                        "memory_in_bytes": 0,
-                        "committed": true,
-                        "search": true,
-                        "version": "9.10.0",
-                        "compound": false,
-                        "merges": { "merges": [] }
-                    }),
-                );
-            }
-
-            Json(json!({
-                "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                "indices": {
-                    index: {
-                        "shards": {
-                            "0": [{
-                                "routing": {
-                                    "state": "STARTED",
-                                    "primary": true,
-                                    "node": "xerj-node-1"
-                                },
-                                "num_committed_segments": num_segments,
-                                "num_search_segments": num_segments,
-                                "segments": segments_map,
-                                "num_docs": stats.doc_count,
-                                "size_in_bytes": snap.segments.iter().map(|s| s.size_bytes).sum::<u64>()
-                            }]
-                        }
-                    }
-                }
-            }))
-            .into_response()
+        let mut segments_map = serde_json::Map::new();
+        for (i, seg) in snap.segments.iter().enumerate() {
+            segments_map.insert(
+                i.to_string(),
+                json!({
+                    "generation": seg.min_seq_no,
+                    "num_docs": seg.doc_count,
+                    "deleted_docs": 0,
+                    "size_in_bytes": seg.size_bytes,
+                    "memory_in_bytes": 0,
+                    "committed": true,
+                    "search": true,
+                    "version": "9.10.0",
+                    "compound": false,
+                    "merges": { "merges": [] }
+                }),
+            );
         }
-        Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+
+        indices_map.insert(
+            name.clone(),
+            json!({
+                "shards": {
+                    "0": [{
+                        "routing": {
+                            "state": "STARTED",
+                            "primary": true,
+                            "node": "xerj-node-1"
+                        },
+                        "num_committed_segments": num_segments,
+                        "num_search_segments": num_segments,
+                        "segments": segments_map,
+                        "num_docs": stats.doc_count,
+                        "size_in_bytes": snap.segments.iter().map(|s| s.size_bytes).sum::<u64>()
+                    }]
+                }
+            }),
+        );
     }
+    let n = members.len();
+    Json(json!({
+        "_shards": { "total": n, "successful": n, "failed": 0 },
+        "indices": indices_map
+    }))
+    .into_response()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
