@@ -11353,6 +11353,80 @@ impl Index {
         )))
     }
 
+    /// #542: the nested-knn analogue of [`Self::index_has_any_vector_at`].
+    /// Nested vectors live at `<nested_path>[].<subfield>` (see the scoring loop
+    /// in `run_nested_knn_brute_force_with_deadline`), so the top-level scan
+    /// would false-negative on them — this mirrors that traversal exactly.
+    /// Early-exits on the first hit; only invoked on an empty nested-knn result.
+    async fn index_has_any_nested_vector_at(&self, nested_path: &str, subfield: &str) -> bool {
+        fn elem_has_vector(elem: &Value, subfield: &str) -> bool {
+            elem.get(subfield)
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty() && a.iter().all(Value::is_number))
+        }
+        fn doc_has(source: &Value, nested_path: &str, subfield: &str) -> bool {
+            match get_field_value(source, nested_path) {
+                Some(Value::Array(arr)) => arr.iter().any(|e| elem_has_vector(e, subfield)),
+                Some(single) => elem_has_vector(&single, subfield),
+                None => false,
+            }
+        }
+        for (_id, source) in self.memtable.all_docs_with_sources() {
+            if doc_has(&source, nested_path, subfield) {
+                return true;
+            }
+        }
+        let snap = self.store.snapshot();
+        for meta in snap.segments.iter() {
+            if let Some(docs) = self.stored_values_for_async(&meta.id).await {
+                for doc in docs.iter() {
+                    let src = doc.get("_source").unwrap_or(doc);
+                    if doc_has(src, nested_path, subfield) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// #542: reject a NESTED `knn` clause naming a field the index cannot
+    /// answer with a 400, symmetric with [`Self::reject_unanswerable_knn_field`].
+    /// Declared `dense_vector` (dotted path) short-circuits; otherwise the nested
+    /// vector-presence scan decides, so declared-but-empty and
+    /// indexed-but-undeclared nested fields still return their real empty result.
+    async fn reject_unanswerable_nested_knn_field(
+        &self,
+        nested_path: &str,
+        field: &str,
+    ) -> Result<()> {
+        {
+            let schema = self.schema.read().await;
+            if collect_dense_vector_fields(&schema.schema)
+                .iter()
+                .any(|f| f == field)
+            {
+                return Ok(());
+            }
+        }
+        let subfield = field
+            .strip_prefix(&format!("{nested_path}."))
+            .unwrap_or(field);
+        if self
+            .index_has_any_nested_vector_at(nested_path, subfield)
+            .await
+        {
+            return Ok(());
+        }
+        Err(EngineError::Common(xerj_common::XerjError::invalid_query(
+            format!(
+                "[knn] nested query field [{field}] is not a vector field: it is absent from \
+                 the nested mapping and carries no indexed vector data. Map it as \
+                 [dense_vector] before running vector search."
+            ),
+        )))
+    }
+
     /// Brute-force nested KNN: score each parent by the best (max)
     /// similarity among its `<nested_path>` array elements.
     ///
@@ -14144,7 +14218,7 @@ impl Index {
             // It defaults to `k` when omitted and is clamped to `>= k` (a
             // smaller fan-out than the requested top-k makes no sense).
             let num_candidates = num_candidates_opt.unwrap_or(k).max(k);
-            return self
+            let result = self
                 .run_nested_knn_brute_force_with_deadline(
                     request,
                     search_deadline,
@@ -14157,7 +14231,16 @@ impl Index {
                     post_filter,
                     &similarity,
                 )
-                .await;
+                .await?;
+            // #542: a nested knn naming a field the index cannot answer must
+            // 400, not return a silent empty 200. Checked only on a genuinely
+            // empty, non-timed-out result, so the hot path and declared-but-
+            // empty / indexed-but-undeclared nested fields are untouched.
+            if result.hits.is_empty() && !result.timed_out {
+                self.reject_unanswerable_nested_knn_field(&nested_path, &field)
+                    .await?;
+            }
+            return Ok(result);
         }
 
         // ── Semantic search short-circuit ─────────────────────────────────────
