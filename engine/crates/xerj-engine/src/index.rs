@@ -30541,6 +30541,46 @@ fn peel_semantic_query(q: &QueryNode) -> Option<(String, String, usize, Option<B
         QueryNode::Constant { query, .. }
         | QueryNode::Boosted { query, .. }
         | QueryNode::Named { query, .. } => peel_semantic_query(query),
+        QueryNode::Bool {
+            must,
+            should,
+            filter,
+            must_not,
+            ..
+        } => {
+            // Mirror peel_knn_query: dispatch the simple case of a bool with
+            // exactly one must/should clause holding a `semantic`, ANDing any
+            // bool `filter` clauses into the semantic filter. Without this arm a
+            // `bool{must:[semantic]}` fell through to the lexical path and
+            // silently returned zero hits with a 200 (#395) — knn already peeled
+            // this exact shape, so semantic was the odd one out. Multi-clause
+            // bools (a semantic clause beside a lexical one) still fall through;
+            // fusing those is the separate #395 dispatch/reject decision.
+            if !must_not.is_empty() {
+                return None;
+            }
+            let candidates: Vec<&QueryNode> = must.iter().chain(should.iter()).collect();
+            if candidates.len() != 1 {
+                return None;
+            }
+            let (field, text, k, inner_filter) = peel_semantic_query(candidates[0])?;
+            let mut merged_filters: Vec<QueryNode> = filter.clone();
+            if let Some(fi) = inner_filter {
+                merged_filters.push(*fi);
+            }
+            let merged = match merged_filters.len() {
+                0 => None,
+                1 => Some(Box::new(merged_filters.into_iter().next().unwrap())),
+                _ => Some(Box::new(QueryNode::Bool {
+                    must: Vec::new(),
+                    should: Vec::new(),
+                    filter: merged_filters,
+                    must_not: Vec::new(),
+                    minimum_should_match: None,
+                })),
+            };
+            Some((field, text, k, merged))
+        }
         _ => None,
     }
 }
