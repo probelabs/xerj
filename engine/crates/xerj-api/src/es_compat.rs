@@ -33189,21 +33189,30 @@ pub async fn eql_search(
     // Translate EQL -> xerj DSL, then run it through the normal search path.
     let inner_query = eql_to_query(&eql);
     let size = body.get("size").and_then(Value::as_u64).unwrap_or(10);
-    let search_body = json!({ "query": inner_query, "size": size, "from": 0 });
+
+    // Fan out to every member of a multi-index alias (#451 `_eql` arm):
+    // eql_search used Engine::get_index -> aliased.first(), silently returning
+    // only the first member's events. Search each member and merge the event
+    // lists, reporting the concrete member in `_index`. Resolve BEFORE building
+    // the request so any alias `filter` is ANDed into the query: a *filtered*
+    // alias is a document boundary (#451 class C, commit 170f41f2 closed this
+    // exact leak for _search/_msearch), so EQL must honour it too — fanning out
+    // unfiltered would leak the hidden members' rows.
+    let (members, filters) = match resolve_selector_with_filters(&state, &index).await {
+        Ok(t) => t,
+        Err(e) => return ApiError::new(e).into_response(),
+    };
+    let effective_query = if filters.is_empty() {
+        inner_query
+    } else {
+        json!({ "bool": { "must": [inner_query], "filter": filters } })
+    };
+    let search_body = json!({ "query": effective_query, "size": size, "from": 0 });
 
     let req = match xerj_query::parse_request(&search_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
     {
         Ok(r) => r,
-        Err(e) => return ApiError::new(e).into_response(),
-    };
-
-    // Fan out to every member of a multi-index alias (#451 `_eql` arm):
-    // eql_search used Engine::get_index -> aliased.first(), silently returning
-    // only the first member's events. Search each member and merge the event
-    // lists, reporting the concrete member in `_index`.
-    let (members, _filters) = match resolve_selector_with_filters(&state, &index).await {
-        Ok(t) => t,
         Err(e) => return ApiError::new(e).into_response(),
     };
     let mut events: Vec<Value> = Vec::new();
