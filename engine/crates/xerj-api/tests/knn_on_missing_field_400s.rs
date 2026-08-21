@@ -270,3 +270,79 @@ async fn nested_knn_on_absent_field_is_400_not_silent_empty() {
         "the 400 must name the field: {body}"
     );
 }
+
+/// #547: the #529-class invariant for MULTI-knn — a 2-clause array on
+/// DECLARED-but-empty dense_vector fields returns an empty 200, not a 400.
+#[tokio::test]
+async fn multi_knn_on_declared_but_empty_vector_fields_is_empty_200() {
+    let (app, _dir) = app().await;
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/vecs",
+        json!({ "mappings": { "properties": {
+            "a": { "type": "dense_vector", "dims": 3 },
+            "b": { "type": "dense_vector", "dims": 3 }
+        } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create index: {status} {body}");
+    // No documents indexed — both fields are declared vectors with nothing to match.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/vecs/_search",
+        json!({ "knn": [
+            { "field": "a", "query_vector": [0.1, 0.2, 0.3], "k": 5, "num_candidates": 50 },
+            { "field": "b", "query_vector": [0.4, 0.5, 0.6], "k": 5, "num_candidates": 50 }
+        ] }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "multi-knn on declared-but-empty vector fields is a real empty result, not 400 (#547/#529): {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(0),
+        "expected empty: {body}"
+    );
+}
+
+/// #547: the #529-class invariant for NESTED knn — a nested knn on a
+/// DECLARED-but-empty nested dense_vector returns an empty 200, not a 400.
+#[tokio::test]
+async fn nested_knn_on_declared_but_empty_vector_field_is_empty_200() {
+    let (app, _dir) = app().await;
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/docs",
+        json!({ "mappings": { "properties": {
+            "items": { "type": "nested", "properties": {
+                "vector": { "type": "dense_vector", "dims": 3 }
+            } }
+        } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create index: {status} {body}");
+    // No documents indexed — the nested vector field is declared, just empty.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/docs/_search",
+        json!({ "query": { "nested": { "path": "items", "query": { "knn": {
+            "field": "items.vector", "query_vector": [0.1, 0.2, 0.3], "k": 5, "num_candidates": 50
+        } } } } }),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "nested knn on a declared-but-empty nested dense_vector is a real empty result, not 400 (#547/#529): {status} {body}"
+    );
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(0),
+        "expected empty: {body}"
+    );
+}
