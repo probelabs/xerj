@@ -22518,6 +22518,44 @@ async fn msearch_impl(
             }
         }
 
+        // AND in any alias `filter` before parsing (#451 class C). msearch
+        // resolved the alias to its members and searched them directly, never
+        // reading `index_alias_metadata`, so a filtered alias — the standard
+        // poor-man's document boundary — leaked the documents it exists to hide
+        // (`_search` through the same alias honours it). Gathered keyed on the
+        // written alias name, exactly as `search_impl` and
+        // `resolve_by_query_targets` do.
+        {
+            let mut alias_filters: Vec<Value> = Vec::new();
+            for part in index_name
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(entry) = state.engine.aliases.get(part) {
+                    for backing in entry.value().iter() {
+                        if let Some(meta) = state.engine.index_alias_metadata.get(backing) {
+                            if let Some(filter) =
+                                meta.get(part).and_then(|v| v.get("filter")).cloned()
+                            {
+                                alias_filters.push(filter);
+                            }
+                        }
+                    }
+                }
+            }
+            if !alias_filters.is_empty() {
+                let existing = effective_body.get("query").cloned();
+                let merged = match existing {
+                    None => json!({ "bool": { "filter": alias_filters } }),
+                    Some(q) => json!({ "bool": { "must": [q], "filter": alias_filters } }),
+                };
+                if let Some(obj) = effective_body.as_object_mut() {
+                    obj.insert("query".to_string(), merged);
+                }
+            }
+        }
+
         // Strip _index constraints BEFORE parsing so downstream FTS
         // doesn't try to score on a metadata field.
         let mut idx_constraints: Vec<String> = Vec::new();
