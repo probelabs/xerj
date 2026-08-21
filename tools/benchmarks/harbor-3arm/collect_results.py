@@ -103,12 +103,22 @@ def main():
     for (bench, model, arm), tasks in cells.items():
         by_bm[(bench, model)][arm] = {
             t for t, v in tasks.items() if v["reward"] is not None}
+    canonical_arms = {"native", "xerj", "xerj-tuned"}
     for (bench, model), arms in sorted(by_bm.items()):
         if len(arms) < 2:
             continue
+        present = set(arms)
         common = set.intersection(*arms.values())
+        # A comparison that isn't the full 3-arm set must say so LOUDLY — an
+        # absent arm otherwise reads as a footnote and a reader can mistake, e.g.,
+        # native vs xerj-tuned for the headline result (#516).
+        coverage = "" if present == canonical_arms else (
+            f"   ⚠ PARTIAL ARM COVERAGE — missing "
+            f"{sorted(canonical_arms - present) or 'nothing'}, "
+            f"unexpected {sorted(present - canonical_arms) or 'nothing'}; "
+            f"this is NOT the canonical 3-arm comparison")
         print(f"\n{bench} / {model}: {len(common)} tasks finished in all "
-              f"{len(arms)} arms")
+              f"{len(arms)} arms ({', '.join(sorted(present))}){coverage}")
         for arm in sorted(arms):
             tv = cells[(bench, model, arm)]
             k = sum(1 for t in common if tv[t]["resolved"])

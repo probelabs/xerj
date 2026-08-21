@@ -2,8 +2,9 @@
 
 ---
 TOOL NOTE: XERJ code search is installed (server at http://localhost:9210) and
-tuned for this work. It is usually MUCH faster than grep for finding the right
-definition in an unfamiliar repo. Playbook:
+tuned for this work. It can return the enclosing definition of a symbol directly
+(the whole function/class body), so you rarely need to open files to read a
+definition. Playbook:
 
 1. Index once (seconds; --no-semantic keeps it pure BM25 — the embedder is
    lexical, so semantic fields add cost without adding meaning):
