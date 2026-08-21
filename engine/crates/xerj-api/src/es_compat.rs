@@ -8910,15 +8910,62 @@ async fn search_impl(
             single => (knn_spec_to_query_json(single), knn_clause_k(single)),
         };
         let merged_query = if let Some(ref existing_q) = body.query {
-            // Hybrid: combine knn + query as a bool should.
-            json!({
-                "bool": {
-                    "should": [
-                        existing_q,
-                        knn_query_json
-                    ]
-                }
-            })
+            // ES 8.x canonical hybrid: a top-level `knn` block beside a
+            // `query`. This used to fold to `{"bool":{"should":[query, knn]}}`
+            // — and the engine never dispatched it to the vector path, because
+            // `peel_knn_query` only peels a bool holding exactly ONE clause.
+            // Two clauses, so it fell through to the generic lexical path and
+            // the kNN half contributed NOTHING: the request answered 200 with
+            // the purely lexical result set, `_shards.failed: 0`, no warning
+            // (#395). Measured on a 3-document index: `query` alone returned
+            // documents 0 and 2, `knn` alone returned 0, 1 and 2, and the two
+            // together returned exactly 0 and 2 — the lexical answer wearing a
+            // hybrid request's clothes, which is a wire-compat divergence from
+            // ES 8.x and not merely an internal limitation.
+            //
+            // `hybrid` is the shape this engine actually combines (it fans each
+            // sub-query out and RRF-fuses the ranked lists), so it dispatches
+            // the kNN half correctly. BUT the hybrid executor REJECTS
+            // aggregations (returns 400) and ignores sort/collapse/search_after.
+            // Folding EVERY knn-beside-query request to hybrid would therefore
+            // turn a valid faceted request (knn + query + aggs) from 200 into a
+            // 400, and silently drop a caller's sort/collapse — trading one
+            // wrong answer for another. So fold to `hybrid` only when the
+            // request carries none of those; otherwise keep the lexical
+            // `bool.should`. Its kNN-dropped hits are the PRE-EXISTING behaviour
+            // (strictly no worse than before this fix), and it still honours
+            // aggs/sort/collapse and returns 200. In the hybrid case scores are
+            // RRF, not a BM25 sum — a visible, documented difference, still
+            // better than silently returning the wrong documents.
+            let hybrid_safe = body.aggs.is_none()
+                && body.aggregations.is_none()
+                && body.sort.is_none()
+                && body.collapse.is_none()
+                && body.search_after.is_none()
+                // The fusion executor also hard-drops rescore and highlight and
+                // ignores explain/profile (run_hybrid_with_deadline zeroes them on
+                // every sub-query) — keep bool.should when any is present so they
+                // are honoured rather than silently dropped (#458).
+                && body.rescore.is_none()
+                && body.highlight.is_none()
+                && !body.explain
+                && !body.profile
+                // A BM25-tuned `min_score` (e.g. 2.0) applied post-fusion to RRF
+                // micro-scores (~1/61) would drop EVERY hit — keep bool.should,
+                // where min_score compares against the BM25 sum it was tuned for.
+                && body.min_score.is_none();
+            if hybrid_safe {
+                json!({
+                    "hybrid": {
+                        "queries": [
+                            { "query": existing_q },
+                            { "query": knn_query_json }
+                        ]
+                    }
+                })
+            } else {
+                json!({ "bool": { "should": [existing_q, knn_query_json] } })
+            }
         } else {
             knn_query_json
         };
