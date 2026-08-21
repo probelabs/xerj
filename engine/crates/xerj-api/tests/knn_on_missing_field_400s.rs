@@ -166,3 +166,58 @@ async fn knn_on_declared_but_empty_vector_field_is_empty_200() {
         .unwrap_or(u64::MAX);
     assert_eq!(total, 0, "expected an empty result set: {body}");
 }
+
+/// #542 (follow-up to #498): the MULTI-knn array form (`knn: [...]`) must also
+/// 400 a clause naming an unanswerable field — #498 only wired the check into
+/// the single top-level knn arm, so the array form still returns a silent
+/// empty 200.
+#[tokio::test]
+async fn multi_knn_on_absent_field_is_400_not_silent_empty() {
+    let (app, _dir) = app().await;
+    let (status, body) = json_req(
+        &app,
+        "PUT",
+        "/codes",
+        json!({ "mappings": { "properties": {
+            "name": { "type": "text" },
+            "code": { "type": "keyword" }
+        } } }),
+    )
+    .await;
+    assert!(status.is_success(), "create index: {status} {body}");
+    let (_s, _b) = json_req(
+        &app,
+        "POST",
+        "/codes/_doc/1",
+        json!({ "name": "sniff", "code": "fn sniff() {}" }),
+    )
+    .await;
+    let (_s, _b) = json_req(&app, "POST", "/codes/_refresh", json!({})).await;
+
+    // The ES multi-knn array form with 2+ clauses (a single-element array
+    // collapses to the single-knn path, already fixed by #498). A clause naming
+    // a field absent from the mapping must fail loudly, not return a silent
+    // empty 200.
+    let (status, body) = json_req(
+        &app,
+        "POST",
+        "/codes/_search",
+        json!({ "knn": [
+            { "field": "embedding", "query_vector": [0.1, 0.2, 0.3], "k": 5, "num_candidates": 50 },
+            { "field": "embedding2", "query_vector": [0.4, 0.5, 0.6], "k": 5, "num_candidates": 50 }
+        ] }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "multi-knn on an absent field must be 400, not a silent empty 200 (#542): got {status} {body}"
+    );
+    assert!(
+        body.pointer("/error/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .contains("embedding"),
+        "the 400 must name the field: {body}"
+    );
+}
