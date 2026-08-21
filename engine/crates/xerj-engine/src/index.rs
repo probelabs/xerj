@@ -23,7 +23,7 @@ use xerj_fts::search::{
 use xerj_query::ast::{
     BoostMode, FieldValueFactor, Fuzziness, HighlightRequest, MinShouldMatch, Modifier, QueryNode,
     RandomScore, RescoreQuery, SavingsMode, ScoreFunction, ScoreMode, SearchRequest, SourceFilter,
-    TrackTotalHits,
+    TrackTotalHits, WeightedQuery,
 };
 use xerj_query::executor::{
     strip_internal_passage_metadata, Hit, PassageMatch, PayloadSavings, SavingsMethod,
@@ -32127,6 +32127,78 @@ fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNod
                 .map(|c| rewrite_keyword_full_text_to_term(c, schema))
                 .collect(),
             minimum_should_match: minimum_should_match.clone(),
+        },
+        // Wrapper/compound nodes carry sub-queries that may target keyword
+        // fields; recurse into them so a keyword `match`/`multi_match` nested
+        // inside them is made mapping-aware too (otherwise it keeps flipping at
+        // flush). Leaf and positional (span) nodes have no full-text sub-query
+        // to rewrite and fall through unchanged.
+        QueryNode::Constant { score, query } => QueryNode::Constant {
+            score: *score,
+            query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
+        },
+        QueryNode::Boosted { boost, query } => QueryNode::Boosted {
+            boost: *boost,
+            query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
+        },
+        QueryNode::FunctionScore {
+            query,
+            functions,
+            score_mode,
+            boost_mode,
+            max_boost,
+        } => QueryNode::FunctionScore {
+            query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
+            functions: functions.clone(),
+            score_mode: *score_mode,
+            boost_mode: *boost_mode,
+            max_boost: *max_boost,
+        },
+        QueryNode::Boosting {
+            positive,
+            negative,
+            negative_boost,
+        } => QueryNode::Boosting {
+            positive: Box::new(rewrite_keyword_full_text_to_term(positive, schema)),
+            negative: Box::new(rewrite_keyword_full_text_to_term(negative, schema)),
+            negative_boost: *negative_boost,
+        },
+        QueryNode::DisMax {
+            queries,
+            tie_breaker,
+        } => QueryNode::DisMax {
+            queries: queries
+                .iter()
+                .map(|c| rewrite_keyword_full_text_to_term(c, schema))
+                .collect(),
+            tie_breaker: *tie_breaker,
+        },
+        QueryNode::Nested {
+            path,
+            query,
+            score_mode,
+        } => QueryNode::Nested {
+            path: path.clone(),
+            query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
+            score_mode: score_mode.clone(),
+        },
+        QueryNode::Hybrid { queries, fusion } => QueryNode::Hybrid {
+            queries: queries
+                .iter()
+                .map(|wq| WeightedQuery {
+                    query: rewrite_keyword_full_text_to_term(&wq.query, schema),
+                    weight: wq.weight,
+                })
+                .collect(),
+            fusion: fusion.clone(),
+        },
+        QueryNode::Pinned { ids, organic } => QueryNode::Pinned {
+            ids: ids.clone(),
+            organic: Box::new(rewrite_keyword_full_text_to_term(organic, schema)),
+        },
+        QueryNode::Named { name, query } => QueryNode::Named {
+            name: name.clone(),
+            query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
         },
         other => other.clone(),
     }
