@@ -625,6 +625,51 @@ fn add_change_delete_and_rename_converge_over_real_http() {
     assert_eq!(journal_events(state_dir.path(), "sync_commit"), 5);
 }
 
+/// #580: re-indexing a **code file** must not abort. The AST file document
+/// carries a `symbols` array (of objects); `FieldAcc` does not scalar-type it,
+/// so it is pruned from the frozen dataset schema at genesis — and the second
+/// generation observed `symbols` again and aborted with `field symbols is
+/// absent from frozen dataset`. A field with no scalar values is now allowed to
+/// be absent from the frozen schema.
+#[test]
+fn code_file_reindex_does_not_abort_on_absent_symbols_field() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus.path().join("lib.rs"),
+        "pub struct AlphaConfig {\n    pub retries: u32,\n}\n",
+    )
+    .unwrap();
+    let endpoint = HttpEndpoint::start();
+    let config = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    // Genesis.
+    assert_eq!(run_index(config.clone()).unwrap(), 0);
+    // Edit the code file and re-index — before #580 this aborted the whole run
+    // on the frozen `symbols` field.
+    fs::write(
+        corpus.path().join("lib.rs"),
+        "pub struct AlphaConfig {\n    pub retries: u64,\n}\n",
+    )
+    .unwrap();
+    assert_eq!(
+        run_index(config).unwrap(),
+        0,
+        "re-indexing a code file must reconcile, not abort on the frozen `symbols` field (#580)"
+    );
+    // The struct is still indexed (file doc + its symbol doc).
+    assert!(
+        endpoint
+            .data_docs()
+            .iter()
+            .any(|d| d.get("name").is_some_and(|n| n == "AlphaConfig")),
+        "the struct's symbol doc must survive the re-index"
+    );
+}
+
 #[test]
 fn pending_generation_replays_sealed_source_after_live_source_mutates() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
