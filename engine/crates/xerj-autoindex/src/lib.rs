@@ -3292,6 +3292,30 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
             rebuild_argv
         );
     }
+    // #490: a committed generation manifest is graph-disabled by construction
+    // (`sync::validate_manifest` requires `!graph_enabled` for every incremental
+    // generation), and the `--no-graph`/committed re-run above already returned.
+    // So reaching here with a committed manifest on the default *graph* path
+    // means the corpus was built `--no-graph` and is being re-run with graph
+    // detection on. Left to proceed it reconciles the no-graph plan on the graph
+    // path and mutates the destination — publishing new documents and writing a
+    // legacy plan record over the committed manifest — before the mismatch ever
+    // surfaces (as an opaque `legacy plan write cannot follow a committed
+    // generated manifest`), and then leaves `--fresh` refused. Refuse it here,
+    // before the journal is opened for write and before `gc_snapshots`, exactly
+    // the way the graph→no-graph direction above is refused: nothing is mutated.
+    if !cfg.no_graph && !genesis_recovery {
+        if let Some(committed) = preflight.committed_manifest.as_ref() {
+            anyhow::bail!(
+                "this corpus was indexed with --no-graph (committed generation {}); re-running \
+                 it on the default graph path would reconcile two different authorities and \
+                 mutate the destination. No remote mutation was attempted. Re-run with \
+                 --no-graph to continue the committed corpus incrementally, or rebuild with a \
+                 new --state-dir and a new --prefix.",
+                committed.generation
+            );
+        }
+    }
     if let Some(prior_plan) = preflight.plan.as_ref() {
         let comparison_keys = if cfg.fresh {
             inventory.keys.clone()
