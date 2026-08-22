@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A file excluded by a widened ignore/hidden rule was reported as a user
+  deletion, so the graph resume path refused the rerun and its recovery
+  contract told operators to "restore the removed file(s)" — a file still on
+  disk** ([#439](https://github.com/xerj-org/xerj/issues/439), first fix). The
+  resume-plan reconciler (`UnsupportedInventoryDelta::between`) now splits a plan
+  file that vanished from the walk by whether it is still on disk, probed through
+  the reversible raw-bytes `path_id` so a hidden *non-UTF-8* name (the case #439
+  was filed for) is matched instead of read as a phantom removal through its
+  lossy `rel`. A genuine deletion keeps the "restore the removed file(s)" route;
+  a still-on-disk exclusion now says the file is still on disk and names the real
+  routes (narrow the rule to re-admit it, or rebuild isolated to drop it). The
+  refusal itself is unchanged — the documents still stay live — because sweeping
+  an excluded group from the destination (so a widened exclusion actually removes
+  the data) is a larger change tracked in
+  [#589](https://github.com/xerj-org/xerj/issues/589).
+
 - **`sort` on a field XERJ cannot resolve returned `null` on every hit
   instead of an error** ([#437](https://github.com/xerj-org/xerj/issues/437)).
   `compute_sort_values` special-cased `_score`, `_doc`, `_id` and the four
@@ -580,16 +596,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Upgrade.** A corpus indexed by a pre-fix binary that contains a
   hidden non-UTF-8 name looks like a file removal to the graph-enabled
-  path (the default, and what `xerj brain` uses). Until
-  [#439](https://github.com/xerj-org/xerj/issues/439) lands, the first
-  rerun exits 1 with `unsupported_content_group_removal`, writes
-  nothing, and the already-indexed documents stay live. Do not follow
-  the refusal's first recovery route ("restore the removed file(s)"):
-  the file is still on disk, just no longer walked. Recovery that
-  works: delete the published indices and the state directory, then
-  re-index the folder. An isolated rebuild with a new `--state-dir` /
-  `--prefix` also exits 0, but leaves the old target's documents live
-  until those indices are deleted by hand.
+  path (the default, and what `xerj brain` uses). As of
+  [#439](https://github.com/xerj-org/xerj/issues/439)'s first fix the
+  rerun's refusal names the real cause — the file is still on disk,
+  excluded, not removed — instead of the misleading "restore the removed
+  file(s)". It still exits 1 with `unsupported_content_group_removal`,
+  writes nothing, and the already-indexed documents still stay live;
+  sweeping them (so a widened exclusion removes the data) is tracked in
+  [#589](https://github.com/xerj-org/xerj/issues/589). Recovery that
+  removes the data today: delete the published indices and the state
+  directory, then re-index the folder. An isolated rebuild with a new
+  `--state-dir` / `--prefix` also exits 0, but leaves the old target's
+  documents live until those indices are deleted by hand.
 
 - **Autoindex snapshot and replay one-shot failpoints can no longer be stolen by unrelated parallel tests.** ([#385](https://github.com/xerj-org/xerj/issues/385)).
   The two test-only failpoints are now owned by the thread that arms them, while

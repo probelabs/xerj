@@ -2389,7 +2389,17 @@ struct InventoryDeltaEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct UnsupportedInventoryDelta {
     added_content_groups: Vec<InventoryDeltaEntry>,
-    vanished_content_groups: Vec<InventoryDeltaEntry>,
+    /// Vanished from the walk AND absent from disk: a genuine user deletion.
+    /// Refused, because the published documents stay live with no source file
+    /// behind them and nothing here removes them.
+    deleted_content_groups: Vec<InventoryDeltaEntry>,
+    /// Vanished from the walk but STILL ON DISK: the file was excluded by a
+    /// widened ignore/hidden rule, not removed by the user (#439). Its documents
+    /// likewise stay live, so the rerun is still refused — but the recovery is
+    /// different, and leading an operator (or an agent parsing the JSON) to
+    /// "restore the removed file" is wrong when the file is one `ls` away. A
+    /// follow-up sweeps these from the destination instead of refusing.
+    excluded_content_groups: Vec<InventoryDeltaEntry>,
 }
 
 /// Everything the refusal needs to name the destination it is protecting.
@@ -2485,26 +2495,70 @@ struct UnsupportedInventoryDeltaError {
 
 impl UnsupportedInventoryDeltaError {
     fn to_json(&self) -> Value {
+        let deleted = &self.delta.deleted_content_groups;
+        let excluded = &self.delta.excluded_content_groups;
+        // Back-compat: `vanished_content_groups` (the v1 field) stays as the
+        // union of both causes; `deleted_`/`excluded_content_groups` add the
+        // #439 distinction without removing anything a v1 consumer reads.
+        // Globally sorted, matching the pre-split v1 field: the two buckets are
+        // each sorted, but a mixed run must not expose bucket order to a v1
+        // consumer that saw one (path, file_key)-sorted list.
+        let mut vanished: Vec<&InventoryDeltaEntry> =
+            deleted.iter().chain(excluded.iter()).collect();
+        vanished.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.file_key.cmp(&right.file_key))
+        });
+        let message = if excluded.is_empty() {
+            "this attempt made no remote mutations. Files that were indexed under this resume plan no longer exist in the folder, and their documents are still live in the destination; removing files from an indexed folder is not reconciled yet".to_string()
+        } else if deleted.is_empty() {
+            "this attempt made no remote mutations. Files that were indexed under this resume plan are STILL ON DISK but the walk no longer yields them — an ignore or hidden-file rule widened to exclude them. They were not removed, and their documents are still live in the destination; sweeping an excluded file's documents in place is not reconciled yet".to_string()
+        } else {
+            "this attempt made no remote mutations. Some files indexed under this resume plan no longer exist in the folder (deleted); others are still on disk but the walk no longer yields them because an ignore or hidden-file rule widened (excluded, not removed). Both sets' documents are still live in the destination and neither deletion nor exclusion is reconciled in place yet".to_string()
+        };
+        let mut recovery = serde_json::Map::new();
+        if !deleted.is_empty() {
+            recovery.insert(
+                "restore_removed_files".into(),
+                json!("for the DELETED file(s) only: put them back and rerun; every other file keeps its resume state. Do NOT apply this to the excluded file(s) — they were never removed"),
+            );
+        }
+        if !excluded.is_empty() {
+            recovery.insert(
+                "excluded_not_removed".into(),
+                json!("the excluded file(s) are still on disk — an ignore/hidden rule now matches them, so the walk stopped yielding them. Restoring them is wrong (they were never removed). To keep them indexed, narrow the rule so the walk re-admits them; to drop them from the index, rebuild isolated (below) — their documents cannot yet be swept in place"),
+            );
+        }
+        recovery.insert(
+            "rebuild_in_place".into(),
+            json!(format!(
+                "delete the indices this plan publishes ({}) and the state directory {}, then rerun. This re-extracts and re-embeds the whole corpus.{}",
+                self.targets.indices_phrase(),
+                self.targets.state_dir,
+                self.targets.edges_note().trim_start_matches(' ')
+            )),
+        );
+        recovery.insert(
+            "rebuild_isolated".into(),
+            json!("index with a new --state-dir, new --prefix, and (when graph detection is enabled) new --brain; alternatively add --no-graph. Validate the isolated target before switching readers, then clean the old one"),
+        );
+        recovery.insert(
+            "fresh_warning".into(),
+            json!("--fresh re-extracts the current folder in place and does pick up added and changed files, but it never deletes documents already published for removed or excluded files, so it is refused here"),
+        );
         json!({
             "schema": "xerj.autoindex.unsupported_sync_delta.v1",
             "status": "error",
             "error": "unsupported_content_group_removal",
-            "message": "this attempt made no remote mutations. Files that were indexed under this resume plan no longer exist in the folder, and their documents are still live in the destination; removing files from an indexed folder is not reconciled yet",
-            "vanished_content_groups": self.delta.vanished_content_groups,
+            "message": message,
+            "vanished_content_groups": vanished,
+            "deleted_content_groups": deleted,
+            "excluded_content_groups": excluded,
             // Context, not the reason for the refusal: a rerun over a frozen
             // plan does not index files added after the plan was frozen.
             "added_content_groups": self.delta.added_content_groups,
-            "recovery": {
-                "restore_removed_files": "put the listed file(s) back and rerun; every other file keeps its resume state",
-                "rebuild_in_place": format!(
-                    "delete the indices this plan publishes ({}) and the state directory {}, then rerun. This re-extracts and re-embeds the whole corpus.{}",
-                    self.targets.indices_phrase(),
-                    self.targets.state_dir,
-                    self.targets.edges_note().trim_start_matches(' ')
-                ),
-                "rebuild_isolated": "index with a new --state-dir, new --prefix, and (when graph detection is enabled) new --brain; alternatively add --no-graph. Validate the isolated target before switching readers, then clean the old one",
-                "fresh_warning": "--fresh re-extracts the current folder in place and does pick up added and changed files, but it never deletes documents already published for removed files, so it is refused here"
-            }
+            "recovery": Value::Object(recovery)
         })
     }
 }
@@ -2527,15 +2581,36 @@ impl std::fmt::Display for UnsupportedInventoryDeltaError {
             }
             rendered
         };
+        let deleted = &self.delta.deleted_content_groups;
+        let excluded = &self.delta.excluded_content_groups;
         write!(
             formatter,
-            "{} file(s) indexed under this resume plan no longer exist in the folder, and their \
-             documents are still live in the destination. Removing files from an indexed folder \
-             is not reconciled yet, so this attempt made no remote mutations — no documents, \
-             aliases, graph edges or catalog entries were written. Removed content groups [{}].",
-            self.delta.vanished_content_groups.len(),
-            render(&self.delta.vanished_content_groups)
+            "this attempt made no remote mutations — no documents, aliases, graph edges or \
+             catalog entries were written."
         )?;
+        if !deleted.is_empty() {
+            write!(
+                formatter,
+                " {} file(s) indexed under this resume plan no longer exist in the folder, and \
+                 their documents are still live in the destination; removing files from an \
+                 indexed folder is not reconciled yet. Deleted content groups [{}].",
+                deleted.len(),
+                render(deleted)
+            )?;
+        }
+        if !excluded.is_empty() {
+            // #439: still on disk, so "restore the removed file" is wrong.
+            write!(
+                formatter,
+                " {} file(s) indexed under this resume plan are still on disk but the walk no \
+                 longer yields them — an ignore or hidden-file rule widened to exclude them, so \
+                 they were not removed. Their documents are still live in the destination; \
+                 sweeping an excluded file's documents in place is not reconciled yet. Excluded \
+                 content groups [{}].",
+                excluded.len(),
+                render(excluded)
+            )?;
+        }
         if !self.delta.added_content_groups.is_empty() {
             write!(
                 formatter,
@@ -2544,16 +2619,30 @@ impl std::fmt::Display for UnsupportedInventoryDeltaError {
                 render(&self.delta.added_content_groups)
             )?;
         }
+        write!(formatter, " Recovery, cheapest first:")?;
+        if !deleted.is_empty() {
+            write!(
+                formatter,
+                " restore the DELETED file(s) and rerun — every other file keeps its resume \
+                 state (this does not apply to the excluded file(s), which were never removed);"
+            )?;
+        }
+        if !excluded.is_empty() {
+            write!(
+                formatter,
+                " for the EXCLUDED file(s), narrow the ignore/hidden rule so the walk re-admits \
+                 them (keeps them indexed), or rebuild isolated to drop them — their documents \
+                 cannot yet be swept in place;"
+            )?;
+        }
         write!(
             formatter,
-            " Recovery, cheapest first: (1) restore the removed file(s) and rerun — every other \
-             file keeps its resume state; (2) rebuild in place by deleting the indices this plan \
-             publishes ({}) and the state directory {}, then rerunning — this re-extracts and \
-             re-embeds the whole corpus.{} (3) rebuild isolated with a new --state-dir, a new \
-             --prefix and, when graph detection is enabled, a new --brain (or --no-graph), \
-             validate it, switch readers, then clean the old target. `--fresh` picks up added \
-             and changed files in place but never deletes documents for removed files, so it is \
-             refused here too",
+            " rebuild in place by deleting the indices this plan publishes ({}) and the state \
+             directory {}, then rerunning — this re-extracts and re-embeds the whole corpus.{} \
+             rebuild isolated with a new --state-dir, a new --prefix and, when graph detection \
+             is enabled, a new --brain (or --no-graph), validate it, switch readers, then clean \
+             the old target. `--fresh` picks up added and changed files in place but never \
+             deletes documents for removed or excluded files, so it is refused here too",
             self.targets.indices_phrase(),
             self.targets.state_dir,
             self.targets.edges_note()
@@ -2563,8 +2652,73 @@ impl std::fmt::Display for UnsupportedInventoryDeltaError {
 
 impl std::error::Error for UnsupportedInventoryDeltaError {}
 
+/// Whether a plan file that vanished from the walk is still on disk (#439).
+///
+/// The disk probe uses the file's reversible raw-bytes identity (`path_id`:
+/// `unix:<hex>` / `windows:<hex>`), NOT its `rel`. `rel` is a `to_string_lossy`
+/// rendering, so a hidden non-UTF-8 name — the exact case #439 was filed for —
+/// is stored with `U+FFFD` and no dirent matches it; probing through `rel` would
+/// call every such file a deletion. `path_id` round-trips the real bytes. Legacy
+/// plans that predate `path_id` fall back to `rel`. An unreadable path counts as
+/// present, so a stat failure never produces a "restore the removed file"
+/// instruction for a file that is merely inaccessible.
+fn vanished_is_on_disk(root: &Path, assignment: &FileAssignment) -> bool {
+    let rel = decode_stable_path_id(&assignment.path_id)
+        .unwrap_or_else(|| std::path::PathBuf::from(&assignment.rel));
+    root.join(rel).try_exists().unwrap_or(true)
+}
+
+/// Reverse of `walk::stable_path_id`: reconstruct the real relative path from its
+/// `unix:<hex>` / `windows:<hex>` identity, preserving bytes a UTF-8 `rel` loses.
+/// Returns `None` for an empty or unrecognised id so the caller falls back.
+fn decode_stable_path_id(path_id: &str) -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        if let Some(hex) = path_id.strip_prefix("unix:") {
+            use std::os::unix::ffi::OsStrExt;
+            if hex.len() % 2 != 0 {
+                return None;
+            }
+            // `hex.get` (not `hex[..]`) so a non-ASCII byte in a corrupted or
+            // hand-edited path_id returns None instead of panicking on a
+            // non-char-boundary slice — the doc contract above.
+            let bytes: Option<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|i| {
+                    hex.get(i..i + 2)
+                        .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                })
+                .collect();
+            return Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                &bytes?,
+            )));
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Some(hex) = path_id.strip_prefix("windows:") {
+            use std::os::windows::ffi::OsStringExt;
+            if hex.len() % 4 != 0 {
+                return None;
+            }
+            let units: Option<Vec<u16>> = (0..hex.len())
+                .step_by(4)
+                .map(|i| {
+                    hex.get(i..i + 4)
+                        .and_then(|quad| u16::from_str_radix(quad, 16).ok())
+                })
+                .collect();
+            return Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &units?,
+            )));
+        }
+    }
+    let _ = path_id;
+    None
+}
+
 impl UnsupportedInventoryDelta {
-    fn between(files: &[walk::FileEntry], keys: &[String], plan: &Plan) -> Self {
+    fn between(root: &Path, files: &[walk::FileEntry], keys: &[String], plan: &Plan) -> Self {
         let current_keys: std::collections::HashSet<&str> = keys
             .iter()
             .filter(|key| !key.is_empty())
@@ -2607,17 +2761,29 @@ impl UnsupportedInventoryDelta {
                 path: file.rel.clone(),
             })
             .collect();
-        let mut vanished_content_groups: Vec<InventoryDeltaEntry> = plan
-            .files
-            .iter()
-            .filter(|(key, assignment)| {
-                !current_keys.contains(key.as_str()) && !path_survives(assignment)
-            })
-            .map(|(key, assignment)| InventoryDeltaEntry {
+        // #439: a plan file absent from the walk is a *deletion* only if it is
+        // also absent from disk. If it is still on disk, the walk stopped
+        // yielding it because an ignore/hidden rule widened — an exclusion, not
+        // a removal — and the accurate recovery is different. `vanished_is_on_disk`
+        // checks through the reversible raw-bytes identity, so a hidden NON-UTF-8
+        // name (the case #439 was filed for) is matched on disk rather than read
+        // as a phantom removal via its lossy `rel`.
+        let mut deleted_content_groups: Vec<InventoryDeltaEntry> = Vec::new();
+        let mut excluded_content_groups: Vec<InventoryDeltaEntry> = Vec::new();
+        for (key, assignment) in &plan.files {
+            if current_keys.contains(key.as_str()) || path_survives(assignment) {
+                continue;
+            }
+            let entry = InventoryDeltaEntry {
                 file_key: key.clone(),
                 path: assignment.rel.clone(),
-            })
-            .collect();
+            };
+            if vanished_is_on_disk(root, assignment) {
+                excluded_content_groups.push(entry);
+            } else {
+                deleted_content_groups.push(entry);
+            }
+        }
         // Deliberately NOT extended with `plan.junk_files`. A junk/skipped file
         // published no documents, no aliases and no graph edges — its entire
         // live footprint is one `file:{key}` catalog row, and the stale
@@ -2633,10 +2799,12 @@ impl UnsupportedInventoryDelta {
                 .then_with(|| left.file_key.cmp(&right.file_key))
         };
         added_content_groups.sort_by(stable_order);
-        vanished_content_groups.sort_by(stable_order);
+        excluded_content_groups.sort_by(stable_order);
+        deleted_content_groups.sort_by(stable_order);
         Self {
             added_content_groups,
-            vanished_content_groups,
+            deleted_content_groups,
+            excluded_content_groups,
         }
     }
 
@@ -2646,7 +2814,11 @@ impl UnsupportedInventoryDelta {
     /// Additions are not refused — they are skipped by the frozen plan exactly
     /// as before and `--fresh` rebuilds the plan in place to include them.
     fn refuses(&self) -> bool {
-        !self.vanished_content_groups.is_empty()
+        // Both categories still stay live with no reconcile behind them, so both
+        // still refuse the rerun (#439 splits them only to give the accurate
+        // recovery route — the excluded case gets swept, not refused, in a
+        // follow-up). Equivalent to the pre-split `!vanished.is_empty()`.
+        !self.deleted_content_groups.is_empty() || !self.excluded_content_groups.is_empty()
     }
 
     fn into_error(self, targets: RefusalTargets) -> anyhow::Error {
@@ -3336,8 +3508,12 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
         // `--fresh` is checked here too: discarding the plan does not delete
         // the documents already published for a file that is now gone, so a
         // removal is unsafe in place whether or not the plan is kept.
-        let delta =
-            UnsupportedInventoryDelta::between(&inventory.files, &comparison_keys, prior_plan);
+        let delta = UnsupportedInventoryDelta::between(
+            &cfg.root,
+            &inventory.files,
+            &comparison_keys,
+            prior_plan,
+        );
         if delta.refuses() {
             return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, prior_plan)));
         }
@@ -3591,7 +3767,7 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
     // It runs before the #238 junk sweep below on purpose: a refused rerun
     // must compute nothing and mutate nothing.
     if resumed_with_plan {
-        let delta = UnsupportedInventoryDelta::between(&files, &keys, &plan);
+        let delta = UnsupportedInventoryDelta::between(&cfg.root, &files, &keys, &plan);
         if delta.refuses() {
             return Err(delta.into_error(RefusalTargets::describe(&cfg, &state_dir, &plan)));
         }
@@ -6125,17 +6301,27 @@ mod inventory_delta_tests {
         }
     }
 
+    /// A root under which no plan file exists, so every vanished group is a
+    /// genuine deletion (#439) — the behaviour these classifier tests assert.
+    fn nowhere() -> &'static Path {
+        Path::new("/xerj-439-no-such-root")
+    }
+
     #[test]
     fn only_a_removed_content_group_refuses_a_rerun() {
         let mut plan = Plan::default();
         plan.files.insert("keep".into(), assignment("keep.csv"));
-        assert!(
-            !UnsupportedInventoryDelta::between(&[file("keep.csv")], &["keep".into()], &plan)
-                .refuses()
-        );
+        assert!(!UnsupportedInventoryDelta::between(
+            nowhere(),
+            &[file("keep.csv")],
+            &["keep".into()],
+            &plan
+        )
+        .refuses());
         // An added file is skipped by the frozen plan, not a refusal: the
         // documented rerun-then---fresh workflow has to keep working.
         let added = UnsupportedInventoryDelta::between(
+            nowhere(),
             &[file("keep.csv"), file("new.csv")],
             &["keep".into(), "new".into()],
             &plan,
@@ -6143,7 +6329,7 @@ mod inventory_delta_tests {
         assert_eq!(added.added_content_groups.len(), 1);
         assert!(!added.refuses(), "an addition alone must not fail the run");
         // A removal leaves live documents with no source file behind them.
-        assert!(UnsupportedInventoryDelta::between(&[], &[], &plan).refuses());
+        assert!(UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).refuses());
     }
 
     #[test]
@@ -6160,6 +6346,7 @@ mod inventory_delta_tests {
         });
         assert!(
             !UnsupportedInventoryDelta::between(
+                nowhere(),
                 &[file("keep.csv"), file("broken.pdf")],
                 &["keep".into(), "junk".into()],
                 &plan,
@@ -6171,6 +6358,7 @@ mod inventory_delta_tests {
         plan.files.insert("old-z".into(), assignment("z-old.csv"));
         plan.files.insert("old-a".into(), assignment("a-old.csv"));
         let delta = UnsupportedInventoryDelta::between(
+            nowhere(),
             &[
                 file("keep.csv"),
                 file("broken.pdf"),
@@ -6190,7 +6378,7 @@ mod inventory_delta_tests {
         );
         assert_eq!(
             delta
-                .vanished_content_groups
+                .deleted_content_groups
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
@@ -6202,7 +6390,8 @@ mod inventory_delta_tests {
     fn refusal_names_the_removed_files_and_every_recovery_route() {
         let mut plan = Plan::default();
         plan.files.insert("gone".into(), assignment("gone.csv"));
-        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let error =
+            UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).into_error(targets());
         let message = format!("{error:#}");
         assert!(message.contains("gone.csv"), "{message}");
         assert!(
@@ -6210,12 +6399,135 @@ mod inventory_delta_tests {
             "{message}"
         );
         assert!(message.contains("made no remote mutations"), "{message}");
-        assert!(message.contains("restore the removed file(s)"), "{message}");
+        assert!(message.contains("restore the DELETED file(s)"), "{message}");
         assert!(message.contains("ax-rows"), "{message}");
         assert!(message.contains("/state"), "{message}");
         assert!(message.contains(".xerj-memory-corpus-edges"), "{message}");
         assert!(message.contains("new --state-dir"), "{message}");
         assert!(message.contains("`--fresh`"), "{message}");
+    }
+
+    /// #439: a plan file that vanished from the walk but is STILL ON DISK was
+    /// excluded by a widened ignore/hidden rule, not removed. It must classify
+    /// as excluded (not deleted), and the refusal must not tell an operator (or
+    /// an agent parsing the JSON) to restore a file that is one `ls` away.
+    #[test]
+    fn an_excluded_still_on_disk_group_is_not_reported_as_a_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret.csv"), "id,value\n1,live\n").unwrap();
+        let mut plan = Plan::default();
+        plan.files.insert("secret".into(), assignment("secret.csv"));
+
+        // The walk yields nothing (the file is now excluded) though it is on disk.
+        let delta = UnsupportedInventoryDelta::between(root.path(), &[], &[], &plan);
+        assert!(
+            delta.deleted_content_groups.is_empty(),
+            "an on-disk file must not be classified as a deletion"
+        );
+        assert_eq!(
+            delta
+                .excluded_content_groups
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["secret.csv"]
+        );
+        // Its documents still stay live, so the rerun is still refused (#439's
+        // in-place sweep is a follow-up) — but with the accurate cause.
+        assert!(delta.refuses());
+        let error = delta.into_error(targets());
+        let message = format!("{error:#}");
+        assert!(message.contains("secret.csv"), "{message}");
+        assert!(
+            message.contains("still on disk"),
+            "the excluded message must say the file is still on disk: {message}"
+        );
+        assert!(
+            !message.contains("restore the DELETED"),
+            "an excluded (never-removed) file must not be offered as a deletion to restore: {message}"
+        );
+        // The machine-readable schema carries the split and the excluded route,
+        // and omits the restore instruction when nothing was actually deleted.
+        let json = error
+            .downcast_ref::<UnsupportedInventoryDeltaError>()
+            .expect("typed refusal")
+            .to_json();
+        assert_eq!(json["excluded_content_groups"].as_array().unwrap().len(), 1);
+        assert!(json["recovery"].get("excluded_not_removed").is_some());
+        assert!(
+            json["recovery"].get("restore_removed_files").is_none(),
+            "no deleted files, so no restore instruction: {json}"
+        );
+        // Back-compat: the v1 union field still lists it.
+        assert_eq!(json["vanished_content_groups"].as_array().unwrap().len(), 1);
+    }
+
+    /// #439's headline case (CHANGELOG): a hidden NON-UTF-8 name still on disk.
+    /// Its `rel` is a lossy `U+FFFD` rendering that matches no dirent, so a probe
+    /// through `rel` would call it a deletion; the reversible `path_id` matches
+    /// the real bytes and classifies it excluded.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_excluded_name_is_matched_on_disk_via_path_id() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        let raw = b".secret_\xff\xfe.csv";
+        let name = std::ffi::OsStr::from_bytes(raw);
+        std::fs::write(root.path().join(name), "id\n1\n").unwrap();
+        let rel_lossy = std::path::Path::new(name).to_string_lossy().into_owned();
+        let mut path_id = String::from("unix:");
+        for byte in raw {
+            use std::fmt::Write;
+            write!(path_id, "{byte:02x}").unwrap();
+        }
+        let mut plan = Plan::default();
+        plan.files.insert(
+            "secret".into(),
+            FileAssignment {
+                rel: rel_lossy.clone(),
+                path_id,
+                family: "csv".into(),
+                gzip: false,
+                content_digest: Some("digest".into()),
+                assignments: vec![(None, "rows".into())],
+                as_document: false,
+                is_symlink: Some(false),
+            },
+        );
+        // Proof that path_id is load-bearing: the lossy rel does NOT resolve.
+        assert!(
+            !root.path().join(&rel_lossy).try_exists().unwrap_or(false),
+            "the lossy rel must not resolve on disk — that is why path_id is needed"
+        );
+        let delta = UnsupportedInventoryDelta::between(root.path(), &[], &[], &plan);
+        assert!(
+            delta.deleted_content_groups.is_empty(),
+            "a non-UTF-8 name still on disk must not be a deletion: {:?}",
+            delta.deleted_content_groups
+        );
+        assert_eq!(delta.excluded_content_groups.len(), 1);
+    }
+
+    /// #439 robustness: a corrupted or hand-edited `path_id` must return None
+    /// (so the caller falls back to `rel`), never panic — including a non-ASCII
+    /// byte inside the hex region, which naive `hex[i..i + 2]` slicing panics on.
+    #[test]
+    fn decode_stable_path_id_rejects_malformed_ids_without_panicking() {
+        assert!(decode_stable_path_id("").is_none());
+        assert!(decode_stable_path_id("id:legacy").is_none());
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                decode_stable_path_id("unix:2e63").unwrap(),
+                std::path::PathBuf::from(".c")
+            );
+            assert!(decode_stable_path_id("unix:2").is_none(), "odd length");
+            assert!(decode_stable_path_id("unix:zz").is_none(), "non-hex");
+            assert!(
+                decode_stable_path_id("unix:aéb").is_none(),
+                "multibyte char in hex must not panic"
+            );
+        }
     }
 
     /// The prose refusal is bounded by REFUSAL_LIST_CAP, not by the corpus: an
@@ -6232,7 +6544,8 @@ mod inventory_delta_tests {
                 assignment(&format!("gone{i:03}.csv")),
             );
         }
-        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let error =
+            UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).into_error(targets());
         let message = format!("{error:#}");
         assert!(message.contains("gone000.csv"), "{message}");
         assert!(
@@ -6262,7 +6575,8 @@ mod inventory_delta_tests {
     fn refusal_prose_below_the_cap_has_no_more_tail() {
         let mut plan = Plan::default();
         plan.files.insert("gone".into(), assignment("gone.csv"));
-        let error = UnsupportedInventoryDelta::between(&[], &[], &plan).into_error(targets());
+        let error =
+            UnsupportedInventoryDelta::between(nowhere(), &[], &[], &plan).into_error(targets());
         let message = format!("{error:#}");
         assert!(!message.contains("… and "), "{message}");
     }
@@ -6271,10 +6585,11 @@ mod inventory_delta_tests {
     fn cli_error_routing_separates_typed_json_from_unrelated_human_errors() {
         let typed = UnsupportedInventoryDelta {
             added_content_groups: Vec::new(),
-            vanished_content_groups: vec![InventoryDeltaEntry {
+            deleted_content_groups: vec![InventoryDeltaEntry {
                 file_key: "key".into(),
                 path: "gone.csv".into(),
             }],
+            excluded_content_groups: Vec::new(),
         }
         .into_error(targets());
         let route = route_cli_error(&typed, true);

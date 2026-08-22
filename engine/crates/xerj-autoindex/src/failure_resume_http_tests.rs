@@ -629,7 +629,7 @@ fn assert_unsupported_delta_without_remote_mutation(
         "{message}"
     );
     assert!(
-        message.contains("restore the removed file(s) and rerun"),
+        message.contains("restore the DELETED file(s) and rerun"),
         "{message}"
     );
     assert!(
