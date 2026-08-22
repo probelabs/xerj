@@ -8311,6 +8311,78 @@ pub async fn search(
     }
 }
 
+/// Emit a collapse inner-hit member's snapshotted `_version` / `_seq_no` +
+/// `_primary_term` into `hit_obj`, honouring the inner_hits `version` /
+/// `seq_no_primary_term` flags.
+///
+/// When the snapshot value is ABSENT -- `Hit.seq_no`/`version` was `None` (a
+/// concurrent tombstone or a version-map miss) and serialized as JSON `null` in
+/// the collapse group -- the field is OMITTED, not fabricated. Elasticsearch
+/// omits versioning it cannot resolve; the previous code fell through
+/// `unwrap_or(i as u64)` / `unwrap_or(1)`, re-fabricating a *positional* `_seq_no`
+/// (the exact #506 bug) and `_version = 1` -- values a client could feed back
+/// into `if_seq_no` / `if_primary_term` and corrupt optimistic concurrency
+/// (#566, residual of #506).
+fn emit_inner_hit_versioning(
+    member: &Value,
+    emit_seq_no: bool,
+    emit_version: bool,
+    hit_obj: &mut serde_json::Map<String, Value>,
+) {
+    if emit_version {
+        if let Some(v) = member.get("_version").and_then(Value::as_u64) {
+            hit_obj.insert("_version".to_string(), json!(v));
+        }
+    }
+    if emit_seq_no {
+        if let Some(sn) = member.get("_seq_no").and_then(Value::as_u64) {
+            hit_obj.insert("_seq_no".to_string(), json!(sn));
+            hit_obj.insert("_primary_term".to_string(), json!(1));
+        }
+    }
+}
+
+#[cfg(test)]
+mod inner_hit_versioning_tests {
+    use super::*;
+
+    /// #566: an absent snapshot `_seq_no`/`_version` (JSON null — a concurrent
+    /// tombstone or version-map miss) must be OMITTED from a collapse inner hit,
+    /// never fabricated into a positional `_seq_no` or `_version = 1` a client
+    /// could feed back into `if_seq_no`/`if_primary_term`.
+    #[test]
+    fn absent_snapshot_versioning_is_omitted_not_fabricated() {
+        let member = json!({ "_id": "x", "_seq_no": null, "_version": null });
+        let mut hit = serde_json::Map::new();
+        emit_inner_hit_versioning(&member, true, true, &mut hit);
+        assert!(
+            !hit.contains_key("_seq_no"),
+            "absent snapshot _seq_no must be omitted, not fabricated (#566)"
+        );
+        assert!(
+            !hit.contains_key("_primary_term"),
+            "no _primary_term without a real _seq_no (#566)"
+        );
+        assert!(
+            !hit.contains_key("_version"),
+            "absent snapshot _version must be omitted, not defaulted to 1 (#566)"
+        );
+
+        // A member with real snapshot values emits them verbatim.
+        let real = json!({ "_id": "y", "_seq_no": 42, "_version": 7 });
+        let mut hit2 = serde_json::Map::new();
+        emit_inner_hit_versioning(&real, true, true, &mut hit2);
+        assert_eq!(hit2.get("_seq_no"), Some(&json!(42)));
+        assert_eq!(hit2.get("_primary_term"), Some(&json!(1)));
+        assert_eq!(hit2.get("_version"), Some(&json!(7)));
+
+        // The inner_hits flags gate emission.
+        let mut hit3 = serde_json::Map::new();
+        emit_inner_hit_versioning(&real, false, false, &mut hit3);
+        assert!(hit3.is_empty(), "flags off => nothing emitted");
+    }
+}
+
 async fn search_impl(
     state: AppState,
     index: String,
@@ -13222,10 +13294,9 @@ async fn search_impl(
                     }
                     let rendered_hits: Vec<Value> = members
                         .into_iter()
-                        .enumerate()
                         .skip(from_spec)
                         .take(size)
-                        .map(|(i, mut m)| {
+                        .map(|mut m| {
                             if let Some(src) = m.get_mut("_source").and_then(Value::as_object_mut) {
                                 src.remove("__xy_collapse_group__");
                                 src.remove("__xy_collapse_spec__");
@@ -13238,24 +13309,17 @@ async fn search_impl(
                             if let Some(score) = m.get("_score").cloned() {
                                 hit_obj.insert("_score".to_string(), score);
                             }
-                            if emit_version_ih {
-                                // Snapshotted `_version` carried in the collapse
-                                // group (#506) — NOT a render-time live lookup,
-                                // which could pair a live `_version` with the
-                                // snapshot `_source` on a collapsed scroll.
-                                let v = m.get("_version").and_then(Value::as_u64).unwrap_or(1);
-                                hit_obj.insert("_version".to_string(), json!(v));
-                            }
-                            if emit_seq_no_ih {
-                                // The doc's real snapshotted seq_no, not the
-                                // array index (#506).
-                                let sn = m
-                                    .get("_seq_no")
-                                    .and_then(Value::as_u64)
-                                    .unwrap_or(i as u64);
-                                hit_obj.insert("_seq_no".to_string(), json!(sn));
-                                hit_obj.insert("_primary_term".to_string(), json!(1));
-                            }
+                            // Snapshotted `_version` / `_seq_no` carried in the
+                            // collapse group (#506) — NOT a render-time live
+                            // lookup, which could pair a live version with the
+                            // snapshot `_source` on a collapsed scroll. An absent
+                            // snapshot value is OMITTED, not fabricated (#566).
+                            emit_inner_hit_versioning(
+                                &m,
+                                emit_seq_no_ih,
+                                emit_version_ih,
+                                &mut hit_obj,
+                            );
                             if let Some(src) = m.get("_source").cloned() {
                                 hit_obj.insert("_source".to_string(), src);
                             }
