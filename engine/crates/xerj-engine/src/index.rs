@@ -32533,7 +32533,21 @@ fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNod
             max_boost,
         } => QueryNode::FunctionScore {
             query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
-            functions: functions.clone(),
+            // Each function may carry its own `filter` sub-query targeting a
+            // keyword field; recurse into it too (#574) — otherwise a keyword
+            // `match`/`multi_match` inside a `function_score` function filter
+            // keeps flipping its hit set at flush (#354).
+            functions: functions
+                .iter()
+                .map(|f| {
+                    let mut nf = f.clone();
+                    nf.filter = f
+                        .filter
+                        .as_ref()
+                        .map(|q| rewrite_keyword_full_text_to_term(q, schema));
+                    nf
+                })
+                .collect(),
             score_mode: *score_mode,
             boost_mode: *boost_mode,
             max_boost: *max_boost,
@@ -32584,7 +32598,175 @@ fn rewrite_keyword_full_text_to_term(q: &QueryNode, schema: &Schema) -> QueryNod
             name: name.clone(),
             query: Box::new(rewrite_keyword_full_text_to_term(query, schema)),
         },
+        // `Knn`/`SemanticSearch` carry an optional `filter` sub-query that gates
+        // which docs the vector search runs against; a keyword `match`/
+        // `multi_match` in that filter must be made mapping-aware too, or it
+        // flips its hit set at flush (#354/#574). Only the filter is a full-text
+        // sub-query — the vector/text search itself is not rewritten.
+        QueryNode::Knn {
+            field,
+            vector,
+            k,
+            num_candidates,
+            filter,
+            boost,
+            similarity,
+        } => QueryNode::Knn {
+            field: field.clone(),
+            vector: vector.clone(),
+            k: *k,
+            num_candidates: *num_candidates,
+            filter: filter
+                .as_ref()
+                .map(|f| Box::new(rewrite_keyword_full_text_to_term(f, schema))),
+            boost: *boost,
+            similarity: *similarity,
+        },
+        QueryNode::SemanticSearch {
+            field,
+            text,
+            k,
+            filter,
+            boost,
+        } => QueryNode::SemanticSearch {
+            field: field.clone(),
+            text: text.clone(),
+            k: *k,
+            filter: filter
+                .as_ref()
+                .map(|f| Box::new(rewrite_keyword_full_text_to_term(f, schema))),
+            boost: *boost,
+        },
+        // Leaf nodes (Term/Terms/Range/Exists/...) and positional (span) nodes
+        // carry no full-text sub-query to rewrite and fall through unchanged.
         other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod keyword_rewrite_filter_tests {
+    use super::*;
+
+    fn kw_schema() -> Schema {
+        let mut s = Schema::empty();
+        s.fields.push(FieldConfig::new("kw", FieldType::Keyword));
+        s
+    }
+
+    // A multi-token keyword `match`: "a b" must be rewritten to a whole-value
+    // `Term`, or it whitespace-tokenises + OR-s and flips its hit set at flush.
+    fn kw_match() -> QueryNode {
+        QueryNode::Match {
+            field: "kw".to_string(),
+            query: "a b".to_string(),
+            operator: Default::default(),
+            analyzer: None,
+            boost: None,
+            minimum_should_match: None,
+        }
+    }
+
+    fn assert_is_kw_term(q: &QueryNode) {
+        match q {
+            QueryNode::Term { field, value, .. } => {
+                assert_eq!(field, "kw");
+                assert_eq!(value, &Value::String("a b".to_string()));
+            }
+            other => panic!("expected keyword Match rewritten to whole-value Term, got {other:?}"),
+        }
+    }
+
+    /// #574: a keyword `match`/`multi_match` inside a `Knn`/`SemanticSearch`/
+    /// `function_score` function **filter** must be made mapping-aware (rewritten
+    /// to a whole-value `Term`) like the top-level and compound-wrapper cases
+    /// (#571/#573) — otherwise it flips its hit set at flush (#354). These nodes
+    /// previously fell through `other => other.clone()` (Knn/SemanticSearch) or
+    /// cloned `functions` verbatim (function_score).
+    #[test]
+    fn keyword_match_in_filter_carrying_nodes_is_rewritten() {
+        let schema = kw_schema();
+
+        // Knn.filter
+        let knn = QueryNode::Knn {
+            field: "vec".to_string(),
+            vector: vec![0.1, 0.2],
+            k: 5,
+            num_candidates: None,
+            filter: Some(Box::new(kw_match())),
+            boost: None,
+            similarity: None,
+        };
+        match rewrite_keyword_full_text_to_term(&knn, &schema) {
+            QueryNode::Knn {
+                filter: Some(f), ..
+            } => assert_is_kw_term(&f),
+            other => panic!("Knn shape changed: {other:?}"),
+        }
+
+        // SemanticSearch.filter
+        let sem = QueryNode::SemanticSearch {
+            field: "vec".to_string(),
+            text: "hello".to_string(),
+            k: 5,
+            filter: Some(Box::new(kw_match())),
+            boost: None,
+        };
+        match rewrite_keyword_full_text_to_term(&sem, &schema) {
+            QueryNode::SemanticSearch {
+                filter: Some(f), ..
+            } => assert_is_kw_term(&f),
+            other => panic!("SemanticSearch shape changed: {other:?}"),
+        }
+
+        // function_score functions[].filter
+        let fs = QueryNode::FunctionScore {
+            query: Box::new(QueryNode::Term {
+                field: "other".to_string(),
+                value: Value::String("x".to_string()),
+                boost: None,
+            }),
+            functions: vec![ScoreFunction {
+                filter: Some(kw_match()),
+                ..Default::default()
+            }],
+            score_mode: Default::default(),
+            boost_mode: Default::default(),
+            max_boost: None,
+        };
+        match rewrite_keyword_full_text_to_term(&fs, &schema) {
+            QueryNode::FunctionScore { functions, .. } => {
+                assert_is_kw_term(functions[0].filter.as_ref().expect("filter preserved"))
+            }
+            other => panic!("FunctionScore shape changed: {other:?}"),
+        }
+
+        // A NON-keyword match in a filter is left as a Match (only keyword fields
+        // are rewritten; text fields stay analyzed).
+        let knn_text = QueryNode::Knn {
+            field: "vec".to_string(),
+            vector: vec![0.1],
+            k: 1,
+            num_candidates: None,
+            filter: Some(Box::new(QueryNode::Match {
+                field: "body".to_string(),
+                query: "a b".to_string(),
+                operator: Default::default(),
+                analyzer: None,
+                boost: None,
+                minimum_should_match: None,
+            })),
+            boost: None,
+            similarity: None,
+        };
+        match rewrite_keyword_full_text_to_term(&knn_text, &schema) {
+            QueryNode::Knn {
+                filter: Some(f), ..
+            } => assert!(
+                matches!(*f, QueryNode::Match { .. }),
+                "a non-keyword field must stay a Match, got {f:?}"
+            ),
+            other => panic!("Knn shape changed: {other:?}"),
+        }
     }
 }
 
