@@ -33266,11 +33266,13 @@ fn object_keys_of(val: &Value) -> Option<&serde_json::Map<String, Value>> {
 /// gates reaches, or a genuinely-new field is suppressed for up to 100 docs
 /// and queries against it answer 0 hits until the throttle expires. So it:
 /// * hashes every field NAME at every nesting depth, INCLUDING keys nested
-///   inside arrays-of-objects -- `object_keys_of` /
-///   `merge_dynamic_children_into` unwrap arrays of objects and register
-///   nested keys across their elements, so this must descend into arrays too
-///   (e.g. `metadata.kind` on one document vs `metadata.project` on the next,
-///   whether `metadata` is an object or a single-element array of objects);
+///   inside arrays-of-objects -- the evolution path unwraps an array of
+///   objects to its FIRST non-null object element (`object_keys_of`) and
+///   registers that element's keys, so this must descend into arrays too;
+///   recursing over every element (below) is a deliberate conservative
+///   superset of that first-element reach (e.g. `metadata.kind` on one
+///   document vs `metadata.project` on the next, whether `metadata` is an
+///   object or an array of objects);
 /// * folds each leaf's value-TYPE tag (null/bool/number/string), so a key
 ///   *refused* a `FieldConfig` for value-shape reasons -- e.g. a dense_vector
 ///   companion first seen as a numeric array -- re-triggers evolution the
@@ -33295,14 +33297,14 @@ fn hash_all_field_names(val: &Value, h: &mut u64) {
         }
         Value::Array(arr) => {
             // #382 (array variant): fold the array tag AND recurse into every
-            // element. The evolution path this hash gates unwraps arrays of
-            // objects (`object_keys_of`) and merges nested keys across all
-            // elements (`merge_dynamic_children_into`), so treating an array as
+            // element. The evolution path this hash gates unwraps an array of
+            // objects to its first non-null object element (`object_keys_of`)
+            // and registers that element's nested keys, so treating an array as
             // one opaque leaf would let `[{kind}]` -> `[{project}]` or
             // `["a","b"]` -> `[[1,2]]` keep the same fingerprint and suppress the
             // evolve those transitions need for up to 100 docs. Recursing over
-            // all elements matches that across-elements reach; a homogeneous
-            // array still hashes stably doc-to-doc.
+            // EVERY element is a conservative superset of that first-element
+            // reach; a homogeneous array still hashes stably doc-to-doc.
             *h ^= 5;
             *h = h.wrapping_mul(0x00000100000001b3);
             for elem in arr {
@@ -42216,9 +42218,10 @@ mod date_detection_tests {
     }
 
     /// #382 (array variant): the throttle fingerprint must reach *inside* arrays,
-    /// because the evolution path it gates (`object_keys_of` /
-    /// `merge_dynamic_children_into`) unwraps arrays-of-objects and registers keys
-    /// across their elements. Treating an array as one opaque leaf let
+    /// because the evolution path it gates unwraps an array of objects to its
+    /// first non-null object element (`object_keys_of`) and registers its keys;
+    /// the fingerprint recurses over every element, a conservative superset of
+    /// that reach. Treating an array as one opaque leaf let
     /// `[{kind}]` -> `[{project}]` and `["a"]` -> `[[1]]` keep the same hash, so a
     /// legitimately-new nested field stayed suppressed (0 hits) for up to 100 docs
     /// — the same defect one array-wrap deeper than the scalar case above.
