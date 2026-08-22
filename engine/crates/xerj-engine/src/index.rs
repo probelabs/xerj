@@ -26479,7 +26479,13 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
                         }
                     }
                 }
-                if result.is_empty() && !prefix.is_empty() {
+                // Prune an intermediate object that *filtering* emptied (it had
+                // keys, all removed) so a stripped subtree does not leave a bare
+                // `{}` behind. But an object that was ALREADY empty in the source
+                // (`obj.is_empty()`) is a real value the document carried -- keep
+                // it, or a dotted include/exclude anywhere in the request would
+                // silently drop every `{"meta": {}}` from every hit (#310).
+                if result.is_empty() && !prefix.is_empty() && !obj.is_empty() {
                     Value::Null
                 } else {
                     Value::Object(result)
@@ -26562,6 +26568,31 @@ mod source_filter_tests {
                 })
             );
         }
+    }
+
+    /// #310 (part 2): a dotted include/exclude anywhere in the request forces
+    /// `filter_object` into its nested branch, which pruned EVERY empty object.
+    /// An object that was already `{}` in the source is a real value the document
+    /// carried and must survive; only an object that *filtering* emptied (had
+    /// keys, all removed) is pruned. A dotted embedding `target_field` puts the
+    /// Default arm on this path, silently dropping every `{"meta": {}}` from
+    /// every hit.
+    #[test]
+    fn dotted_filter_keeps_an_already_empty_source_object_but_prunes_a_filtering_emptied_one() {
+        let source = json!({
+            "meta": {},                // already empty in the source
+            "title": "x",
+            "nested": { "drop_me": 1 } // becomes empty only via the exclude below
+        });
+        // The dotted exclude forces the nested branch (has_dotted) and empties
+        // `nested`; `meta` was already empty in the document.
+        let filtered = filter_object(&source, &[], &["nested.drop_me".to_string()]);
+        assert_eq!(
+            filtered,
+            json!({ "meta": {}, "title": "x" }),
+            "an already-empty object must survive a dotted filter; only a \
+             filtering-emptied object is pruned (#310)"
+        );
     }
 
     #[test]
