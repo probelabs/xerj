@@ -4653,6 +4653,108 @@ mod semantic_deadline_regression_tests {
         );
     }
 
+    /// #569: when a hybrid sub-list is truncated at `per_query_topk`, the fused
+    /// `fused.len()` under-counts the true match set, so `hits.total.relation`
+    /// must be `Gte` (honest lower bound) — NOT a false `Eq`. This must hold
+    /// without any timeout (the pre-fix code only set `Gte` on timeout).
+    #[tokio::test]
+    async fn hybrid_reports_gte_when_a_sub_list_is_capped() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("hybrid-capped", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("hybrid-capped").unwrap();
+        seed_vectors(&idx).await; // 256 docs, identical [1.0, 0.0] vectors
+        idx.test_scan_checkpoint_delay_ms
+            .store(0, Ordering::Relaxed);
+        // k >= per_query_topk(50) over 256 vectors → the sub-list fills a full
+        // 50-doc page → capped → the fused union under-counts the 256 matches.
+        let knn = QueryNode::Knn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 256,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = idx
+            .run_hybrid_with_deadline(
+                &match_all(30_000), // default size 10 → per_query_topk = 50
+                far,
+                vec![xerj_query::ast::WeightedQuery {
+                    query: knn,
+                    weight: 1.0,
+                }],
+                xerj_query::ast::FusionStrategy::Rrf { k: 60 },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !result.timed_out,
+            "the Gte must come from capping, not a timeout"
+        );
+        assert_eq!(
+            result.total.relation,
+            TotalHitsRelation::Gte,
+            "a capped hybrid sub-list must report a lower-bound total: {:?}",
+            result.total
+        );
+    }
+
+    /// #569 guardrail: when every sub-list is fully retrieved (fewer matches
+    /// than `per_query_topk`), the fused total is exact → `Eq`, not a needless
+    /// `Gte`.
+    #[tokio::test]
+    async fn hybrid_reports_eq_when_no_sub_list_is_capped() {
+        let dir = TempDir::new().unwrap();
+        let engine = engine(&dir);
+        engine
+            .create_index("hybrid-exact", Schema::empty())
+            .unwrap();
+        let idx = engine.get_index("hybrid-exact").unwrap();
+        for n in 0..6 {
+            idx.index_document(
+                Some(format!("d{n}")),
+                serde_json::json!({"embedding": [1.0, 0.0]}),
+            )
+            .await
+            .unwrap();
+        }
+        let knn = QueryNode::Knn {
+            field: "embedding".into(),
+            vector: vec![1.0, 0.0],
+            k: 10,
+            num_candidates: None,
+            filter: None,
+            boost: None,
+            similarity: None,
+        };
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let result = idx
+            .run_hybrid_with_deadline(
+                &match_all(30_000),
+                far,
+                vec![xerj_query::ast::WeightedQuery {
+                    query: knn,
+                    weight: 1.0,
+                }],
+                xerj_query::ast::FusionStrategy::Rrf { k: 60 },
+            )
+            .await
+            .unwrap();
+        assert!(!result.timed_out);
+        assert_eq!(
+            result.total.relation,
+            TotalHitsRelation::Eq,
+            "a fully-fetched hybrid total is exact: {:?}",
+            result.total
+        );
+        assert_eq!(result.total.value, 6, "{:?}", result.total);
+    }
+
     #[tokio::test]
     async fn nested_knn_uses_the_shared_request_deadline() {
         let dir = TempDir::new().unwrap();
@@ -12095,6 +12197,12 @@ impl Index {
         let mut sub_results: Vec<(Vec<Hit>, f32)> = Vec::with_capacity(sub_queries.len());
         let mut sub_savings: Vec<PayloadSavings> = Vec::new();
         let mut any_timed_out = false;
+        // #569: whether the fused total is a lower bound rather than exact.
+        // Each sub-query is fetched at `per_query_topk`; if any sub-list hit that
+        // cap (or reported its own count as capped), the fused union under-counts
+        // the true match set, so the reported relation must be Gte, not a false
+        // Eq. Stays false only when every sub-list was fully retrieved.
+        let mut fused_count_capped = false;
         for wq in sub_queries {
             if std::time::Instant::now() >= deadline {
                 any_timed_out = true;
@@ -12125,6 +12233,16 @@ impl Index {
             // run_hybrid both async fn).
             let sub_result = Box::pin(self.search_inner(&sub_request, deadline)).await?;
             any_timed_out |= sub_result.timed_out;
+            // #569: this sub-list is truncated (more matches exist than we
+            // fetched) if it filled the `per_query_topk` page, or its own total
+            // exceeds the page, or its own count is already a lower bound. Any of
+            // these makes the fused union an under-count → report Gte, not Eq.
+            if sub_result.hits.len() >= per_query_topk
+                || sub_result.total.value > per_query_topk as u64
+                || sub_result.total.relation == TotalHitsRelation::Gte
+            {
+                fused_count_capped = true;
+            }
             // Fusion de-duplicates documents across sub-queries, so the
             // per-hit records are merged by document id below — a document
             // retrieved by both the lexical and the vector leg saved its
@@ -12167,7 +12285,7 @@ impl Index {
             hits: page,
             total: TotalHits {
                 value: total_value,
-                relation: if any_timed_out {
+                relation: if any_timed_out || fused_count_capped {
                     TotalHitsRelation::Gte
                 } else {
                     TotalHitsRelation::Eq
