@@ -254,3 +254,210 @@ async fn filter_only_bool_still_scores_zero() {
         );
     }
 }
+
+/// The still-live #361 case after #387: a **non-projectable** filter (here
+/// `exists`, which has no FTS projection arm) must not divert the MUST clause
+/// off the exact-BM25 scorer onto the IDF-less heuristic. `exists: repo`
+/// matches every doc, so this is a *no-op* filter — the headline of the issue
+/// ("a no-op filter flattens every score to a constant") — and the result
+/// must be byte-identical to the bare `match` reference.
+///
+/// Root cause: in `query_node_to_fts_with_keyword_fields` the Bool arm's
+/// filter loop does `let fq = ...(sub)?;`, and `exists` returns `None` (no FTS
+/// arm), so the `?` aborts the ENTIRE projection — dragging the scoring
+/// `must` subtree onto `score_query_against_doc` (`boost·(1+ln(1+tf))`, no
+/// IDF). #387 only covered *projectable* (`term`) filters.
+#[tokio::test]
+async fn nonprojectable_filter_does_not_divert_the_scorer() {
+    let (_dir, idx) = seed("bool-nonprojectable-filter").await;
+    let reference = idx.search(&req(text_query(), 200)).await.unwrap();
+    assert!(
+        score_map(&reference).values().any(|s| *s > 1.0),
+        "fixture must expose the exact BM25 path, got {:?}",
+        reference.hits.first().map(|h| h.score)
+    );
+
+    let filtered = idx
+        .search(&req(
+            json!({"bool": {
+                "must": [text_query()],
+                "filter": [{"exists": {"field": "repo"}}]
+            }}),
+            50,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered.total.value, 120,
+        "exists:repo matches every doc — a no-op filter"
+    );
+    assert_matches_reference(
+        "bool.must + non-projectable exists filter",
+        &reference,
+        &filtered,
+    );
+}
+
+/// The correctness half of the non-projectable-filter fix: a residual filter
+/// that genuinely EXCLUDES documents must still exclude them. Once the
+/// projection stops `?`-aborting on a non-projectable filter, the FTS bool no
+/// longer carries that filter — so membership must be re-applied by the
+/// caller's `doc_matches_query` gate, or the query over-returns.
+///
+/// Fixture: `tag` (keyword) is present on the 60 even docs only. `exists:tag`
+/// is non-projectable AND selective, so `bool{must:[match], filter:[exists:tag]}`
+/// must return exactly those 60 — not all 120.
+#[tokio::test]
+async fn residual_filter_still_excludes_nonmatching_docs() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let mut schema = Schema::empty();
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("tag", FieldType::Keyword));
+    engine.create_index("residual-excl", schema).unwrap();
+    let idx = engine.get_index("residual-excl").unwrap();
+    for i in 0..120usize {
+        let alphas = "alpha ".repeat(1 + i % 5);
+        let mut doc = json!({ "body": alphas });
+        if i % 2 == 0 {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("tag".into(), json!("kept"));
+        }
+        idx.index_document(Some(format!("d{i:03}")), doc)
+            .await
+            .unwrap();
+    }
+    idx.flush().await.unwrap();
+
+    let filtered = idx
+        .search(&req(
+            json!({"bool": {
+                "must": [{"match": {"body": "alpha"}}],
+                "filter": [{"exists": {"field": "tag"}}]
+            }}),
+            200,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        filtered.total.value, 60,
+        "exists:tag is selective — only the 60 even docs carry `tag`; a missing \
+         membership gate over-returns all 120 (#361)"
+    );
+    for hit in &filtered.hits {
+        let n: usize = hit.id[1..].parse().unwrap();
+        assert_eq!(n % 2, 0, "{} has no `tag` and must be excluded", hit.id);
+    }
+}
+
+/// The residual gate must be page-size-invariant: forcing full materialisation
+/// and re-counting survivors must give the same top hit, the same score, and
+/// the same total at size:1 and size:200 (a gate that miscounts or mis-ranks
+/// would diverge).
+#[tokio::test]
+async fn residual_gate_is_page_size_invariant() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let mut schema = Schema::empty();
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("tag", FieldType::Keyword));
+    engine.create_index("residual-page", schema).unwrap();
+    let idx = engine.get_index("residual-page").unwrap();
+    for i in 0..120usize {
+        let alphas = "alpha ".repeat(1 + i % 5);
+        let mut doc = json!({ "body": alphas });
+        if i % 2 == 0 {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("tag".into(), json!("kept"));
+        }
+        idx.index_document(Some(format!("d{i:03}")), doc)
+            .await
+            .unwrap();
+    }
+    idx.flush().await.unwrap();
+
+    let q = json!({"bool": {
+        "must": [{"match": {"body": "alpha"}}],
+        "filter": [{"exists": {"field": "tag"}}]
+    }});
+    let deep = idx.search(&req(q.clone(), 200)).await.unwrap();
+    let shallow = idx.search(&req(q.clone(), 1)).await.unwrap();
+    assert_eq!(deep.total.value, 60, "residual total wrong at size:200");
+    assert_eq!(shallow.total.value, 60, "residual total wrong at size:1");
+    assert!(!deep.hits.is_empty() && !shallow.hits.is_empty());
+    assert_eq!(
+        shallow.hits[0].id, deep.hits[0].id,
+        "residual: size:1 and size:200 disagree on the best hit"
+    );
+    assert!(
+        (shallow.hits[0].score - deep.hits[0].score).abs() < 1e-4,
+        "residual: top hit scores {} at size:1 but {} at size:200",
+        shallow.hits[0].score,
+        deep.hits[0].score
+    );
+}
+
+/// A NON-projectable `must_not` (`exists`) is also skipped from the FTS bool by
+/// the projection and re-applied by the same gate — it must still EXCLUDE the
+/// docs it names (here: keep only the docs WITHOUT `tag`).
+#[tokio::test]
+async fn nonprojectable_must_not_still_excludes() {
+    let dir = TempDir::new().unwrap();
+    let engine = make_engine(&dir);
+    let mut schema = Schema::empty();
+    schema
+        .fields
+        .push(FieldConfig::new("body", FieldType::Text));
+    schema
+        .fields
+        .push(FieldConfig::new("tag", FieldType::Keyword));
+    engine.create_index("residual-mustnot", schema).unwrap();
+    let idx = engine.get_index("residual-mustnot").unwrap();
+    for i in 0..120usize {
+        let alphas = "alpha ".repeat(1 + i % 5);
+        let mut doc = json!({ "body": alphas });
+        if i % 2 == 0 {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("tag".into(), json!("kept"));
+        }
+        idx.index_document(Some(format!("d{i:03}")), doc)
+            .await
+            .unwrap();
+    }
+    idx.flush().await.unwrap();
+
+    let excluded = idx
+        .search(&req(
+            json!({"bool": {
+                "must": [{"match": {"body": "alpha"}}],
+                "must_not": [{"exists": {"field": "tag"}}]
+            }}),
+            200,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        excluded.total.value, 60,
+        "must_not exists:tag must exclude the 60 tagged docs, keeping the 60 untagged"
+    );
+    for hit in &excluded.hits {
+        let n: usize = hit.id[1..].parse().unwrap();
+        assert_eq!(
+            n % 2,
+            1,
+            "{} HAS `tag` and must be excluded by must_not",
+            hit.id
+        );
+    }
+}

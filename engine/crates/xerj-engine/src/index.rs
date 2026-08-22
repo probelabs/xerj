@@ -15892,6 +15892,19 @@ impl Index {
                 &kw_fields,
             );
             let needs_fts = fts_query_probe.is_some();
+            // #361: a bool with a non-projectable non-scoring (`filter`/`must_not`)
+            // child projects only its scoring subtree — the residual clause is
+            // absent from the FTS match set, so when FTS runs we must re-apply
+            // membership with `doc_matches_query` over the ORIGINAL query and
+            // switch off the seg_total count/bounded fast path (which assumes the
+            // FTS bool is the exact match set). Only meaningful when FTS runs.
+            let residual_gate = needs_fts
+                && bool_has_nonprojectable_nonscoring(
+                    query,
+                    &text_fields,
+                    &exact_fields,
+                    &kw_fields,
+                );
             // A `query_string` whose projection DECLINED still has to be
             // answered by the stored-doc scan — an over-cap `tokens × fields`
             // cross-product returns `None`, and without the scan the segment
@@ -16195,7 +16208,7 @@ impl Index {
                         //     skip past `materialisation_limit` matches while
                         //     filling the page, so the page needs more than the
                         //     top-`cap` by score.
-                        let fts_cap = if count_only || sort_topk.is_some() {
+                        let fts_cap = if count_only || sort_topk.is_some() || residual_gate {
                             usize::MAX
                         } else {
                             // #179 — `deletes_present` no longer forces the
@@ -16247,6 +16260,122 @@ impl Index {
                                 fts_handled = true;
                                 // #361 — this segment's hits carry exact BM25.
                                 fts_scored_applied = true;
+                                // #361 — residual membership gate. This bool has a
+                                // non-projectable, non-scoring `filter`/`must_not`
+                                // that the projection dropped from the FTS bool, so
+                                // `seg_hits` (with `fts_cap == usize::MAX` forced
+                                // above) is a SUPERSET of the answer. Re-apply
+                                // membership with `doc_matches_query` over the
+                                // original (alias/keyword-resolved) query on every
+                                // match, counting + materialising only survivors.
+                                // A dedicated pass, not inline gating: the bounded
+                                // walk below early-outs below `page_worst` and skips
+                                // non-entering segments, so gating there would
+                                // undercount. Cost is O(matches) source reads for
+                                // residual queries only (uncommon) — the same
+                                // correctness-over-speed convention as the deletes
+                                // path.
+                                if residual_gate {
+                                    let slices =
+                                        self.stored_slices_for(seg_id.as_str(), meta.doc_count);
+                                    let whole: Option<Vec<Value>> = if slices.is_some() {
+                                        None
+                                    } else {
+                                        let seg_reader = self.store.open_segment_arc(&seg_id)?;
+                                        match seg_reader.section(SectionType::Stored) {
+                                            Ok(Some(raw)) => {
+                                                xerj_storage::stored_codec::decode_stored(raw)
+                                                    .ok()
+                                                    .and_then(|b| {
+                                                        serde_json::from_slice::<Vec<Value>>(&b)
+                                                            .ok()
+                                                    })
+                                            }
+                                            _ => None,
+                                        }
+                                    };
+                                    let fetch = |pos: u32| -> Option<Value> {
+                                        if let Some(s) = slices.as_deref() {
+                                            let &(a, b) = s.offsets.get(pos as usize)?;
+                                            serde_json::from_slice::<Value>(
+                                                s.bytes.get(a as usize..b as usize)?,
+                                            )
+                                            .ok()
+                                        } else {
+                                            whole
+                                                .as_ref()
+                                                .and_then(|d| d.get(pos as usize).cloned())
+                                        }
+                                    };
+                                    for sh in &seg_hits {
+                                        let doc = match fetch(sh.doc_id) {
+                                            Some(d) => d,
+                                            None => continue,
+                                        };
+                                        let id = doc
+                                            .get("_id")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string();
+                                        // Same liveness/staleness check the normal
+                                        // walk uses: skip tombstoned or superseded
+                                        // copies (live version in a newer segment).
+                                        let (mut hit_seq_no, mut hit_version) = (None, None);
+                                        if let Some(ver) = self.store.version_map.get(&id) {
+                                            if ver.deleted
+                                                || ver.segment_id.as_ref() != seg_id.as_str()
+                                            {
+                                                continue;
+                                            }
+                                            let (s, v) = self.hit_seq_version(&id, &ver);
+                                            hit_seq_no = s;
+                                            hit_version = v;
+                                        }
+                                        if seen_ids.contains(&id) {
+                                            continue;
+                                        }
+                                        let source =
+                                            doc.get("_source").cloned().unwrap_or(Value::Null);
+                                        // Membership: re-test the dropped residual
+                                        // clause via the whole original query.
+                                        let mut src_with_id = source.clone();
+                                        if let Some(obj) = src_with_id.as_object_mut() {
+                                            obj.insert(
+                                                "_id".to_string(),
+                                                Value::String(id.clone()),
+                                            );
+                                        }
+                                        if !doc_matches_query(query, &src_with_id) {
+                                            continue;
+                                        }
+                                        total_count += 1;
+                                        seen_ids.insert(id.clone());
+                                        let hit = Hit {
+                                            id,
+                                            score: sh.score,
+                                            source,
+                                            seq_no: hit_seq_no,
+                                            version: hit_version,
+                                            sort: Vec::new(),
+                                            explain: None,
+                                            highlight: None,
+                                            matched_queries: Vec::new(),
+                                            passage: None,
+                                        };
+                                        if let Some(topk) = sort_topk.as_mut() {
+                                            let seq = hit_seq_no.unwrap_or(u64::MAX);
+                                            topk.offer(hit, seq, self);
+                                        } else {
+                                            all_hits.push(hit);
+                                        }
+                                    }
+                                    // Preserve the segment-tail deadline propagation
+                                    // that the `continue` below would otherwise skip.
+                                    if fts_deadline_tripped {
+                                        deadline_exceeded = true;
+                                    }
+                                    continue;
+                                }
                                 // Exact count — identical for count_only and size>0.
                                 // GHOST WINDOW (b7 DEFECT 1c): `seg_total` is the
                                 // segment's PHYSICAL match count — between a flush
@@ -39101,14 +39230,23 @@ fn query_node_to_fts_with_keyword_fields(
             // `bool{must:[text], filter:[term]}` score the filter's BM25 on
             // top of the text clause and reorder the page.
             for sub in filter {
-                let fq = query_node_to_fts_with_keyword_fields(
+                // #361: a non-projecting filter child (e.g. `exists`,
+                // non-numeric `range`) is a NON-SCORING residual — skip it
+                // (instead of `?`-aborting the whole projection) so the scoring
+                // must/should subtree keeps exact BM25. Because the residual is
+                // then absent from the FTS bool, membership is re-applied by the
+                // `residual_gate` pass in `search` (a `doc_matches_query` sweep
+                // over the original query; the shape is detected up-front by
+                // `bool_has_nonprojectable_nonscoring`).
+                if let Some(fq) = query_node_to_fts_with_keyword_fields(
                     sub,
                     text_fields,
                     exact_fields,
                     keyword_fields,
-                )?;
-                bool_q = bool_q.filter(fq);
-                projected_any = true;
+                ) {
+                    bool_q = bool_q.filter(fq);
+                    projected_any = true;
+                }
             }
             for sub in should {
                 // A `should` clause that can't be projected to FTS (e.g.
@@ -39128,14 +39266,19 @@ fn query_node_to_fts_with_keyword_fields(
             // `must_not` children that don't project are similar: dropping
             // a must_not relaxes the filter, which is wrong.
             for sub in must_not {
-                let fq = query_node_to_fts_with_keyword_fields(
+                // #361: like `filter`, a non-projecting `must_not` child is a
+                // non-scoring residual — skip it (don't `?`-abort); the
+                // `residual_gate` pass in `search` re-excludes it via
+                // `doc_matches_query` over the original query.
+                if let Some(fq) = query_node_to_fts_with_keyword_fields(
                     sub,
                     text_fields,
                     exact_fields,
                     keyword_fields,
-                )?;
-                bool_q = bool_q.must_not(fq);
-                projected_any = true;
+                ) {
+                    bool_q = bool_q.must_not(fq);
+                    projected_any = true;
+                }
             }
             if !projected_any {
                 return None;
@@ -39496,6 +39639,56 @@ fn query_node_to_fts_with_keyword_fields(
             None
         }
         _ => None,
+    }
+}
+
+/// #361: does `q` contain a `bool` whose `filter`/`must_not` child cannot be
+/// projected to FTS (e.g. `exists`, non-numeric `range`, `script`)?
+///
+/// Such a non-scoring child is skipped from the FTS bool by the projection
+/// (`query_node_to_fts_with_keyword_fields`) so the scoring subtree keeps exact
+/// BM25 — but it is then absent from the FTS match set, so membership must be
+/// re-applied by a `doc_matches_query` gate over the original query, and the
+/// count/materialisation fast path (which assumes the FTS bool IS the exact
+/// match set) must be switched off for the segment.
+fn bool_has_nonprojectable_nonscoring(
+    q: &QueryNode,
+    text_fields: &[String],
+    exact_fields: &std::collections::HashSet<String>,
+    keyword_fields: &std::collections::HashSet<String>,
+) -> bool {
+    match q {
+        QueryNode::Bool {
+            must,
+            should,
+            must_not,
+            filter,
+            ..
+        } => {
+            for sub in filter.iter().chain(must_not.iter()) {
+                if query_node_to_fts_with_keyword_fields(
+                    sub,
+                    text_fields,
+                    exact_fields,
+                    keyword_fields,
+                )
+                .is_none()
+                {
+                    return true;
+                }
+            }
+            must.iter()
+                .chain(should.iter())
+                .chain(filter.iter())
+                .chain(must_not.iter())
+                .any(|c| {
+                    bool_has_nonprojectable_nonscoring(c, text_fields, exact_fields, keyword_fields)
+                })
+        }
+        QueryNode::Constant { query, .. } => {
+            bool_has_nonprojectable_nonscoring(query, text_fields, exact_fields, keyword_fields)
+        }
+        _ => false,
     }
 }
 
