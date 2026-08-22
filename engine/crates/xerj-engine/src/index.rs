@@ -26481,11 +26481,17 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
                 }
                 // Prune an intermediate object that *filtering* emptied (it had
                 // keys, all removed) so a stripped subtree does not leave a bare
-                // `{}` behind. But an object that was ALREADY empty in the source
-                // (`obj.is_empty()`) is a real value the document carried -- keep
-                // it, or a dotted include/exclude anywhere in the request would
-                // silently drop every `{"meta": {}}` from every hit (#310).
-                if result.is_empty() && !prefix.is_empty() && !obj.is_empty() {
+                // `{}` behind. An object that was ALREADY empty in the source is a
+                // real value the document carried -- but keep it ONLY in an
+                // ACCEPTING state: includes is match-all, or this object's own
+                // path is allow-listed (matches an include), NOT merely a prefix
+                // of a deeper one. In pure include mode `{"meta": {}}` under
+                // include `meta.foo` has nothing allow-listed below it, so ES
+                // drops it and so must we; under a match-all/exclude-only filter
+                // the empty object must survive (#310).
+                let already_empty_and_accepted =
+                    obj.is_empty() && (includes.is_empty() || matches_path(prefix, includes));
+                if result.is_empty() && !prefix.is_empty() && !already_empty_and_accepted {
                     Value::Null
                 } else {
                     Value::Object(result)
@@ -26592,6 +26598,46 @@ mod source_filter_tests {
             json!({ "meta": {}, "title": "x" }),
             "an already-empty object must survive a dotted filter; only a \
              filtering-emptied object is pruned (#310)"
+        );
+    }
+
+    /// #310 (part 2, include mode): the already-empty relaxation is gated to an
+    /// ACCEPTING state. An empty object kept only because it PREFIXES a deeper
+    /// include (`meta` for include `meta.foo`) has nothing allow-listed under it,
+    /// so ES drops it -- the fix must not resurrect it. But an empty object whose
+    /// OWN path matches an include is accepting and is preserved. (Without this
+    /// gate, `!obj.is_empty()` alone over-preserves in the prefix case.)
+    #[test]
+    fn dotted_include_keeps_an_empty_object_only_when_its_own_path_is_accepted() {
+        // Prefix-only: `meta` is a non-accepting prefix of `meta.foo`, so nothing
+        // under it is allow-listed -> dropped, exactly as ES does.
+        assert_eq!(
+            filter_object(&json!({ "meta": {} }), &["meta.foo".to_string()], &[]),
+            json!({}),
+            "an empty object that only prefixes a deeper include is not allow-listed (#310)"
+        );
+        // Own-path accepted: `meta` itself is an include (the dotted sibling
+        // `other.x` forces the nested branch) -> preserved.
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": {} }),
+                &["meta".to_string(), "other.x".to_string()],
+                &[]
+            ),
+            json!({ "meta": {} }),
+            "an empty object whose own path matches an include is preserved (#310)"
+        );
+        // Consistency with a non-empty sibling under the same prefix-only include:
+        // `{"meta":{"bar":1}}` under `meta.foo` also drops `meta`, so the empty
+        // and non-empty cases now agree (no appear/disappear by source emptiness).
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": { "bar": 1 } }),
+                &["meta.foo".to_string()],
+                &[]
+            ),
+            json!({}),
+            "a non-empty object with no allow-listed leaf is dropped, same as the empty one (#310)"
         );
     }
 
