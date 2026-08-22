@@ -181,3 +181,182 @@ async fn eql_search_through_a_filtered_alias_honours_the_filter_on_every_member(
          member name: {body}"
     );
 }
+
+/// #567: when the summed match count across alias members exceeds `size`, the
+/// returned page must be the globally-earliest by `@timestamp` (ES EQL ascending
+/// order), not biased toward the earlier-iterated member. Two members with
+/// interleaving timestamps and a `size` below the combined count.
+#[tokio::test]
+async fn eql_events_are_timestamp_ordered_across_members_before_truncation() {
+    let (app, _dir) = app().await;
+
+    // ts-a at odd seconds, ts-b at even — the global @timestamp order interleaves
+    // the two members, so a member-order concat + truncate would return the wrong
+    // page.
+    let members: [(&str, &[u32]); 2] = [("ts-a", &[1, 3, 5]), ("ts-b", &[2, 4, 6])];
+    for (member, secs) in members {
+        let (st, _) = call(
+            &app,
+            "PUT",
+            &format!("/{member}"),
+            json!({"mappings": {"properties": {
+                "status": {"type": "keyword"},
+                "@timestamp": {"type": "date"}
+            }}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "create {member}");
+        for s in secs {
+            let (st, _) = call(
+                &app,
+                "POST",
+                &format!("/{member}/_doc/{member}-{s}"),
+                json!({ "status": "active", "@timestamp": format!("2026-01-01T00:00:0{s}Z") }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "index {member}-{s}");
+        }
+        let (st, _) = call(&app, "POST", &format!("/{member}/_refresh"), Value::Null).await;
+        assert_eq!(st, StatusCode::OK, "refresh {member}");
+    }
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/_aliases",
+        json!({"actions": [
+            {"add": {"index": "ts-a", "alias": "ts-all"}},
+            {"add": {"index": "ts-b", "alias": "ts-all"}}
+        ]}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create alias ts-all");
+
+    // 3 of 6 total: must be the three earliest by @timestamp (01, 02, 03), which
+    // spans BOTH members — not ts-a's first three (01, 03, 05).
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/ts-all/_eql/search",
+        json!({ "query": "any where status == \"active\"", "size": 3 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "_eql/search status: {body}");
+
+    let stamps: Vec<String> = body
+        .pointer("/hits/events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .map(|e| {
+            e.pointer("/_source/@timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        stamps,
+        vec![
+            "2026-01-01T00:00:01Z".to_string(),
+            "2026-01-01T00:00:02Z".to_string(),
+            "2026-01-01T00:00:03Z".to_string(),
+        ],
+        "the returned page must be the globally-earliest by @timestamp across members, not the \
+         first member's earliest three (#567): {body}"
+    );
+    assert_eq!(
+        body.pointer("/hits/total/value").and_then(Value::as_u64),
+        Some(6),
+        "total must be the true summed match count: {body}"
+    );
+}
+
+/// #567 (correctness): the cross-member merge must order by the true INSTANT, not
+/// the raw timestamp string. Mixed fractional-second precision and non-UTC
+/// offsets are the norm in log/SIEM corpora, and a lexical byte compare misorders
+/// both: `…:01.500Z` sorts before `…:01Z` (`.` < `Z`), and `…+05:00` — an earlier
+/// instant — sorts after the lexically-smaller `…Z`.
+#[tokio::test]
+async fn eql_events_order_by_instant_not_lexical_string() {
+    let (app, _dir) = app().await;
+    // True chronological order of the four events:
+    //   2026-01-01T05:00:00+05:00  == 00:00:00.000Z
+    //   2026-01-01T00:00:01Z       == 00:00:01.000Z
+    //   2026-01-01T00:00:01.500Z   == 00:00:01.500Z
+    //   2026-01-01T01:00:00Z       == 01:00:00.000Z
+    let members: [(&str, &[&str]); 2] = [
+        (
+            "iz-a",
+            &["2026-01-01T05:00:00+05:00", "2026-01-01T00:00:01.500Z"],
+        ),
+        ("iz-b", &["2026-01-01T00:00:01Z", "2026-01-01T01:00:00Z"]),
+    ];
+    for (member, stamps) in members {
+        let (st, _) = call(
+            &app,
+            "PUT",
+            &format!("/{member}"),
+            json!({"mappings": {"properties": {
+                "status": {"type": "keyword"},
+                "@timestamp": {"type": "date"}
+            }}}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "create {member}");
+        for (i, ts) in stamps.iter().enumerate() {
+            let (st, _) = call(
+                &app,
+                "POST",
+                &format!("/{member}/_doc/{member}-{i}"),
+                json!({ "status": "active", "@timestamp": ts }),
+            )
+            .await;
+            assert_eq!(st, StatusCode::CREATED, "index {member}-{i} ({ts})");
+        }
+        let (st, _) = call(&app, "POST", &format!("/{member}/_refresh"), Value::Null).await;
+        assert_eq!(st, StatusCode::OK, "refresh {member}");
+    }
+    let (st, _) = call(
+        &app,
+        "POST",
+        "/_aliases",
+        json!({"actions": [
+            {"add": {"index": "iz-a", "alias": "iz"}},
+            {"add": {"index": "iz-b", "alias": "iz"}}
+        ]}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "create alias iz");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/iz/_eql/search",
+        json!({ "query": "any where status == \"active\"", "size": 4 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "_eql/search status: {body}");
+
+    let stamps: Vec<String> = body
+        .pointer("/hits/events")
+        .and_then(Value::as_array)
+        .expect("events array")
+        .iter()
+        .map(|e| {
+            e.pointer("/_source/@timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        stamps,
+        vec![
+            "2026-01-01T05:00:00+05:00".to_string(),
+            "2026-01-01T00:00:01Z".to_string(),
+            "2026-01-01T00:00:01.500Z".to_string(),
+            "2026-01-01T01:00:00Z".to_string(),
+        ],
+        "EQL events must be ordered by the true instant, not the lexical string (#567): {body}"
+    );
+}
