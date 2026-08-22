@@ -682,23 +682,38 @@ const GO_Q: &str = r#"
 (source_file (var_declaration (var_spec_list (var_spec name: (identifier) @static))))
 "#;
 
-// No constant capture here, deliberately. #170 is about files that extract zero
-// symbols and so become unreachable; Java barely has that failure mode, because
-// every file must declare a type. Measured: 7 of 1043 Java files in one corpus
-// and 1 of 72 in another extract zero symbols under this query (0.7%), against
-// 20 of 331 for Rust and 186 of 400 for C headers. A clean query does exist if
-// the recall is wanted later — `(field_declaration (modifiers "static")
-// declarator: (variable_declarator name: (identifier) @const))` captured 372
-// constants with 0 method-local false positives, where capturing all fields
-// would have pulled in 1311 including private instance state — but it is a
-// recall improvement, not this bug, and no Java corpus is wired into the
-// end-to-end check that proves it, so it is not shipped unverified.
+// #170 is about files that extract zero symbols and so become unreachable; Java
+// barely has that failure mode, because every file must declare a type. Measured:
+// 7 of 1043 Java files in one corpus and 1 of 72 in another extract zero symbols
+// under the type/method patterns (0.7%), against 20 of 331 for Rust and 186 of
+// 400 for C headers. So the `static`-field pattern below was originally held back
+// as "a recall improvement, not #170, and no Java corpus is wired into the
+// end-to-end check that proves it."
+//
+// #500 supplied exactly that missing end-to-end evidence: a fair, precise-query
+// retrieval test over Apache Lucene measured the gap directly — a static constant
+// like `DEFAULT_MAX_CONN` was not a symbol at all (`term name=DEFAULT_MAX_CONN` ->
+// count 0), so a field-level fact only survived folded inside its ~2 KB parent
+// class (32-48x more bytes per answered question than grep) or was
+// length-normalised out of reach (the `DEFAULT_BEAM_WIDTH` rank-35 recall miss).
+// So the pattern is now shipped: it promotes each static constant to its own
+// `const` symbol whose `code` is the ~40-80 B declaration span, not the parent.
+// The `static` modifier is the precision filter — it captured 372 constants with
+// 0 method-local false positives, where capturing ALL fields would have pulled in
+// 1311 including private instance state. Java interface fields are implicitly
+// `public static final` constants but parse as `constant_declaration`, not
+// `field_declaration` (verified via s-expr: `interface I { int IC = 7; }` ->
+// `(interface_body (constant_declaration …))`), so they get their own pattern
+// below and are captured with no `static` guard needed. Non-static instance
+// fields remain a separate recall question, not this bug.
 const JAVA_Q: &str = r#"
 (class_declaration name: (identifier) @class)
 (interface_declaration name: (identifier) @interface)
 (enum_declaration name: (identifier) @enum)
 (method_declaration name: (identifier) @method)
 (constructor_declaration name: (identifier) @method)
+(field_declaration (modifiers "static") declarator: (variable_declarator name: (identifier) @const))
+(constant_declaration declarator: (variable_declarator name: (identifier) @const))
 "#;
 
 // C has #170's failure mode worse than anywhere else: 186 of 400 sampled headers
@@ -1609,6 +1624,42 @@ mod tests {
         assert!(has(&s, "C", "class"));
         assert!(has(&s, "m", "method"));
         assert!(has(&s, "I", "interface"));
+    }
+    /// #500: a Java constant (class `static` field OR interface field) must become
+    /// its own `const` symbol whose `code` is the ~40-80 B declaration span, so a
+    /// field-level fact is retrievable directly instead of only folded inside its
+    /// ~2 KB parent class. Instance fields and method locals stay out.
+    #[test]
+    fn java_static_constants_are_symbols() {
+        let s = syms(
+            "java",
+            "class HnswGraphBuilder {\n    public static final int DEFAULT_MAX_CONN = 16;\n    private int instanceField = 3;\n    void m(){ int local = 1; (void)local; }\n}\ninterface Params {\n    int DEFAULT_BEAM_WIDTH = 100;\n}\n",
+        );
+        // The class static constant is its own `const` symbol, and its `code` is
+        // the declaration span (~46 B) — NOT the multi-line parent class body.
+        let c = s
+            .iter()
+            .find(|(n, k, _, _)| n == "DEFAULT_MAX_CONN" && k == "const")
+            .unwrap_or_else(|| panic!("a static class constant must be a symbol (#500): {s:?}"));
+        assert!(
+            c.3.contains("DEFAULT_MAX_CONN = 16") && c.3.len() < 120,
+            "code must be the declaration span, not the ~KB parent class (#500): {:?}",
+            c.3
+        );
+        // A Java interface field is an implicitly-static constant (constant_declaration).
+        assert!(
+            has(&s, "DEFAULT_BEAM_WIDTH", "const"),
+            "an interface constant must be a symbol (#500): {s:?}"
+        );
+        // The static/constant filter keeps instance fields and method locals out.
+        assert!(
+            !has(&s, "instanceField", "const"),
+            "a non-static instance field must NOT be captured (noise): {s:?}"
+        );
+        assert!(
+            !has(&s, "local", "const"),
+            "a method local must NOT be captured: {s:?}"
+        );
     }
     #[test]
     fn c() {
