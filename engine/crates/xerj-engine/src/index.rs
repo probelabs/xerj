@@ -33257,28 +33257,78 @@ fn object_keys_of(val: &Value) -> Option<&serde_json::Map<String, Value>> {
         .or_else(|| val.as_array()?.iter().find(|v| !v.is_null())?.as_object())
 }
 
-/// FNV-1a hash of every field NAME in `val`, at EVERY nesting depth, into
-/// `h` -- not just the top-level keys. Used by the single-doc ingest path's
-/// schema-evolution throttle (`index_document_with_version_inner_guarded`)
-/// to fingerprint "does this document's field-name shape differ from the
-/// last one we evolved the schema for". A shallow, top-level-only hash
-/// would miss a document whose top-level keys are unchanged but whose
-/// NESTED shape changed -- e.g. `metadata.kind` on one document,
-/// `metadata.project` on the next -- silently suppressing the schema-evolve
-/// call that new nested key needs, for up to 100 documents. For a
-/// document with no nested objects this hashes exactly the same bytes in
-/// the same order as hashing only the top-level keys, so it's a strict
-/// superset, not a behavior change, for the common flat-document case.
+/// FNV-1a fingerprint of `val`'s full field-name-and-value-*shape*, folded
+/// into `h`. Used by the single-doc ingest path's schema-evolution throttle
+/// (`index_document_with_version_inner_guarded`) to answer "does this
+/// document's shape differ from the last one we evolved the schema for" and
+/// skip `evolve_schema_from_doc` while it is unchanged, re-checking only every
+/// ~100 documents. The fingerprint MUST reach everywhere the evolution path it
+/// gates reaches, or a genuinely-new field is suppressed for up to 100 docs
+/// and queries against it answer 0 hits until the throttle expires. So it:
+/// * hashes every field NAME at every nesting depth, INCLUDING keys nested
+///   inside arrays-of-objects -- the evolution path unwraps an array of
+///   objects to its FIRST non-null object element (`object_keys_of`) and
+///   registers that element's keys, so this must descend into arrays too;
+///   recursing over every element (below) is a deliberate conservative
+///   superset of that first-element reach (e.g. `metadata.kind` on one
+///   document vs `metadata.project` on the next, whether `metadata` is an
+///   object or an array of objects);
+/// * folds each leaf's value-TYPE tag (null/bool/number/string), so a key
+///   *refused* a `FieldConfig` for value-shape reasons -- e.g. a dense_vector
+///   companion first seen as a numeric array -- re-triggers evolution the
+///   moment a differently-typed value arrives under it (#382);
+/// * folds an array tag and recurses into every element, so an array whose
+///   element shape changes (scalar type, or nested object keys one array-wrap
+///   deep -- `["a"]` -> `[[1]]`, `[{kind}]` -> `[{project}]`) changes the
+///   fingerprint instead of staying an opaque leaf.
+///
+/// A homogeneous corpus (one shape per field) still produces a stable hash, so
+/// the throttle's fast path is unchanged for the common case it exists for.
 fn hash_all_field_names(val: &Value, h: &mut u64) {
-    let Some(obj) = val.as_object() else {
-        return;
-    };
-    for (k, v) in obj {
-        for b in k.bytes() {
-            *h ^= b as u64;
+    match val {
+        Value::Object(obj) => {
+            for (k, v) in obj {
+                for b in k.bytes() {
+                    *h ^= b as u64;
+                    *h = h.wrapping_mul(0x00000100000001b3);
+                }
+                hash_all_field_names(v, h);
+            }
+        }
+        Value::Array(arr) => {
+            // #382 (array variant): fold the array tag AND recurse into every
+            // element. The evolution path this hash gates unwraps an array of
+            // objects to its first non-null object element (`object_keys_of`)
+            // and registers that element's nested keys, so treating an array as
+            // one opaque leaf would let `[{kind}]` -> `[{project}]` or
+            // `["a","b"]` -> `[[1,2]]` keep the same fingerprint and suppress the
+            // evolve those transitions need for up to 100 docs. Recursing over
+            // EVERY element is a conservative superset of that first-element
+            // reach; a homogeneous array still hashes stably doc-to-doc.
+            *h ^= 5;
+            *h = h.wrapping_mul(0x00000100000001b3);
+            for elem in arr {
+                hash_all_field_names(elem, h);
+            }
+        }
+        // #382: mix each leaf's value TYPE into the hash so a key refused a
+        // `FieldConfig` for value-shape reasons re-triggers evolution the moment
+        // a differently-typed value arrives under it. Hashing NAMES alone left
+        // the old and new documents with the same fingerprint, suppressing
+        // evolution for up to 100 docs -> the new value stayed unregistered and
+        // queries answered 0 hits until the throttle expired.
+        _ => {
+            let tag: u64 = match val {
+                Value::Null => 1,
+                Value::Bool(_) => 2,
+                Value::Number(_) => 3,
+                Value::String(_) => 4,
+                // Object and Array are handled by the arms above.
+                Value::Array(_) | Value::Object(_) => unreachable!(),
+            };
+            *h ^= tag;
             *h = h.wrapping_mul(0x00000100000001b3);
         }
-        hash_all_field_names(v, h);
     }
 }
 
@@ -42121,9 +42171,9 @@ mod date_detection_tests {
             "same top-level keys, different nested shape, must hash differently"
         );
 
-        // Sanity: a flat document with no nested objects hashes the exact
-        // same bytes as hashing only its top-level keys would (no behavior
-        // change for the common case this throttle was written for).
+        // Sanity: a flat document hashes each top-level key AND that key's leaf
+        // value TYPE (#382 folds the type tag in — number == 3 — so a later,
+        // differently-typed value under the same key re-triggers evolution).
         let mut h_flat: u64 = 0xcbf29ce484222325;
         hash_all_field_names(&serde_json::json!({"a": 1, "b": 2}), &mut h_flat);
         let mut h_manual: u64 = 0xcbf29ce484222325;
@@ -42132,8 +42182,79 @@ mod date_detection_tests {
                 h_manual ^= b as u64;
                 h_manual = h_manual.wrapping_mul(0x00000100000001b3);
             }
+            h_manual ^= 3; // Value::Number leaf-type tag
+            h_manual = h_manual.wrapping_mul(0x00000100000001b3);
         }
         assert_eq!(h_flat, h_manual);
+    }
+
+    /// #382: the throttle hash must change when a value's TYPE changes under an
+    /// unchanged key name, so a key refused a `FieldConfig` (value-shape reasons)
+    /// re-triggers `evolve_schema_from_doc` when a differently-typed value later
+    /// arrives — instead of staying unregistered (0 hits) for up to 100 docs.
+    #[test]
+    fn hash_all_field_names_distinguishes_leaf_value_types_under_the_same_key() {
+        let mk = |v: &serde_json::Value| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            hash_all_field_names(v, &mut h);
+            h
+        };
+        let as_array = mk(&serde_json::json!({"emb_chunks": [[1.0, 2.0]]}));
+        let as_string = mk(&serde_json::json!({"emb_chunks": "tenant-a"}));
+        let as_number = mk(&serde_json::json!({"emb_chunks": 5}));
+        assert_ne!(
+            as_array, as_string,
+            "an array vs a string under the same key must hash differently (#382)"
+        );
+        assert_ne!(as_string, as_number, "string vs number under the same key");
+        assert_ne!(as_array, as_number, "array vs number under the same key");
+        // A homogeneous corpus (one type per field) still hashes stably, so the
+        // throttle's fast path is unchanged for the common case.
+        assert_eq!(
+            mk(&serde_json::json!({"k": "a"})),
+            mk(&serde_json::json!({"k": "b"})),
+            "same leaf type, different value → stable hash (throttle preserved)"
+        );
+    }
+
+    /// #382 (array variant): the throttle fingerprint must reach *inside* arrays,
+    /// because the evolution path it gates unwraps an array of objects to its
+    /// first non-null object element (`object_keys_of`) and registers its keys;
+    /// the fingerprint recurses over every element, a conservative superset of
+    /// that reach. Treating an array as one opaque leaf let
+    /// `[{kind}]` -> `[{project}]` and `["a"]` -> `[[1]]` keep the same hash, so a
+    /// legitimately-new nested field stayed suppressed (0 hits) for up to 100 docs
+    /// — the same defect one array-wrap deeper than the scalar case above.
+    #[test]
+    fn hash_all_field_names_recurses_into_array_elements() {
+        let mk = |v: &serde_json::Value| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            hash_all_field_names(v, &mut h);
+            h
+        };
+        // Array-of-objects: a new nested key under the same array-valued field is
+        // what `merge_dynamic_children_into` would register — the fingerprint must
+        // change so evolution is not throttled away.
+        assert_ne!(
+            mk(&serde_json::json!({"items": [{"kind": "note"}]})),
+            mk(&serde_json::json!({"items": [{"project": "xerj"}]})),
+            "a new key inside an array-of-objects must change the fingerprint (#382)"
+        );
+        // Element-type change: a flat string array vs a multi-vector companion
+        // (array-of-arrays). The string array is not a multi-vector, so evolution
+        // would register it — but only if the throttle lets the call through.
+        assert_ne!(
+            mk(&serde_json::json!({"emb": ["tenant-a", "tenant-b"]})),
+            mk(&serde_json::json!({"emb": [[1.0, 2.0]]})),
+            "an array's element type changing must change the fingerprint (#382)"
+        );
+        // Stability: same array shape, different scalar values → stable hash, so
+        // the throttle's fast path is preserved for a homogeneous corpus.
+        assert_eq!(
+            mk(&serde_json::json!({"items": [{"kind": "note"}]})),
+            mk(&serde_json::json!({"items": [{"kind": "task"}]})),
+            "same array shape, different values → stable hash (throttle preserved)"
+        );
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
