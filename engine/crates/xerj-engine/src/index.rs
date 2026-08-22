@@ -26484,13 +26484,29 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
                 // `{}` behind. An object that was ALREADY empty in the source is a
                 // real value the document carried -- but keep it ONLY in an
                 // ACCEPTING state: includes is match-all, or this object's own
-                // path is allow-listed (matches an include), NOT merely a prefix
-                // of a deeper one. In pure include mode `{"meta": {}}` under
-                // include `meta.foo` has nothing allow-listed below it, so ES
-                // drops it and so must we; under a match-all/exclude-only filter
-                // the empty object must survive (#310).
+                // path is allow-listed, NOT merely a prefix on the way to a
+                // deeper include. In pure include mode `{"meta": {}}` under
+                // include `meta.foo` (or `meta.*`) has nothing allow-listed below
+                // it, so ES drops it and so must we; under a match-all /
+                // exclude-only filter the empty object must survive (#310).
+                //
+                // `matches_path` cannot be reused as the accept test: it also
+                // returns true for a prefix (to DRIVE recursion), and its glob
+                // clause `p.ends_with(".*") && path.starts_with(p[..len-2])` marks
+                // bare `meta` as matching `meta.*`. ES's automaton needs the
+                // trailing dot -- `meta` is a live but non-accepting state of
+                // `meta.*` -- so the accept test must require it.
+                let path_is_accepting = |path: &str| {
+                    includes.iter().any(|inc| match inc.strip_suffix(".*") {
+                        // `base.*`: accept only paths strictly BELOW `base`.
+                        Some(base) => path.starts_with(&format!("{base}.")),
+                        // Plain paths and other globs: a full `matches_path`
+                        // (path is the include, under it, or a full glob match).
+                        None => matches_path(path, std::slice::from_ref(inc)),
+                    })
+                };
                 let already_empty_and_accepted =
-                    obj.is_empty() && (includes.is_empty() || matches_path(prefix, includes));
+                    obj.is_empty() && (includes.is_empty() || path_is_accepting(prefix));
                 if result.is_empty() && !prefix.is_empty() && !already_empty_and_accepted {
                     Value::Null
                 } else {
@@ -26638,6 +26654,33 @@ mod source_filter_tests {
             ),
             json!({}),
             "a non-empty object with no allow-listed leaf is dropped, same as the empty one (#310)"
+        );
+        // Glob form: `meta.*` — bare `meta` is a non-accepting prefix (ES's
+        // automaton needs the trailing dot), so an empty `{"meta":{}}` drops just
+        // as under `meta.foo`. Reusing `matches_path` as the accept test leaked
+        // this because its `.*` clause matches the dot-less prefix.
+        assert_eq!(
+            filter_object(&json!({ "meta": {} }), &["meta.*".to_string()], &[]),
+            json!({}),
+            "an empty object under a `.*` glob prefix is not allow-listed (#310)"
+        );
+        // But an empty object strictly BELOW the glob base IS accepted.
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": { "foo": {} } }),
+                &["meta.*".to_string()],
+                &[]
+            ),
+            json!({ "meta": { "foo": {} } }),
+            "an empty object strictly under a `.*` glob is preserved (#310)"
+        );
+        // Boundary: a sibling key that merely shares a textual prefix
+        // (`metadata` vs glob `meta.*`) is NOT accepted -- the accept test
+        // requires the dot boundary, unlike a bare `starts_with("meta")`.
+        assert_eq!(
+            filter_object(&json!({ "metadata": {} }), &["meta.*".to_string()], &[]),
+            json!({}),
+            "a prefix-sharing sibling (metadata vs meta.*) is not accepted (#310)"
         );
     }
 
