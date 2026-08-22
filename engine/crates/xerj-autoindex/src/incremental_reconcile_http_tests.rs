@@ -1624,15 +1624,35 @@ fn code_files_index_with_ast_fields_and_the_run_reports_code_coverage() {
     assert_eq!(summary["code_files_junked"], 0, "{summary}");
 
     let docs = endpoint.data_docs();
+    // The per-file AST document carries `defs`/`symbols`; the #500 per-symbol
+    // documents carry `code`/`name` but no `defs`, so filter on `defs` to keep
+    // the one-per-file assertions honest about the file-level document.
     let mut code_docs: Vec<&Value> = docs
         .iter()
-        .filter(|doc| doc.get("language").is_some())
+        .filter(|doc| doc.get("language").is_some() && doc.get("defs").is_some())
         .collect();
     code_docs.sort_by_key(|doc| doc["language"].as_str().unwrap_or("").to_owned());
     assert_eq!(
         code_docs.len(),
         2,
-        "one AST document per source file: {docs:?}"
+        "one AST (file-level) document per source file: {docs:?}"
+    );
+    // #500: each declaration is also promoted to its own retrievable document
+    // (has `code` + `name`, no `defs`). At least the Rust struct + Python class
+    // must each be their own symbol document, not only foldable inside a parent.
+    let symbol_docs: Vec<&Value> = docs
+        .iter()
+        .filter(|doc| doc.get("code").is_some() && doc.get("name").is_some())
+        .collect();
+    assert!(
+        symbol_docs
+            .iter()
+            .any(|d| d["name"] == "AlphaConfig" && d.get("defs").is_none()),
+        "the AlphaConfig struct must be its own symbol document (#500): {symbol_docs:?}"
+    );
+    assert!(
+        symbol_docs.iter().any(|d| d["name"] == "GammaStore"),
+        "the GammaStore class must be its own symbol document (#500): {symbol_docs:?}"
     );
     assert_eq!(code_docs[0]["language"], "python");
     assert_eq!(code_docs[1]["language"], "rust");

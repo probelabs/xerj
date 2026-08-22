@@ -3,13 +3,18 @@
 //! Source files used to fall through to the plain-text extractor, so a repo was
 //! searchable only as prose. This parses each file with the matching tree-sitter
 //! grammar and captures its DEFINITIONS (functions, classes, methods, structs,
-//! traits, interfaces, modules, constants, …). Each file becomes one document
-//! carrying:
+//! traits, interfaces, modules, constants, …). Each file becomes a file-level
+//! document carrying:
 //! - `language`  the detected language
 //! - `symbols`   a structured array of {name, kind, line}
 //! - `defs`      "kind name" per symbol, newline-joined so BM25 matches a query
 //!   like `class User` or `def save` to the file that owns it
 //! - `body`      the full source text (still full-text searchable)
+//!
+//! PLUS one document PER DECLARATION (#500): `{name, kind, line, code}` under a
+//! unique `code:<line>:<name>` locator, so a constant/field/signature lookup
+//! retrieves the ~40–80 B declaration line as its own unit instead of only
+//! surviving folded inside the enclosing class/method body.
 //!
 //! The capture-name in each query IS the symbol kind (`@function`, `@class`, …),
 //! so adding a language is a grammar dep + one registry row. If a grammar fails
@@ -339,8 +344,17 @@ pub fn extract(path: &Path, sn: &crate::sniff::Sniffed, sink: Sink) -> Result<Ex
     Ok(stats)
 }
 
-/// (name, kind, 1-based line)
-type Symbol = (String, String, usize);
+/// (name, kind, 1-based line, declaration line text)
+///
+/// `code` is the single source line the declaration starts on — for a
+/// constant/field/`#define`/signature that IS the whole declaration (~40–80 B),
+/// so #500 can promote each declaration to its own retrievable document instead
+/// of only reaching it inside the ~2–3 KB enclosing class/method body. (A
+/// multi-line body's `code` is its signature line; the full body stays in the
+/// file document's `body`.) Language-agnostic on purpose: the capture depth of
+/// the name node varies per grammar, so a tree-walk to the declaration node is
+/// unreliable, whereas the start line is always exact.
+type Symbol = (String, String, usize, String);
 
 /// Evaluate a pattern's text predicates against one match. The core library
 /// exposes `#eq?`/`#any-of?` (and their `not-` forms) as *general* predicates
@@ -389,6 +403,9 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
     parser.set_language(&def.language).ok()?;
     let tree = parser.parse(text.as_bytes(), None)?;
     let names = def.query.capture_names();
+    // Row → source line, built once (not `lines().nth(row)` per symbol, which
+    // would be O(symbols · file)).
+    let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<Symbol> = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut it = cursor.matches(&def.query, tree.root_node(), text.as_bytes());
@@ -406,11 +423,15 @@ fn parse_symbols(def: &LangDef, text: &str) -> Option<Vec<Symbol>> {
             if name.is_empty() || name.len() > 200 {
                 continue;
             }
-            out.push((
-                name.to_string(),
-                kind.to_string(),
-                node.start_position().row + 1,
-            ));
+            let row = node.start_position().row;
+            // The declaration's start line, trimmed of indentation and capped
+            // so a minified/pathological line can't bloat the per-symbol doc.
+            let mut code = lines.get(row).copied().unwrap_or("").trim().to_string();
+            if code.len() > 400 {
+                // Char-boundary-safe cap (String::truncate would panic mid-char).
+                code = code.chars().take(400).collect();
+            }
+            out.push((name.to_string(), kind.to_string(), row + 1, code));
             if out.len() >= 5000 {
                 return Some(out); // pathological generated file — enough
             }
@@ -443,13 +464,13 @@ fn emit_code_doc(
         let mut seen = std::collections::HashSet::new();
         let defs: Vec<String> = symbols
             .iter()
-            .filter(|(n, k, _)| seen.insert((k.clone(), n.clone())))
-            .map(|(n, k, _)| format!("{k} {n}"))
+            .filter(|(n, k, _, _)| seen.insert((k.clone(), n.clone())))
+            .map(|(n, k, _, _)| format!("{k} {n}"))
             .collect();
         fields.insert("defs".into(), Value::String(defs.join("\n")));
         let arr: Vec<Value> = symbols
             .iter()
-            .map(|(n, k, line)| {
+            .map(|(n, k, line, _)| {
                 let mut m = Map::new();
                 m.insert("name".into(), Value::String(n.clone()));
                 m.insert("kind".into(), Value::String(k.clone()));
@@ -467,7 +488,7 @@ fn emit_code_doc(
     fields.insert("body".into(), Value::String(text.to_string()));
 
     stats.records += 1;
-    sink(RawRecord {
+    if !sink(RawRecord {
         fields,
         locator: "code".into(),
         group: None,
@@ -475,7 +496,65 @@ fn emit_code_doc(
         // something, so a better grammar would otherwise move the file to a
         // different dataset and orphan its old document (#178).
         origin: FieldOrigin::Extractor,
-    })
+    }) {
+        return false;
+    }
+
+    // #500: promote each declaration to its OWN retrievable document. A
+    // constant/field/`#define`/signature lookup then returns the ~40–80 B
+    // declaration line with an exact `name` (mapped keyword), instead of only
+    // surviving folded inside the ~2–3 KB enclosing class/method body (the
+    // measured 32–48× byte blow-up + the rank-35 recall miss). The file
+    // document above keeps `body`/`defs` for full-text and cross-file search.
+    let file_path = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("source")
+        .to_string();
+    // A single declaration can be captured under two kinds at the same line+name
+    // (e.g. `export const f = () => {}` → @function + @const). Those share the
+    // `code:<line>:<name>` locator → the same `doc_id` → ES stores ONE document.
+    // The emitted RECORD count MUST match, or the count-reconciliation barrier
+    // (sync_executor) sees "sealed N vs read-back N-1" and aborts the whole run.
+    // So dedup by locator here, BEFORE counting/emitting — do not rely on the
+    // downstream `_id` overwrite (which fixes the doc but not the count).
+    let mut emitted_locators = std::collections::HashSet::new();
+    for (name, kind, line, code) in symbols {
+        if code.is_empty() {
+            continue;
+        }
+        let locator = format!("code:{line}:{name}");
+        if !emitted_locators.insert(locator.clone()) {
+            continue;
+        }
+        let mut sf = Map::new();
+        // `title` = the symbol so the hit reads as the declaration, `path` for
+        // citation, `name`/`code` searchable (the mapping exposes `name.keyword`
+        // for exact-identifier ranking), `kind`/`line` for filtering + citation.
+        sf.insert("title".into(), Value::String(name.clone()));
+        sf.insert("path".into(), Value::String(file_path.clone()));
+        sf.insert("language".into(), Value::String(language.to_string()));
+        sf.insert("name".into(), Value::String(name.clone()));
+        sf.insert("kind".into(), Value::String(kind.clone()));
+        sf.insert("line".into(), Value::Number((*line as u64).into()));
+        sf.insert("code".into(), Value::String(code.clone()));
+        stats.records += 1;
+        if !sink(RawRecord {
+            fields: sf,
+            // Unique, stable per-declaration locator so `doc_id(dataset,
+            // file_key, locator)` gives each symbol its OWN document instead of
+            // colliding with the file document (all of which used "code"). Keyed
+            // by line+name: unique per declaration, stable across re-index unless
+            // the line moves (deduped above so the record count matches the doc
+            // count).
+            locator,
+            group: None,
+            origin: FieldOrigin::Extractor,
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 // ── Per-language capture queries. Capture-name == emitted symbol kind. ─────────
@@ -1094,7 +1173,7 @@ mod tests {
         parse_symbols(def, src).unwrap()
     }
     fn has(s: &[Symbol], name: &str, kind: &str) -> bool {
-        s.iter().any(|(n, k, _)| n == name && k == kind)
+        s.iter().any(|(n, k, _, _)| n == name && k == kind)
     }
 
     #[test]
@@ -1118,10 +1197,62 @@ mod tests {
             true
         })
         .unwrap();
-        assert_eq!((stats.records, stats.junk), (1, 0));
+        // #500: the file-level document + one per-declaration document
+        // (`alpha_helper`), no junk. records[0] is the file document.
+        assert_eq!((stats.records, stats.junk), (2, 0));
         assert_eq!(records[0].fields["language"], "python");
+        assert!(
+            records
+                .iter()
+                .any(|r| r.fields.get("name").is_some_and(|n| n == "alpha_helper")),
+            "the function must be its own symbol document (#500)"
+        );
         // Title comes from the logical name, not the blob ordinal.
         assert_eq!(records[0].fields["title"], "app.py");
+    }
+
+    /// #500 regression: a declaration captured under two kinds at the same
+    /// line+name (`export const X = () => …` → @function + @const, the dominant
+    /// modern-TS public-surface shape) must emit EXACTLY ONE record, because both
+    /// share the `code:<line>:<name>` locator → one document. Emitting two would
+    /// make the sealed record count exceed the read-back doc count, and the
+    /// count-reconciliation barrier aborts the entire index run.
+    #[test]
+    fn double_captured_declaration_emits_one_record_per_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.ts");
+        std::fs::write(&f, "export const Button = () => 1;\n").unwrap();
+        let sn = crate::sniff::sniff_with_name(&f, Path::new("m.ts")).unwrap();
+        assert_eq!(sn.family, crate::sniff::Family::Code);
+        // The parser really does double-capture this shape (guards the premise).
+        assert!(
+            syms("typescript", "export const Button = () => 1;\n").len() >= 2,
+            "premise: Button is captured under >1 kind"
+        );
+        let mut records: Vec<RawRecord> = Vec::new();
+        let stats = extract(&f, &sn, &mut |record| {
+            records.push(record);
+            true
+        })
+        .unwrap();
+        let distinct: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.locator.as_str()).collect();
+        assert_eq!(
+            records.len(),
+            distinct.len(),
+            "each emitted record needs a UNIQUE locator, else sealed count > read-back \
+             doc count aborts the run: {:?}",
+            records.iter().map(|r| &r.locator).collect::<Vec<_>>()
+        );
+        // The sealed count the reconcile barrier compares against must equal the
+        // number of records actually emitted.
+        assert_eq!(stats.records as usize, records.len());
+        assert!(
+            records
+                .iter()
+                .any(|r| r.fields.get("name").is_some_and(|n| n == "Button")),
+            "Button must still be its own symbol document"
+        );
     }
 
     /// #295 acceptance criterion: every registered grammar must instantiate

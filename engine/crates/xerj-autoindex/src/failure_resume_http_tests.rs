@@ -715,7 +715,9 @@ fn the_legacy_terminal_line_and_run_document_report_code_coverage() {
     let ast = locked
         .docs
         .values()
-        .find(|doc| doc.get("language").is_some())
+        // The file-level AST document carries `defs`; the #500 per-symbol
+        // documents also carry `language` but no `defs`, so select on `defs`.
+        .find(|doc| doc.get("language").is_some() && doc.get("defs").is_some())
         .unwrap_or_else(|| panic!("the legacy path indexes an AST document for alpha.rs"));
     assert_eq!(ast["language"], "rust", "{ast}");
     assert_eq!(ast["title"], "alpha.rs", "{ast}");
