@@ -348,12 +348,24 @@ fn ensure_compatible(fields: &HashMap<String, FieldAcc>, dataset: &PlanDataset) 
         .map(|spec| (spec.name.as_str(), spec))
         .collect();
     for (name, acc) in fields {
-        let spec = specs.get(name.as_str()).with_context(|| {
-            format!(
+        let Some(spec) = specs.get(name.as_str()) else {
+            // A field observed with NO scalar values (`acc.n == 0`) — e.g. the
+            // code file's `symbols` sidecar (an array of objects, which
+            // `FieldAcc` deliberately does not scalar-type) — legitimately never
+            // received a frozen `FieldSpec` at genesis: it has nothing to type.
+            // Its absence is therefore not drift; there is nothing to validate,
+            // so mirror `compatible_with_spec`'s `acc.n == 0 => true` and skip
+            // it. Without this, re-indexing ANY code file aborted the whole run
+            // (#580), because `symbols` is observed on every generation but was
+            // pruned from the frozen schema. A field that DOES carry scalar
+            // values yet is absent is still a real incompatibility.
+            anyhow::ensure!(
+                acc.n == 0,
                 "field {name} is absent from frozen dataset {}",
                 dataset.slug
-            )
-        })?;
+            );
+            continue;
+        };
         anyhow::ensure!(
             compatible_with_spec(acc, spec),
             "field {name} is incompatible with frozen {} mapping in dataset {}",
