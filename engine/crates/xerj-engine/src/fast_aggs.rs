@@ -5132,7 +5132,7 @@ fn compile_top_pred(filter: &Value) -> Option<Pred> {
 /// costs an extra clone, never correctness — so this deliberately mirrors
 /// the substring semantics (`top_hits` anywhere; the meta fields as exact
 /// key/string tokens, i.e. the serialized quoted form).
-fn agg_tree_mentions_meta(v: &Value) -> bool {
+pub(super) fn agg_tree_mentions_meta(v: &Value) -> bool {
     fn is_meta(s: &str) -> bool {
         s.contains("top_hits") || s == "_id" || s == "_index" || s == "_seq_no"
     }
