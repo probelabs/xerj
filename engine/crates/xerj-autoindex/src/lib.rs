@@ -2176,6 +2176,45 @@ fn pending_for_phase_b(
         .collect()
 }
 
+/// #487: an unchanged re-index on a `neural`/`proxy` backend must not fail with
+/// a false "embedding execution identity changed" message. The identity CHANGED
+/// only if a comparable field differs from what the journal pinned; `resumable`
+/// is a standing property of the backend (false by construction for backends
+/// whose identity hashes the model NAME, not its bytes), so it is checked
+/// SEPARATELY with an accurate message — restoring the identity cannot fix a
+/// backend that simply cannot resume.
+fn ensure_embedding_execution_unchanged_and_resumable(
+    current: &crate::esclient::EmbeddingExecutionIdentity,
+    expected_sha: &str,
+    expected_backend: &str,
+    expected_dimension: Option<usize>,
+    expected_semantic_contract: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current.identity_sha256 == expected_sha
+            && current.backend == expected_backend
+            && current.dimensions == expected_dimension
+            && current.semantic_contract == expected_semantic_contract,
+        "embedding execution identity changed since this autoindex journal was created; \
+         refusing to mix vector spaces. No remote mutation was attempted. Restore the \
+         original identity, or rebuild with a new --state-dir and a new --prefix"
+    );
+    anyhow::ensure!(
+        current.resumable,
+        "the `{}` embedding backend cannot resume semantic indexing{}. The pinned identity is \
+         UNCHANGED — this is a backend limitation, not a change, so restoring the identity will \
+         not help. Rebuild with a new --state-dir and a new --prefix, or content-address the \
+         model identity so this backend can resume (#367).",
+        current.backend,
+        current
+            .non_resumable_reason
+            .as_deref()
+            .map(|r| format!(": {r}"))
+            .unwrap_or_default()
+    );
+    Ok(())
+}
+
 fn select_resume_plan_keys(
     files: &[walk::FileEntry],
     content_keys: &[String],
@@ -3170,17 +3209,13 @@ pub fn run_index_report(cfg: IndexCfg) -> Result<(i32, Option<Value>)> {
                     .any(|dataset| dataset.semantic_field.is_some())
                 {
                     let current = es.embedding_execution_identity()?;
-                    anyhow::ensure!(
-                        current.resumable
-                            && current.identity_sha256 == expected.embedding_identity_sha256
-                            && current.backend == expected.embedding_backend
-                            && current.dimensions == expected.embedding_dimension
-                            && current.semantic_contract == expected.embedding_semantic_contract,
-                        "embedding execution identity changed since this autoindex journal was \
-                         created; refusing to mix vector spaces. No remote mutation was attempted. \
-                         Restore the original identity, or rebuild with a new --state-dir and a \
-                         new --prefix"
-                    );
+                    ensure_embedding_execution_unchanged_and_resumable(
+                        &current,
+                        &expected.embedding_identity_sha256,
+                        &expected.embedding_backend,
+                        expected.embedding_dimension,
+                        &expected.embedding_semantic_contract,
+                    )?;
                 }
             }
             let summary = finish_generated_run(&es, &mut journal, &cfg)?;
@@ -6366,6 +6401,60 @@ mod duplicate_integration_tests {
                 Some(&["a".to_string(), "b".to_string(), "c".to_string()])
             ),
             HashSet::from(["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+    }
+
+    /// #487: an UNCHANGED re-index on a backend with `resumable == false`
+    /// (`neural`/`proxy`) must report the resume LIMITATION, not a false
+    /// "identity changed" — and must surface the backend's own reason rather
+    /// than sending the user to a remedy (restore the identity) that cannot work.
+    #[test]
+    fn unchanged_reindex_on_non_resumable_backend_reports_resume_limit_not_identity_change() {
+        let current = crate::esclient::EmbeddingExecutionIdentity {
+            version: 1,
+            backend: "neural".into(),
+            identity_sha256: "6e51e5ce3e46".into(),
+            dimensions: None,
+            semantic_contract: "semantic_text-derived-vector.v1".into(),
+            resumable: false,
+            non_resumable_reason: Some("identity is derived from the model name".into()),
+        };
+        // All comparable fields match → the identity did NOT change.
+        let err = ensure_embedding_execution_unchanged_and_resumable(
+            &current,
+            "6e51e5ce3e46",
+            "neural",
+            None,
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("cannot resume") && !err.contains("identity changed"),
+            "must report the resume limitation, not a false identity change: {err}"
+        );
+        assert!(
+            err.contains("derived from the model name"),
+            "should surface the backend's own non_resumable_reason: {err}"
+        );
+        // A GENUINE change still reports "identity changed".
+        let changed = crate::esclient::EmbeddingExecutionIdentity {
+            identity_sha256: "DIFFERENT".into(),
+            resumable: true,
+            ..current.clone()
+        };
+        let err2 = ensure_embedding_execution_unchanged_and_resumable(
+            &changed,
+            "6e51e5ce3e46",
+            "neural",
+            None,
+            "semantic_text-derived-vector.v1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err2.contains("identity changed"),
+            "a real identity change must still report it: {err2}"
         );
     }
 
