@@ -33188,6 +33188,42 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 // POST /{index}/_eql/search — EQL search stub
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Compare two EQL timestamp-field values (pulled from each event's `_source`)
+/// for the ascending merge sort (#567). Epoch numbers compare numerically (one
+/// unit per corpus). Strings are parsed as RFC3339 / ISO-8601 and compared as
+/// real instants — NOT byte-wise: a raw string compare misorders mixed
+/// fractional-second precision (`…:01.500Z` vs `…:01Z`, since `.` < `Z`) and
+/// non-UTC offsets (`…+05:00` is an earlier instant than the lexically-smaller
+/// `…Z`), which are the norm in SIEM/log corpora. `chrono::DateTime` orders by
+/// the UTC instant, so both are handled. An unparseable value falls back to a
+/// deterministic byte order; a missing field sorts last so a malformed doc never
+/// displaces a real earliest hit.
+fn eql_timestamp_cmp(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            if let (Some(nx), Some(ny)) = (x.as_f64(), y.as_f64()) {
+                nx.partial_cmp(&ny).unwrap_or(Equal)
+            } else if let (Some(sx), Some(sy)) = (x.as_str(), y.as_str()) {
+                match (
+                    chrono::DateTime::parse_from_rfc3339(sx),
+                    chrono::DateTime::parse_from_rfc3339(sy),
+                ) {
+                    (Ok(dx), Ok(dy)) => dx.cmp(&dy),
+                    // Non-RFC3339 formats the engine may still accept: fall back
+                    // to a deterministic byte order rather than misrank silently.
+                    _ => sx.cmp(sy),
+                }
+            } else {
+                Equal
+            }
+        }
+        (Some(_), None) => Less,
+        (None, Some(_)) => Greater,
+        (None, None) => Equal,
+    }
+}
+
 pub async fn eql_search(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -33251,6 +33287,16 @@ pub async fn eql_search(
     // Translate EQL -> xerj DSL, then run it through the normal search path.
     let inner_query = eql_to_query(&eql);
     let size = body.get("size").and_then(Value::as_u64).unwrap_or(10);
+    // #567: EQL orders single-event results by the timestamp field ascending
+    // (default `@timestamp`, overridable via `timestamp_field`). The alias
+    // fan-out below must sort the MERGED events by it before truncating to
+    // `size`, otherwise the surviving page is biased toward the earlier-iterated
+    // members rather than the globally-earliest events.
+    let ts_field = body
+        .get("timestamp_field")
+        .and_then(Value::as_str)
+        .unwrap_or("@timestamp")
+        .to_string();
 
     // Fan out to every member of a multi-index alias (#451 `_eql` arm):
     // eql_search used Engine::get_index -> aliased.first(), silently returning
@@ -33269,7 +33315,24 @@ pub async fn eql_search(
     } else {
         json!({ "bool": { "must": [inner_query], "filter": filters } })
     };
-    let search_body = json!({ "query": effective_query, "size": size, "from": 0 });
+    // Sort each member ascending by the timestamp field: a member with more than
+    // `size` matches must contribute its EARLIEST events to the merge, not its
+    // top-scored ones, or the global-earliest page can miss them. `unmapped_type`
+    // is ES's escape hatch so a member index without the timestamp field is not a
+    // 400 ("No mapping found for [@timestamp] in order to sort on") — XERJ's EQL,
+    // unlike ES, does not require a timestamp field, so this must degrade to
+    // unsorted for such a corpus rather than fail.
+    let mut ts_sort = serde_json::Map::new();
+    ts_sort.insert(
+        ts_field.clone(),
+        json!({ "order": "asc", "unmapped_type": "date" }),
+    );
+    let search_body = json!({
+        "query": effective_query,
+        "size": size,
+        "from": 0,
+        "sort": [Value::Object(ts_sort)],
+    });
 
     let req = match xerj_query::parse_request(&search_body)
         .map_err(|e| xerj_common::XerjError::invalid_query(e.to_string()))
@@ -33299,6 +33362,16 @@ pub async fn eql_search(
             Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
         }
     }
+    // #567: order the merged events by the timestamp field ascending BEFORE
+    // truncating, so the returned page is the globally-earliest `size` events
+    // (ES EQL semantics), not whichever alias members were iterated first. Stable
+    // so events with equal timestamps keep member/order determinism.
+    events.sort_by(|a, b| {
+        eql_timestamp_cmp(
+            a.get("_source").and_then(|s| s.get(&ts_field)),
+            b.get("_source").and_then(|s| s.get(&ts_field)),
+        )
+    });
     // Apply the EQL `size` limit across the merged member results.
     events.truncate(size as usize);
     let took_ms = started.elapsed().as_millis() as u64;
