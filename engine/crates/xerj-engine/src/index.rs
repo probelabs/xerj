@@ -18117,6 +18117,33 @@ impl Index {
         // `min_doc_count:0` background, so it must exist after `_refresh` has
         // flushed the memtable to segments.
         let need_full_corpus = precomputed_aggs.is_none() && request.aggs.is_some();
+        // #464: the brute agg corpus below deep-clones EVERY memtable AND
+        // segment source into owned `Value`s — the allocation that escaped
+        // `max_query_memory_mb` (the window guard bills `from + size` hits, which
+        // is 0 for `size:0 + aggs`). This path is reached by ANY agg that bails
+        // the columnar fast path: a meta-observing `top_hits`, and equally the
+        // no-meta families with no columnar path at all (percentiles /
+        // date_histogram / cardinality). Bound the full-corpus materialisation
+        // here, before the clone, counting memtable AND flushed-segment docs.
+        if need_full_corpus {
+            if let Some(g) = crate::governor::global() {
+                if g.query_memory_enabled() {
+                    const EST_BYTES_PER_OWNED_DOC: u64 = 2048;
+                    let seg_docs: u64 = self
+                        .store
+                        .snapshot()
+                        .segments
+                        .iter()
+                        .map(|m| m.doc_count)
+                        .sum();
+                    let est = (self.memtable.doc_count() as u64)
+                        .saturating_add(seg_docs)
+                        .saturating_mul(EST_BYTES_PER_OWNED_DOC);
+                    g.check_query_alloc(est, "aggregation corpus materialisation")
+                        .map_err(EngineError::Common)?;
+                }
+            }
+        }
         let all_docs: Vec<Value> = if need_full_corpus {
             // `_id` is injected onto each source so `top_hits` / `_id`-keyed
             // aggs over the corpus still work (the fast path never provided it).
