@@ -511,8 +511,20 @@ fn emit_code_doc(
         .and_then(|n| n.to_str())
         .unwrap_or("source")
         .to_string();
+    // A single declaration can be captured under two kinds at the same line+name
+    // (e.g. `export const f = () => {}` → @function + @const). Those share the
+    // `code:<line>:<name>` locator → the same `doc_id` → ES stores ONE document.
+    // The emitted RECORD count MUST match, or the count-reconciliation barrier
+    // (sync_executor) sees "sealed N vs read-back N-1" and aborts the whole run.
+    // So dedup by locator here, BEFORE counting/emitting — do not rely on the
+    // downstream `_id` overwrite (which fixes the doc but not the count).
+    let mut emitted_locators = std::collections::HashSet::new();
     for (name, kind, line, code) in symbols {
         if code.is_empty() {
+            continue;
+        }
+        let locator = format!("code:{line}:{name}");
+        if !emitted_locators.insert(locator.clone()) {
             continue;
         }
         let mut sf = Map::new();
@@ -533,10 +545,9 @@ fn emit_code_doc(
             // file_key, locator)` gives each symbol its OWN document instead of
             // colliding with the file document (all of which used "code"). Keyed
             // by line+name: unique per declaration, stable across re-index unless
-            // the line moves, and it dedups a declaration double-captured under
-            // two kinds (e.g. `export const f = function(){}` → @function+@const)
-            // to a single doc at the same line.
-            locator: format!("code:{line}:{name}"),
+            // the line moves (deduped above so the record count matches the doc
+            // count).
+            locator,
             group: None,
             origin: FieldOrigin::Extractor,
         }) {
@@ -1198,6 +1209,50 @@ mod tests {
         );
         // Title comes from the logical name, not the blob ordinal.
         assert_eq!(records[0].fields["title"], "app.py");
+    }
+
+    /// #500 regression: a declaration captured under two kinds at the same
+    /// line+name (`export const X = () => …` → @function + @const, the dominant
+    /// modern-TS public-surface shape) must emit EXACTLY ONE record, because both
+    /// share the `code:<line>:<name>` locator → one document. Emitting two would
+    /// make the sealed record count exceed the read-back doc count, and the
+    /// count-reconciliation barrier aborts the entire index run.
+    #[test]
+    fn double_captured_declaration_emits_one_record_per_locator() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.ts");
+        std::fs::write(&f, "export const Button = () => 1;\n").unwrap();
+        let sn = crate::sniff::sniff_with_name(&f, Path::new("m.ts")).unwrap();
+        assert_eq!(sn.family, crate::sniff::Family::Code);
+        // The parser really does double-capture this shape (guards the premise).
+        assert!(
+            syms("typescript", "export const Button = () => 1;\n").len() >= 2,
+            "premise: Button is captured under >1 kind"
+        );
+        let mut records: Vec<RawRecord> = Vec::new();
+        let stats = extract(&f, &sn, &mut |record| {
+            records.push(record);
+            true
+        })
+        .unwrap();
+        let distinct: std::collections::HashSet<&str> =
+            records.iter().map(|r| r.locator.as_str()).collect();
+        assert_eq!(
+            records.len(),
+            distinct.len(),
+            "each emitted record needs a UNIQUE locator, else sealed count > read-back \
+             doc count aborts the run: {:?}",
+            records.iter().map(|r| &r.locator).collect::<Vec<_>>()
+        );
+        // The sealed count the reconcile barrier compares against must equal the
+        // number of records actually emitted.
+        assert_eq!(stats.records as usize, records.len());
+        assert!(
+            records
+                .iter()
+                .any(|r| r.fields.get("name").is_some_and(|n| n == "Button")),
+            "Button must still be its own symbol document"
+        );
     }
 
     /// #295 acceptance criterion: every registered grammar must instantiate
