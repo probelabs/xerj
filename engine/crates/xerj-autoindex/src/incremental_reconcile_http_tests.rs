@@ -768,6 +768,60 @@ fn partially_applied_data_bulk_leaves_the_generation_pending_and_the_retry_conve
     );
 }
 
+/// #490: a corpus committed by the `--no-graph` generated path must not be
+/// silently re-runnable on the default *graph* path. A committed generation
+/// manifest is graph-disabled by construction (`sync::validate_manifest`), so
+/// the graph path can recognise the mismatch and refuse it — the way the
+/// graph→no-graph direction is already refused. Before this guard the graph
+/// re-run reconciled against the no-graph plan and *mutated the destination*
+/// (publishing the newly added row) before the mismatch was ever noticed, then
+/// left `--fresh` refused. The refusal must land before the journal is opened
+/// for write, so no remote mutation is attempted.
+#[test]
+fn no_graph_committed_corpus_refuses_a_graph_path_rerun_before_mutating() {
+    let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let corpus = tempfile::tempdir().unwrap();
+    let state_dir = tempfile::tempdir().unwrap();
+    let source = corpus.path().join("rows.csv");
+    fs::write(&source, "id,value\n1,first\n").unwrap();
+    let endpoint = HttpEndpoint::start();
+
+    // Commit generation 1 with the `--no-graph` generated executor.
+    let no_graph = cfg(corpus.path(), state_dir.path(), &endpoint.url, false);
+    assert_eq!(run_index(no_graph.clone()).unwrap(), 0);
+    assert_eq!(journal_events(state_dir.path(), "sync_commit"), 1);
+    let committed = endpoint.data_docs().len();
+    assert!(committed > 0, "the no-graph run published documents");
+
+    // Grow the corpus so a graph re-run would have a new row to publish, then
+    // re-run the *same* state dir on the default graph path (`no_graph: false`).
+    fs::write(&source, "id,value\n1,first\n2,second\n").unwrap();
+    let mut graph = no_graph.clone();
+    graph.no_graph = false;
+    let error = run_index(graph).unwrap_err();
+    let rendered = format!("{error:#}");
+    assert!(
+        rendered.contains("indexed with --no-graph"),
+        "the graph re-run must be refused with the cross-path message, got: {rendered}"
+    );
+
+    // The refusal must land before any mutation: the added row was not
+    // published, and no second generation was committed.
+    assert_eq!(
+        endpoint.data_docs().len(),
+        committed,
+        "the refused graph re-run must not publish the added row"
+    );
+    assert_eq!(
+        journal_events(state_dir.path(), "sync_commit"),
+        1,
+        "no second generation may be committed by the refused cross-path re-run"
+    );
+}
+
 #[test]
 fn pending_semantic_identity_drift_rejects_before_any_further_bulk() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
