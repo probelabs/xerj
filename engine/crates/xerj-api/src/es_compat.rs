@@ -8342,6 +8342,29 @@ fn emit_inner_hit_versioning(
     }
 }
 
+/// #603: resolve a top-level / scroll hit's wire `(_version, _seq_no,
+/// _primary_term)`, honouring the request's `version` / `seq_no_primary_term`
+/// flags. A value is emitted ONLY when the engine actually resolved it: an
+/// absent `seq_no`/`version` (a concurrent tombstone or version-map miss,
+/// carried as `None` on the `Hit`) is OMITTED, never fabricated into a
+/// positional hit index or a default `1` — values a client could replay into
+/// `if_seq_no`/`if_primary_term` and corrupt optimistic concurrency. The
+/// placeholder `_primary_term = 1` is emitted only alongside a real `_seq_no`.
+/// This is the non-collapse twin of [`emit_inner_hit_versioning`] (#566).
+fn resolve_hit_versioning(
+    seq_no: Option<u64>,
+    version: Option<u64>,
+    emit_seq_no: bool,
+    emit_version: bool,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let out_version = if emit_version { version } else { None };
+    let (out_seq_no, out_primary_term) = match (emit_seq_no, seq_no) {
+        (true, Some(sn)) => (Some(sn), Some(1u64)),
+        _ => (None, None),
+    };
+    (out_version, out_seq_no, out_primary_term)
+}
+
 #[cfg(test)]
 mod inner_hit_versioning_tests {
     use super::*;
@@ -8380,6 +8403,43 @@ mod inner_hit_versioning_tests {
         let mut hit3 = serde_json::Map::new();
         emit_inner_hit_versioning(&real, false, false, &mut hit3);
         assert!(hit3.is_empty(), "flags off => nothing emitted");
+    }
+
+    /// #603: the top-level and scroll hit render paths must honour the SAME
+    /// omit-on-absent contract as the collapse inner_hit path — an absent
+    /// `_seq_no`/`_version` is omitted, never a positional index or a
+    /// default `1`, and `_primary_term` never appears without a real `_seq_no`.
+    #[test]
+    fn absent_top_level_versioning_is_omitted_not_fabricated() {
+        // Both flags on, both values absent → everything omitted (the bug was
+        // `(Some(1), Some(hit_idx), Some(1))` here).
+        assert_eq!(
+            resolve_hit_versioning(None, None, true, true),
+            (None, None, None),
+            "absent seq_no/version must be omitted, never positional/defaulted (#603)"
+        );
+        // Real values → emitted verbatim, with the placeholder primary_term.
+        assert_eq!(
+            resolve_hit_versioning(Some(42), Some(7), true, true),
+            (Some(7), Some(42), Some(1))
+        );
+        // seq_no resolved but version absent (independent axes) → version omitted,
+        // seq_no + primary_term emitted.
+        assert_eq!(
+            resolve_hit_versioning(Some(42), None, true, true),
+            (None, Some(42), Some(1))
+        );
+        // version resolved but seq_no absent → version emitted, but NO
+        // `_primary_term` without a real `_seq_no`.
+        assert_eq!(
+            resolve_hit_versioning(None, Some(7), true, true),
+            (Some(7), None, None)
+        );
+        // Flags off → nothing emitted even when the engine resolved values.
+        assert_eq!(
+            resolve_hit_versioning(Some(42), Some(7), false, false),
+            (None, None, None)
+        );
     }
 }
 
@@ -11507,8 +11567,7 @@ async fn search_impl(
 
     let hits: Vec<EsHit> = merged_hits
         .into_iter()
-        .enumerate()
-        .map(|(hit_idx, (idx_name, h))| {
+        .map(|(idx_name, h)| {
             // Extract `_ignored` from _source (populated by apply_ignore_malformed
             // at index time). Promote it to a top-level hit meta-field and
             // remove it from the returned _source so _source stays clean.
@@ -13406,12 +13465,11 @@ async fn search_impl(
             // the hit itself — resolved at construction time in the engine,
             // from the same read as `_source`, not a later live re-lookup
             // here (#440).
-            let (real_seq_no, real_primary_term) = if emit_seq_no {
-                let sn = h.seq_no.unwrap_or(hit_idx as u64);
-                (Some(sn), Some(1u64))
-            } else {
-                (None, None)
-            };
+            // #603: emit `_version`/`_seq_no`/`_primary_term` only when the
+            // engine resolved them; an absent value is omitted, never
+            // fabricated into a positional index or a default `1`.
+            let (real_version, real_seq_no, real_primary_term) =
+                resolve_hit_versioning(h.seq_no, h.version, emit_seq_no, emit_version);
             EsHit {
                 index: idx_name.clone(),
                 id: h.id.clone(),
@@ -13430,17 +13488,13 @@ async fn search_impl(
                 } else {
                     None
                 },
-                version: if emit_version {
-                    // Real per-doc `_version`, read from the hit itself —
-                    // resolved at construction time in the engine (external-
-                    // version map wins so reindexes with
-                    // `version_type=external[_gte]` echo the caller's
-                    // value, then the engine write counter), not a later
-                    // live re-lookup here (#440).
-                    h.version.or(Some(1))
-                } else {
-                    None
-                },
+                // Per-doc `_version`/`_seq_no`/`_primary_term` are read from the
+                // hit itself — resolved at construction time in the engine (the
+                // external-version map wins so `version_type=external[_gte]`
+                // reindexes echo the caller's value; then the write counter),
+                // not a later live re-lookup here (#440). An absent value is
+                // omitted, never fabricated (#603) — see `resolve_hit_versioning`.
+                version: real_version,
                 seq_no: real_seq_no,
                 primary_term: real_primary_term,
                 source,
@@ -20070,22 +20124,29 @@ pub async fn search_with_scroll(
         let first_page: Vec<EsHit> = all_hits
             .iter()
             .take(page_size)
-            .enumerate()
-            .map(|(hit_idx, (idx_name, h))| EsHit {
+            .map(|(idx_name, h)| EsHit {
                 index: idx_name.clone(),
                 id: h.id.clone(),
                 score: Some(h.score as f64),
                 version: if emit_version {
-                    h.version.or(Some(1))
+                    // #603: absent `_version` omitted, never defaulted to 1.
+                    h.version
                 } else {
                     None
                 },
                 seq_no: if emit_seq_no {
-                    Some(h.seq_no.unwrap_or(hit_idx as u64))
+                    // #603: absent `_seq_no` omitted, never a positional
+                    // `hit_idx` a client could replay into OCC.
+                    h.seq_no
                 } else {
                     None
                 },
-                primary_term: if emit_seq_no { Some(1) } else { None },
+                // #603: `_primary_term` only alongside a real `_seq_no`.
+                primary_term: if emit_seq_no {
+                    h.seq_no.map(|_| 1)
+                } else {
+                    None
+                },
                 source: if h.source.is_null() {
                     None
                 } else {
@@ -20402,23 +20463,30 @@ async fn scroll_page_response(
                 .iter()
                 .skip(position)
                 .take(page_size)
-                .enumerate()
-                .map(|(hit_idx, (hit_index, h))| EsHit {
+                .map(|(hit_index, h)| EsHit {
                     // Per-hit index, not the context-level one (#414).
                     index: hit_index.clone(),
                     id: h.id.clone(),
                     score: Some(h.score as f64),
                     version: if emit_version {
-                        h.version.or(Some(1))
+                        // #603: absent `_version` omitted, never defaulted to 1.
+                        h.version
                     } else {
                         None
                     },
                     seq_no: if emit_seq_no {
-                        Some(h.seq_no.unwrap_or(hit_idx as u64))
+                        // #603: absent `_seq_no` omitted, never a positional
+                        // `hit_idx` a client could replay into OCC.
+                        h.seq_no
                     } else {
                         None
                     },
-                    primary_term: if emit_seq_no { Some(1) } else { None },
+                    // #603: `_primary_term` only alongside a real `_seq_no`.
+                    primary_term: if emit_seq_no {
+                        h.seq_no.map(|_| 1)
+                    } else {
+                        None
+                    },
                     source: if h.source.is_null() {
                         None
                     } else {
