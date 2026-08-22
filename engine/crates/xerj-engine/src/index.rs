@@ -33271,6 +33271,26 @@ fn object_keys_of(val: &Value) -> Option<&serde_json::Map<String, Value>> {
 /// superset, not a behavior change, for the common flat-document case.
 fn hash_all_field_names(val: &Value, h: &mut u64) {
     let Some(obj) = val.as_object() else {
+        // #382: mix the leaf value's TYPE into the hash. The schema-evolution
+        // throttle skips `evolve_schema_from_doc` while this hash is unchanged,
+        // and hashing key NAMES alone left a key that was *refused* a FieldConfig
+        // (for value-shape reasons — e.g. a dense_vector companion) with the same
+        // hash when a later document put a differently-typed value under it. That
+        // suppressed evolution for up to 100 docs, so the new value shape stayed
+        // unregistered and queries answered 0 hits until the throttle expired.
+        // Folding the leaf type in makes a `string` after an `array`/`object`/
+        // number re-trigger evolution. A homogeneous corpus (one type per field)
+        // still produces a stable hash, so the fast path is unchanged for it.
+        let tag: u64 = match val {
+            Value::Null => 1,
+            Value::Bool(_) => 2,
+            Value::Number(_) => 3,
+            Value::String(_) => 4,
+            Value::Array(_) => 5,
+            Value::Object(_) => 6, // unreachable: `as_object` returned None
+        };
+        *h ^= tag;
+        *h = h.wrapping_mul(0x00000100000001b3);
         return;
     };
     for (k, v) in obj {
@@ -42121,9 +42141,9 @@ mod date_detection_tests {
             "same top-level keys, different nested shape, must hash differently"
         );
 
-        // Sanity: a flat document with no nested objects hashes the exact
-        // same bytes as hashing only its top-level keys would (no behavior
-        // change for the common case this throttle was written for).
+        // Sanity: a flat document hashes each top-level key AND that key's leaf
+        // value TYPE (#382 folds the type tag in — number == 3 — so a later,
+        // differently-typed value under the same key re-triggers evolution).
         let mut h_flat: u64 = 0xcbf29ce484222325;
         hash_all_field_names(&serde_json::json!({"a": 1, "b": 2}), &mut h_flat);
         let mut h_manual: u64 = 0xcbf29ce484222325;
@@ -42132,8 +42152,39 @@ mod date_detection_tests {
                 h_manual ^= b as u64;
                 h_manual = h_manual.wrapping_mul(0x00000100000001b3);
             }
+            h_manual ^= 3; // Value::Number leaf-type tag
+            h_manual = h_manual.wrapping_mul(0x00000100000001b3);
         }
         assert_eq!(h_flat, h_manual);
+    }
+
+    /// #382: the throttle hash must change when a value's TYPE changes under an
+    /// unchanged key name, so a key refused a `FieldConfig` (value-shape reasons)
+    /// re-triggers `evolve_schema_from_doc` when a differently-typed value later
+    /// arrives — instead of staying unregistered (0 hits) for up to 100 docs.
+    #[test]
+    fn hash_all_field_names_distinguishes_leaf_value_types_under_the_same_key() {
+        let mk = |v: &serde_json::Value| {
+            let mut h: u64 = 0xcbf29ce484222325;
+            hash_all_field_names(v, &mut h);
+            h
+        };
+        let as_array = mk(&serde_json::json!({"emb_chunks": [[1.0, 2.0]]}));
+        let as_string = mk(&serde_json::json!({"emb_chunks": "tenant-a"}));
+        let as_number = mk(&serde_json::json!({"emb_chunks": 5}));
+        assert_ne!(
+            as_array, as_string,
+            "an array vs a string under the same key must hash differently (#382)"
+        );
+        assert_ne!(as_string, as_number, "string vs number under the same key");
+        assert_ne!(as_array, as_number, "array vs number under the same key");
+        // A homogeneous corpus (one type per field) still hashes stably, so the
+        // throttle's fast path is unchanged for the common case.
+        assert_eq!(
+            mk(&serde_json::json!({"k": "a"})),
+            mk(&serde_json::json!({"k": "b"})),
+            "same leaf type, different value → stable hash (throttle preserved)"
+        );
     }
 
     /// Ingest-time acceptance for default-format date fields: lenient on
