@@ -2298,10 +2298,14 @@ mod tests {
         )
         .unwrap();
         let prepared = snapshot.files[0].prepared.as_ref().unwrap();
-        assert_eq!(
-            (prepared.records, prepared.junk),
-            (1, 0),
-            "a code file must prepare one document, not silent junk"
+        // #500: a code file prepares the file-level document PLUS one document
+        // per declaration — so records is now ≥1 (was exactly 1). The invariant
+        // the test guards is "documents, not silent junk": junk stays 0.
+        assert!(
+            prepared.records >= 1 && prepared.junk == 0,
+            "a code file must prepare documents, not silent junk: records={} junk={}",
+            prepared.records,
+            prepared.junk
         );
         let ndjson = std::fs::read_to_string(
             state
