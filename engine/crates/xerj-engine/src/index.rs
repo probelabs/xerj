@@ -26479,7 +26479,35 @@ fn filter_object(source: &Value, includes: &[String], excludes: &[String]) -> Va
                         }
                     }
                 }
-                if result.is_empty() && !prefix.is_empty() {
+                // Prune an intermediate object that *filtering* emptied (it had
+                // keys, all removed) so a stripped subtree does not leave a bare
+                // `{}` behind. An object that was ALREADY empty in the source is a
+                // real value the document carried -- but keep it ONLY in an
+                // ACCEPTING state: includes is match-all, or this object's own
+                // path is allow-listed, NOT merely a prefix on the way to a
+                // deeper include. In pure include mode `{"meta": {}}` under
+                // include `meta.foo` (or `meta.*`) has nothing allow-listed below
+                // it, so ES drops it and so must we; under a match-all /
+                // exclude-only filter the empty object must survive (#310).
+                //
+                // `matches_path` cannot be reused as the accept test: it also
+                // returns true for a prefix (to DRIVE recursion), and its glob
+                // clause `p.ends_with(".*") && path.starts_with(p[..len-2])` marks
+                // bare `meta` as matching `meta.*`. ES's automaton needs the
+                // trailing dot -- `meta` is a live but non-accepting state of
+                // `meta.*` -- so the accept test must require it.
+                let path_is_accepting = |path: &str| {
+                    includes.iter().any(|inc| match inc.strip_suffix(".*") {
+                        // `base.*`: accept only paths strictly BELOW `base`.
+                        Some(base) => path.starts_with(&format!("{base}.")),
+                        // Plain paths and other globs: a full `matches_path`
+                        // (path is the include, under it, or a full glob match).
+                        None => matches_path(path, std::slice::from_ref(inc)),
+                    })
+                };
+                let already_empty_and_accepted =
+                    obj.is_empty() && (includes.is_empty() || path_is_accepting(prefix));
+                if result.is_empty() && !prefix.is_empty() && !already_empty_and_accepted {
                     Value::Null
                 } else {
                     Value::Object(result)
@@ -26562,6 +26590,98 @@ mod source_filter_tests {
                 })
             );
         }
+    }
+
+    /// #310 (part 2): a dotted include/exclude anywhere in the request forces
+    /// `filter_object` into its nested branch, which pruned EVERY empty object.
+    /// An object that was already `{}` in the source is a real value the document
+    /// carried and must survive; only an object that *filtering* emptied (had
+    /// keys, all removed) is pruned. A dotted embedding `target_field` puts the
+    /// Default arm on this path, silently dropping every `{"meta": {}}` from
+    /// every hit.
+    #[test]
+    fn dotted_filter_keeps_an_already_empty_source_object_but_prunes_a_filtering_emptied_one() {
+        let source = json!({
+            "meta": {},                // already empty in the source
+            "title": "x",
+            "nested": { "drop_me": 1 } // becomes empty only via the exclude below
+        });
+        // The dotted exclude forces the nested branch (has_dotted) and empties
+        // `nested`; `meta` was already empty in the document.
+        let filtered = filter_object(&source, &[], &["nested.drop_me".to_string()]);
+        assert_eq!(
+            filtered,
+            json!({ "meta": {}, "title": "x" }),
+            "an already-empty object must survive a dotted filter; only a \
+             filtering-emptied object is pruned (#310)"
+        );
+    }
+
+    /// #310 (part 2, include mode): the already-empty relaxation is gated to an
+    /// ACCEPTING state. An empty object kept only because it PREFIXES a deeper
+    /// include (`meta` for include `meta.foo`) has nothing allow-listed under it,
+    /// so ES drops it -- the fix must not resurrect it. But an empty object whose
+    /// OWN path matches an include is accepting and is preserved. (Without this
+    /// gate, `!obj.is_empty()` alone over-preserves in the prefix case.)
+    #[test]
+    fn dotted_include_keeps_an_empty_object_only_when_its_own_path_is_accepted() {
+        // Prefix-only: `meta` is a non-accepting prefix of `meta.foo`, so nothing
+        // under it is allow-listed -> dropped, exactly as ES does.
+        assert_eq!(
+            filter_object(&json!({ "meta": {} }), &["meta.foo".to_string()], &[]),
+            json!({}),
+            "an empty object that only prefixes a deeper include is not allow-listed (#310)"
+        );
+        // Own-path accepted: `meta` itself is an include (the dotted sibling
+        // `other.x` forces the nested branch) -> preserved.
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": {} }),
+                &["meta".to_string(), "other.x".to_string()],
+                &[]
+            ),
+            json!({ "meta": {} }),
+            "an empty object whose own path matches an include is preserved (#310)"
+        );
+        // Consistency with a non-empty sibling under the same prefix-only include:
+        // `{"meta":{"bar":1}}` under `meta.foo` also drops `meta`, so the empty
+        // and non-empty cases now agree (no appear/disappear by source emptiness).
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": { "bar": 1 } }),
+                &["meta.foo".to_string()],
+                &[]
+            ),
+            json!({}),
+            "a non-empty object with no allow-listed leaf is dropped, same as the empty one (#310)"
+        );
+        // Glob form: `meta.*` — bare `meta` is a non-accepting prefix (ES's
+        // automaton needs the trailing dot), so an empty `{"meta":{}}` drops just
+        // as under `meta.foo`. Reusing `matches_path` as the accept test leaked
+        // this because its `.*` clause matches the dot-less prefix.
+        assert_eq!(
+            filter_object(&json!({ "meta": {} }), &["meta.*".to_string()], &[]),
+            json!({}),
+            "an empty object under a `.*` glob prefix is not allow-listed (#310)"
+        );
+        // But an empty object strictly BELOW the glob base IS accepted.
+        assert_eq!(
+            filter_object(
+                &json!({ "meta": { "foo": {} } }),
+                &["meta.*".to_string()],
+                &[]
+            ),
+            json!({ "meta": { "foo": {} } }),
+            "an empty object strictly under a `.*` glob is preserved (#310)"
+        );
+        // Boundary: a sibling key that merely shares a textual prefix
+        // (`metadata` vs glob `meta.*`) is NOT accepted -- the accept test
+        // requires the dot boundary, unlike a bare `starts_with("meta")`.
+        assert_eq!(
+            filter_object(&json!({ "metadata": {} }), &["meta.*".to_string()], &[]),
+            json!({}),
+            "a prefix-sharing sibling (metadata vs meta.*) is not accepted (#310)"
+        );
     }
 
     #[test]
