@@ -1107,10 +1107,26 @@ fn classify_text(text: &str, nonblank: &[&str]) -> Family {
         return Family::Csv;
     }
 
-    // YAML
-    if nonblank.first().map(|l| l.trim() == "---").unwrap_or(false)
-        || yaml_line_ratio(nonblank) >= 0.6
-    {
+    // YAML — but a leading `---` is also the opening delimiter of markdown/prose
+    // frontmatter (Jekyll, Hugo, Obsidian, Docusaurus, MkDocs, Astro, and Claude
+    // Code skill files — including the two this repo ships). Without a lookahead
+    // for the *closing* `---` and what follows it, every such file was handed to
+    // the YAML extractor, which keeps the frontmatter mapping and the first
+    // paragraph and discards the rest of the body (#551, silent data loss). If
+    // the file opens with `---`, has a matching closing `---`, and the body after
+    // it is majority non-YAML, classify by that body so the whole document is
+    // indexed. A pure/multi-document YAML file keeps YAML: the content after its
+    // `---` document marker is still YAML-like (or too short to be called prose).
+    let leads_with_marker = nonblank.first().map(|l| l.trim() == "---").unwrap_or(false);
+    if leads_with_marker {
+        if let Some(close_offset) = nonblank.iter().skip(1).position(|l| l.trim() == "---") {
+            let body = &nonblank[close_offset + 2..];
+            if body.len() >= 2 && yaml_like_count(body) * 2 < body.len() {
+                return txt_kind(body);
+            }
+        }
+    }
+    if leads_with_marker || yaml_line_ratio(nonblank) >= 0.6 {
         return Family::Yaml;
     }
 
@@ -1127,8 +1143,16 @@ fn yaml_line_ratio(nonblank: &[&str]) -> f64 {
     if nonblank.len() < 3 {
         return 0.0;
     }
+    yaml_like_count(nonblank) as f64 / nonblank.len() as f64
+}
+
+/// Count of lines that read as YAML mapping/sequence entries. Shared by
+/// `yaml_line_ratio` and the frontmatter lookahead (#551) so both apply the
+/// identical definition of "YAML-like line" — unlike `yaml_line_ratio` this has
+/// no `< 3` short-circuit, so a short frontmatter body is judged on its content.
+fn yaml_like_count(lines: &[&str]) -> usize {
     let re = regex::Regex::new(r"^\s*(- )?[\w.@/-]+:(\s|$)").unwrap();
-    let hits = nonblank
+    lines
         .iter()
         .filter(|l| {
             let t = l.trim_start();
@@ -1141,8 +1165,7 @@ fn yaml_line_ratio(nonblank: &[&str]) -> f64 {
                 t.starts_with("- [ ] ") || t.starts_with("- [x] ") || t.starts_with("- [X] ");
             re.is_match(l) || (t.starts_with("- ") && !checkbox)
         })
-        .count();
-    hits as f64 / nonblank.len() as f64
+        .count()
 }
 
 fn txt_kind(nonblank: &[&str]) -> Family {
@@ -3104,6 +3127,69 @@ mod text_family_tests {
                   ## Pool exhaustion\n\
                   Symptoms are rising p99 and pool errors in the logs.\n";
         assert_eq!(kind(md), Family::TxtProse);
+    }
+
+    /// #551: a markdown/prose file that opens with a `---` frontmatter block was
+    /// sniffed as YAML — the YAML extractor keeps the frontmatter mapping and the
+    /// first paragraph and discards the body (silent data loss on the dominant
+    /// markdown convention: Jekyll/Hugo/Obsidian/Docusaurus/MkDocs/Astro, and
+    /// Claude Code skill files). With the closing-`---` lookahead the file is
+    /// classified by its body — identically to a frontmatter-less twin — so the
+    /// whole document is indexed.
+    #[test]
+    fn markdown_frontmatter_is_classified_by_its_body_not_yaml() {
+        let with_frontmatter = "---\n\
+                                title: Widget outage\n\
+                                date: 2026-01-15\n\
+                                tags: [widget, outage]\n\
+                                ---\n\n\
+                                # Outage postmortem\n\n\
+                                The sprocket pool was exhausted.\n\n\
+                                ## Resolution\n\
+                                Raised the sprocket pool size from 4 to 16.\n";
+        // Byte-identical body, no frontmatter.
+        let no_frontmatter = "# Outage postmortem\n\n\
+                              The sprocket pool was exhausted.\n\n\
+                              ## Resolution\n\
+                              Raised the sprocket pool size from 4 to 16.\n";
+        let twin = classify_full(no_frontmatter);
+        assert_ne!(
+            twin,
+            Family::Yaml,
+            "sanity: the body itself is prose, not YAML"
+        );
+        assert_eq!(
+            classify_full(with_frontmatter),
+            twin,
+            "markdown frontmatter must be classified by its body, identical to the \
+             frontmatter-less twin, not routed to the YAML extractor (#551)"
+        );
+    }
+
+    /// #551 guardrail: the frontmatter lookahead must not reclassify real YAML.
+    /// A single document (leading `---` marker, no prose body) and a
+    /// multi-document stream (the body after the first `---` separator is itself
+    /// YAML) both stay `Yaml`.
+    #[test]
+    fn yaml_documents_are_unaffected_by_the_frontmatter_lookahead() {
+        let pure = "---\n\
+                    name: widget-service\n\
+                    replicas: 3\n\
+                    ports:\n\
+                    \x20 - 8080\n\
+                    \x20 - 9090\n\
+                    env:\n\
+                    \x20 LOG_LEVEL: info\n";
+        assert_eq!(classify_full(pure), Family::Yaml);
+
+        let multi = "---\n\
+                     name: first\n\
+                     value: 1\n\
+                     ---\n\
+                     name: second\n\
+                     value: 2\n\
+                     kind: config\n";
+        assert_eq!(classify_full(multi), Family::Yaml);
     }
 
     /// The record-stream side must be unaffected — these are what TxtLines is for.
