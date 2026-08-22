@@ -13863,33 +13863,6 @@ impl Index {
             }
         }
 
-        // #464: the guard above only covers the search RESULT WINDOW. An
-        // aggregation runs with `size: 0`, so that estimate is 0 — yet a
-        // meta-observing agg (`top_hits`, or one targeting `_id`/`_index`/
-        // `_seq_no`) deep-clones EVERY buffered memtable document to build its
-        // owned-source view (`fast_aggs::MemDocs::Owned`), which under a bulk
-        // writer is 10^4-10^5 full-source clones. That allocation escaped
-        // `max_query_memory_mb` entirely. Estimate it here — before either the
-        // fast or the brute agg path runs — and reject up-front. Bounds the
-        // owned build; bucket-cardinality growth remains a separate concern.
-        if let Some(aggs_def) = &request.aggs {
-            if fast_aggs::agg_tree_mentions_meta(aggs_def) {
-                if let Some(g) = crate::governor::global() {
-                    if g.query_memory_enabled() {
-                        // Full source clone + `_id`/`_index`/`_seq_no` injection
-                        // per buffered doc; a conservative per-doc figure (the
-                        // window guard above bills 1 KiB/hit, an owned agg clones
-                        // the whole source).
-                        const EST_BYTES_PER_OWNED_DOC: u64 = 2048;
-                        let est = (self.memtable.doc_count() as u64)
-                            .saturating_mul(EST_BYTES_PER_OWNED_DOC);
-                        g.check_query_alloc(est, "aggregation owned-source materialisation")
-                            .map_err(EngineError::Common)?;
-                    }
-                }
-            }
-        }
-
         // Determine the timeout: use the request-level timeout if set, otherwise
         // fall back to the default of 30 seconds.
         let timeout_ms = request.timeout_ms.unwrap_or(30_000);
@@ -18145,12 +18118,13 @@ impl Index {
         // flushed the memtable to segments.
         let need_full_corpus = precomputed_aggs.is_none() && request.aggs.is_some();
         // #464: the brute agg corpus below deep-clones EVERY memtable AND
-        // segment source into owned `Value`s. It is reached by ANY agg that
-        // bailed the fast path — percentiles / date_histogram / cardinality have
-        // no columnar path at all — so the earlier `agg_tree_mentions_meta` guard
-        // (which only sees the fast-path `MemDocs::Owned` clone) missed the whole
-        // family. Bound the full-corpus materialisation here too, before the
-        // clone, counting memtable AND flushed-segment docs.
+        // segment source into owned `Value`s — the allocation that escaped
+        // `max_query_memory_mb` (the window guard bills `from + size` hits, which
+        // is 0 for `size:0 + aggs`). This path is reached by ANY agg that bails
+        // the columnar fast path: a meta-observing `top_hits`, and equally the
+        // no-meta families with no columnar path at all (percentiles /
+        // date_histogram / cardinality). Bound the full-corpus materialisation
+        // here, before the clone, counting memtable AND flushed-segment docs.
         if need_full_corpus {
             if let Some(g) = crate::governor::global() {
                 if g.query_memory_enabled() {
