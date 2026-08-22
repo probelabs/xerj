@@ -768,17 +768,27 @@ fn partially_applied_data_bulk_leaves_the_generation_pending_and_the_retry_conve
     );
 }
 
-/// #490: a corpus committed by the `--no-graph` generated path must not be
-/// silently re-runnable on the default *graph* path. A committed generation
+/// #490 (fix #3): a corpus committed by the `--no-graph` generated path must not
+/// be silently re-runnable on the default *graph* path. A committed generation
 /// manifest is graph-disabled by construction (`sync::validate_manifest`), so
-/// the graph path can recognise the mismatch and refuse it — the way the
-/// graph→no-graph direction is already refused. Before this guard the graph
-/// re-run reconciled against the no-graph plan and *mutated the destination*
-/// (publishing the newly added row) before the mismatch was ever noticed, then
-/// left `--fresh` refused. The refusal must land before the journal is opened
-/// for write, so no remote mutation is attempted.
+/// the graph path recognises the mismatch and refuses it — the way the
+/// graph→no-graph direction is already refused.
+///
+/// Scope of what this harness proves. Without the guard the re-run still fails,
+/// but only later and opaquely: `write_plan`'s own `ensure!` rejects it with
+/// `legacy plan write cannot follow a committed generated manifest`, *after*
+/// `open_after_preflight` and `gc_snapshots` have run. On real binaries whose
+/// graph path reaches Phase B before that point the destination is mutated first
+/// (#490 matrix: 79 → 80 docs); this in-process harness is backstopped by that
+/// `ensure!`, so it exercises the *message and ordering*, not the remote row.
+/// The load-bearing contract pinned here is therefore: the run is refused with
+/// the clear cross-path message and NOT the opaque `write_plan` one (i.e. the
+/// guard preempts it, before the journal is opened for write). The destination
+/// staying clean is asserted as a belt-and-suspenders invariant — true here
+/// regardless of the guard, so a future change that lets the graph path reach
+/// Phase B before refusing is caught.
 #[test]
-fn no_graph_committed_corpus_refuses_a_graph_path_rerun_before_mutating() {
+fn no_graph_committed_corpus_is_refused_on_the_graph_path_with_a_clear_message() {
     let _guard = HTTP_E2E_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _replay_guard = sync_executor::REPLAY_FAILPOINT_TEST_LOCK
         .lock()
@@ -803,13 +813,24 @@ fn no_graph_committed_corpus_refuses_a_graph_path_rerun_before_mutating() {
     graph.no_graph = false;
     let error = run_index(graph).unwrap_err();
     let rendered = format!("{error:#}");
+    // Load-bearing pair. Fail-before, `rendered` IS the opaque `write_plan`
+    // error (thrown after journal-open/gc_snapshots) and lacks this phrase; the
+    // guard replaces it with the clear, actionable one *and* preempts the opaque
+    // one, proving the refusal now lands earlier.
     assert!(
         rendered.contains("indexed with --no-graph"),
-        "the graph re-run must be refused with the cross-path message, got: {rendered}"
+        "the graph re-run must be refused with the clear cross-path message, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("legacy plan write cannot follow a committed generated manifest"),
+        "the guard must preempt write_plan's opaque late error, got: {rendered}"
     );
 
-    // The refusal must land before any mutation: the added row was not
-    // published, and no second generation was committed.
+    // Belt-and-suspenders (true here regardless of the guard, because this
+    // harness is backstopped by write_plan's `ensure!`): the destination is left
+    // clean — the added row was not published and no second generation committed.
+    // Asserted so a future change that lets the graph path reach Phase B before
+    // refusing is caught as a mutation.
     assert_eq!(
         endpoint.data_docs().len(),
         committed,
