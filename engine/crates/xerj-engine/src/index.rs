@@ -10166,6 +10166,23 @@ impl Index {
         }
     }
 
+    /// Await the in-flight stale HNSW rebuild to completion, if one is running.
+    ///
+    /// A deterministic alternative to polling `hnsw_stats` for tests and
+    /// diagnostics (#536): the background task clears `hnsw_rebuilding` and
+    /// publishes the healed graph *before* its `JoinHandle` resolves, so a
+    /// caller observes `stale == false` / `rebuilding == false` immediately
+    /// after this returns — with no timeout that can flake under parallel test
+    /// load. A no-op when no rebuild was spawned (the snapshot was already
+    /// fresh). The handle is `take`n, so a subsequent close/abort is a no-op
+    /// (the task has already finished).
+    pub async fn await_hnsw_rebuild(&self) {
+        let handle = self.hnsw_rebuild_task.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
     /// Re-derive the HNSW graph from the authoritative doc set and clear
     /// `hnsw_stale` (RC4 W2 item 17). Returns `Ok(true)` once converged.
     ///
