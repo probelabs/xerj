@@ -25,6 +25,79 @@ fn test_engine() -> (Engine, TempDir) {
     (engine, dir)
 }
 
+/// Stack budget for the async recursion tests below.
+///
+/// These tests deliberately trip the closure-recursion limit *through the async
+/// search path* (`function_score` / `rescore` / `terms_set` / a `block_in_place`
+/// hand-off), so the whole search stack sits beneath the evaluator. The limit
+/// itself is sound — `MAX_CALL_DEPTH` trips at a release-measured 1.20 MiB worst
+/// case, and the server pins its worker stack to 4 MiB (`RT_THREAD_STACK_SIZE`)
+/// for exactly that budget. But a DEBUG build's per-call-level frames are
+/// several times a release build's (the same reason
+/// `worst_case_nested_block_recursion_still_fits_a_2mib_stack` is release-only),
+/// and a stock `#[tokio::test]` worker gets only 2 MiB. In debug that overflows
+/// and SIGABRTs the whole binary — silently masking every other test in the file
+/// (issue #353). We give these tests a debug-adequate stack — the test analogue
+/// of the production pin — so the SAME limit trips *gracefully* (a `script_failure`
+/// on the result) in every profile instead of racing the thread's stack guard.
+/// This does NOT raise the ceiling (`MAX_CALL_DEPTH` is untouched); it only lets
+/// the existing ceiling be the binding limit under debug's inflated frames.
+const RECURSION_TEST_STACK: usize = 16 * 1024 * 1024;
+
+/// Drive `body` to completion on a current-thread runtime hosted on a thread
+/// with [`RECURSION_TEST_STACK`] of stack (the current-thread analogue: the
+/// runtime runs everything on this thread).
+fn on_big_stack_current_thread<F>(body: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(RECURSION_TEST_STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread test runtime")
+                .block_on(body)
+        })
+        .expect("spawn test thread")
+        .join()
+        // Re-raise the body's own panic (assertion message + backtrace intact)
+        // rather than flatten it to a generic string. A stack *overflow* aborts
+        // the process outright — it never reaches here — which is exactly the
+        // #353 failure this larger stack prevents.
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+/// Drive `body` on a multi-thread runtime whose worker threads each get
+/// [`RECURSION_TEST_STACK`] — the path that exercises `Index::search`'s
+/// `block_in_place` + `Handle::block_on` hand-off onto a worker thread.
+fn on_big_stack_multi_thread<F>(body: F) -> F::Output
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    std::thread::Builder::new()
+        .stack_size(RECURSION_TEST_STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(RECURSION_TEST_STACK)
+                .enable_all()
+                .build()
+                .expect("build multi-thread test runtime")
+                .block_on(body)
+        })
+        .expect("spawn test thread")
+        .join()
+        // Re-raise the body's own panic (assertion message + backtrace intact)
+        // rather than flatten it to a generic string. A stack *overflow* aborts
+        // the process outright — it never reaches here — which is exactly the
+        // #353 failure this larger stack prevents.
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
 /// Self-application recursion that runs past `MAX_CALL_DEPTH` (32). The
 /// closure body wraps the recursive call in nested blocks, the shape from the
 /// original process-abort repro.
@@ -62,25 +135,27 @@ fn script_score_request(source: String) -> xerj_query::ast::SearchRequest {
 /// The headline of #97: a `script_score` that trips the call-depth limit used
 /// to return `_score: 0.0` and a 200-shaped success. It must now surface the
 /// limit on the result so the API layer can fail the request.
-#[tokio::test]
-async fn script_score_over_call_depth_reports_a_failure_not_a_score() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn script_score_over_call_depth_reports_a_failure_not_a_score() {
+    on_big_stack_current_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    let req = script_score_request(over_deep_script());
-    let result = idx.search(&req).await.expect("search");
+        let req = script_score_request(over_deep_script());
+        let result = idx.search(&req).await.expect("search");
 
-    let failure = result.script_failure.as_deref().unwrap_or_else(|| {
-        panic!(
-            "call-depth limit was swallowed: search succeeded with scores {:?} \
-             and no script_failure — this is the silent wrong-score bug",
-            result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
-        )
+        let failure = result.script_failure.as_deref().unwrap_or_else(|| {
+            panic!(
+                "call-depth limit was swallowed: search succeeded with scores {:?} \
+                 and no script_failure — this is the silent wrong-score bug",
+                result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+            )
+        });
+        assert!(
+            failure.contains("closure call depth"),
+            "expected the closure-call-depth limit to be named, got {failure:?}"
+        );
     });
-    assert!(
-        failure.contains("closure call depth"),
-        "expected the closure-call-depth limit to be named, got {failure:?}"
-    );
 }
 
 /// A script the interpreter simply doesn't support must keep degrading
@@ -105,47 +180,51 @@ async fn ordinary_script_error_still_degrades_gracefully() {
 /// whole search body inside `block_in_place` + `Handle::block_on`. The fault
 /// sink is a *task*-local, so this pins that it survives that hand-off — a
 /// current-thread-only test would pass while production stayed silently wrong.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn call_depth_limit_survives_the_multi_thread_block_in_place_path() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn call_depth_limit_survives_the_multi_thread_block_in_place_path() {
+    on_big_stack_multi_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    let req = script_score_request(over_deep_script());
-    let result = idx.search(&req).await.expect("search");
-    assert!(
-        result.script_failure.is_some(),
-        "the multi-thread block_in_place path lost the fault; scores {:?}",
-        result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
-    );
+        let req = script_score_request(over_deep_script());
+        let result = idx.search(&req).await.expect("search");
+        assert!(
+            result.script_failure.is_some(),
+            "the multi-thread block_in_place path lost the fault; scores {:?}",
+            result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+        );
+    });
 }
 
 /// `terms_set`'s `minimum_should_match_script` is a *matching* path, not a
 /// scoring one: a script error makes the doc unsatisfiable (fail-closed), so a
 /// limit trip silently removes documents from the result set.
-#[tokio::test]
-async fn terms_set_min_should_match_script_over_call_depth_reports_a_failure() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn terms_set_min_should_match_script_over_call_depth_reports_a_failure() {
+    on_big_stack_current_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    let req = parse_request(&json!({
-        "query": {
-            "terms_set": {
-                "tags": {
-                    "terms": ["a", "b"],
-                    "minimum_should_match_script": { "source": over_deep_script() }
+        let req = parse_request(&json!({
+            "query": {
+                "terms_set": {
+                    "tags": {
+                        "terms": ["a", "b"],
+                        "minimum_should_match_script": { "source": over_deep_script() }
+                    }
                 }
             }
-        }
-    }))
-    .expect("parse_request");
+        }))
+        .expect("parse_request");
 
-    let result = idx.search(&req).await.expect("search");
-    assert!(
-        result.script_failure.is_some(),
-        "terms_set min_should_match swallowed the call-depth limit and reported \
-         {} hits as a complete answer",
-        result.total.value
-    );
+        let result = idx.search(&req).await.expect("search");
+        assert!(
+            result.script_failure.is_some(),
+            "terms_set min_should_match swallowed the call-depth limit and reported \
+             {} hits as a complete answer",
+            result.total.value
+        );
+    });
 }
 
 /// The `Rc<Vec<Stmt>>` follow-up note on #97: a shared closure body was the
@@ -158,99 +237,106 @@ fn painless_values_can_cross_a_thread_boundary() {
 }
 
 /// The rescore path has the same shape (`Err(_) => 0.0`) and the same bug.
-#[tokio::test]
-async fn rescore_script_over_call_depth_reports_a_failure() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn rescore_script_over_call_depth_reports_a_failure() {
+    on_big_stack_current_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    // `parse_request` doesn't read `rescore` (the API layer builds it), so
-    // attach the stage directly.
-    let mut req = parse_request(&json!({ "query": { "match_all": {} } })).expect("parse_request");
-    req.rescore = vec![xerj_query::ast::RescoreQuery {
-        window_size: 10,
-        query: None,
-        script: Some(xerj_query::ast::ScriptRescore {
-            source: over_deep_script(),
-            params: json!({}),
-            query_weight: 1.0,
-            rescore_query_weight: 1.0,
-            score_mode: None,
-        }),
-    }];
+        // `parse_request` doesn't read `rescore` (the API layer builds it), so
+        // attach the stage directly.
+        let mut req =
+            parse_request(&json!({ "query": { "match_all": {} } })).expect("parse_request");
+        req.rescore = vec![xerj_query::ast::RescoreQuery {
+            window_size: 10,
+            query: None,
+            script: Some(xerj_query::ast::ScriptRescore {
+                source: over_deep_script(),
+                params: json!({}),
+                query_weight: 1.0,
+                rescore_query_weight: 1.0,
+                score_mode: None,
+            }),
+        }];
 
-    let result = idx.search(&req).await.expect("search");
-    assert!(
-        result.script_failure.is_some(),
-        "rescore swallowed the call-depth limit; scores {:?}",
-        result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
-    );
+        let result = idx.search(&req).await.expect("search");
+        assert!(
+            result.script_failure.is_some(),
+            "rescore swallowed the call-depth limit; scores {:?}",
+            result.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+        );
+    });
 }
 
 /// Script-bucketed aggregations run inside the search too, and mapped a failed
 /// script to "no buckets" — an empty aggregation that looks like a legitimate
 /// answer.
-#[tokio::test]
-async fn script_bucketed_terms_agg_over_call_depth_reports_a_failure() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn script_bucketed_terms_agg_over_call_depth_reports_a_failure() {
+    on_big_stack_current_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    let req = parse_request(&json!({
-        "size": 0,
-        "query": { "match_all": {} },
-        "aggs": {
-            "by_script": { "terms": { "script": { "source": over_deep_script() } } }
-        }
-    }))
-    .expect("parse_request");
+        let req = parse_request(&json!({
+            "size": 0,
+            "query": { "match_all": {} },
+            "aggs": {
+                "by_script": { "terms": { "script": { "source": over_deep_script() } } }
+            }
+        }))
+        .expect("parse_request");
 
-    let result = idx.search(&req).await.expect("search");
-    assert!(
-        result.script_failure.is_some(),
-        "the terms-agg script path swallowed the call-depth limit; aggs {:?}",
-        result.aggs
-    );
+        let result = idx.search(&req).await.expect("search");
+        assert!(
+            result.script_failure.is_some(),
+            "the terms-agg script path swallowed the call-depth limit; aggs {:?}",
+            result.aggs
+        );
+    });
 }
 
 /// A failed search must not poison the response cache, and the fault must not
 /// be replayed against the next (innocent) caller of the same query.
-#[tokio::test]
-async fn script_failure_is_not_cached_or_replayed() {
-    let (engine, _dir) = test_engine();
-    let idx = seed(&engine).await;
+#[test]
+fn script_failure_is_not_cached_or_replayed() {
+    on_big_stack_current_thread(async {
+        let (engine, _dir) = test_engine();
+        let idx = seed(&engine).await;
 
-    let bad = parse_request(&json!({
-        "query": {
-            "function_score": {
-                "query": { "match_all": {} },
-                "functions": [ { "script_score": { "script": { "source": over_deep_script() } } } ]
+        let bad = parse_request(&json!({
+            "query": {
+                "function_score": {
+                    "query": { "match_all": {} },
+                    "functions": [ { "script_score": { "script": { "source": over_deep_script() } } } ]
+                }
             }
-        }
-    }))
-    .expect("parse_request");
-    assert!(idx
-        .search(&bad)
-        .await
-        .expect("search")
-        .script_failure
-        .is_some());
-    assert!(
-        idx.search(&bad)
+        }))
+        .expect("parse_request");
+        assert!(idx
+            .search(&bad)
             .await
             .expect("search")
             .script_failure
-            .is_some(),
-        "the second identical request must fail too, not be served a cached \
-         result whose scores are the degraded ones"
-    );
+            .is_some());
+        assert!(
+            idx.search(&bad)
+                .await
+                .expect("search")
+                .script_failure
+                .is_some(),
+            "the second identical request must fail too, not be served a cached \
+             result whose scores are the degraded ones"
+        );
 
-    let good: xerj_query::ast::SearchRequest =
-        parse_request(&json!({ "query": { "match_all": {} } })).expect("parse_request");
-    let clean = idx.search(&good).await.expect("search");
-    assert!(
-        clean.script_failure.is_none(),
-        "an unrelated request inherited another request's script fault: {:?}",
-        clean.script_failure
-    );
+        let good: xerj_query::ast::SearchRequest =
+            parse_request(&json!({ "query": { "match_all": {} } })).expect("parse_request");
+        let clean = idx.search(&good).await.expect("search");
+        assert!(
+            clean.script_failure.is_none(),
+            "an unrelated request inherited another request's script fault: {:?}",
+            clean.script_failure
+        );
+    });
 }
 
 /// Run `src` to completion on a thread with exactly the 2 MiB stack a tokio
