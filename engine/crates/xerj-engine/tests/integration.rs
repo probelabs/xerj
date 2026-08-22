@@ -5153,22 +5153,26 @@ async fn test_hnsw_stale_snapshot_rebuilds_on_open() {
     // converge, clear the flag, and leave every doc graphed.
     let engine = make_engine(&dir);
     let idx = engine.get_index("vecs").unwrap();
-    let mut healed = false;
-    let mut last = json!(null);
-    for _ in 0..100 {
-        last = idx.hnsw_stats().await;
-        if last["present"] == json!(true)
-            && last["stale"] == json!(false)
-            && last["rebuilding"] == json!(false)
-        {
-            healed = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-    assert!(
-        healed,
-        "stale HNSW snapshot must be healed by the background rebuild; last stats: {last}"
+    // Deterministically wait for the background rebuild to converge instead of
+    // polling `hnsw_stats` on a fixed 10s budget that flaked under parallel test
+    // load (#536): the rebuild task clears `rebuilding` and publishes the healed
+    // graph before its handle resolves, so after this the stats are settled.
+    idx.await_hnsw_rebuild().await;
+    let last = idx.hnsw_stats().await;
+    assert_eq!(
+        last["present"],
+        json!(true),
+        "healed graph present after rebuild: {last}"
+    );
+    assert_eq!(
+        last["stale"],
+        json!(false),
+        "stale flag cleared after rebuild: {last}"
+    );
+    assert_eq!(
+        last["rebuilding"],
+        json!(false),
+        "rebuilding flag cleared after rebuild: {last}"
     );
     assert_eq!(
         last["doc_coverage"],
